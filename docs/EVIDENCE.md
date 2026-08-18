@@ -48,7 +48,10 @@ Command: `.venv/Scripts/python.exe scripts/probe_roundtrip.py`
 'open notepad'    -> 'Open Notepad.'       exact
 ```
 
-Command: `.venv/Scripts/python.exe -m pytest -q` → **367 passed, 0 failed, 3 skipped**
+Command: `.venv/Scripts/python.exe -m pytest -q` → **495 passed, 0 failed, 4 skipped**
+(at commit `a8cc40e`. A passed-count is a timestamp, not a property — it rises as
+coverage lands. The durable facts are 0 failed and a skip count you can account
+for. Quote a count only with the commit it was measured at.)
 
 Memory, measured across a real 3-turn run (see finding F16):
 
