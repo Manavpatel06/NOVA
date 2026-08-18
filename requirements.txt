@@ -29,8 +29,7 @@ nvidia-cudnn-cu12==9.24.0.43
 
 # --- text to speech ---
 onnxruntime==1.29.0
-kokoro-onnx==0.5.0
-misaki==0.7.4          # kokoro-onnx's grapheme-to-phoneme dependency
+kokoro-onnx==0.5.0     # G2P via bundled phonemizer-fork + espeakng-loader
 
 # --- interfaces ---
 keyboard==0.13.5       # global hotkey; system-wide low-level hook
