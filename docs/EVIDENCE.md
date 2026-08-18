@@ -79,13 +79,14 @@ observed, that bar is **unmet**, no matter how much of the code path is proven.
       asserted from memory. Run Task Manager as administrator and press
       `Ctrl+Alt+Space`. If it fails, that becomes a documented limitation.
 
-**Before running the human demo — check the Windows sound output device.**
-Finding F18: `Player` takes the OS default endpoint without verifying it, and
-this machine has four (Realtek Headphones, Realtek Speakers, and an Insignia TV
-over NVIDIA HDMI). If the default is an endpoint nobody is listening to, NOVA is
-inaudible while synthesis succeeds — and the natural conclusion is "NOVA is
-broken" when it is not. One glance at the Windows sound settings protects the
-whole test.
+**Before running the human demo — run `scripts/probe_output.py` (F18 is now fixed).**
+`Player` now probes rather than trusting the OS default, and prefers a local
+sound card over display/HDMI audio. `scripts/probe_output.py` lists every
+endpoint, says which NOVA will use and why, and plays a test tone. If you hear
+the tone, playback is good. Lead-verified: it selects `Headphones (Realtek(R)
+Audio)`, index 4, opened and accepted a buffer.
+
+Audibility itself still needs your ears — no probe can close that.
 
 Command for the human demo: `.venv\Scripts\python.exe -m nova`
 
