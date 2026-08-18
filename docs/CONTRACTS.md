@@ -59,12 +59,38 @@ class Player:
     def cancel(self) -> None
 ```
 
-**The WASAPI trap:** Windows exposes the same physical mic several times and the
-WASAPI endpoint returns digital zeros. A device that opens successfully is NOT a
-working device. Record a real second from every candidate and reject any whose
-samples are all zero or whose RMS is indistinguishable from zero. Rank survivors
-WDM-KS → MME → DirectSound → WASAPI. Cache the winner, keyed by the device list
-so a new headset re-probes. `verified=True` means audio actually arrived.
+**The lying-endpoint trap (measured on this machine, correcting prior art):**
+Windows exposes the same physical mic several times, and at least one endpoint
+opens successfully while returning digital zeros. A device that opens is NOT a
+working device.
+
+Prior art said the WASAPI endpoint was the liar. On this laptop it is **device 17
+(Realtek Mic input) on WDM-KS**, returning exact `0.0` RMS on 3/3 trials — so the
+rule is "probe empirically", never "distrust one named host API".
+
+The subtler half, and the reason a zero-check alone is not enough: the WASAPI and
+MME duplicates of the *same physical mic* are not lying. They return real signal
+at ~1e-4 RMS, squashed by the Windows audio engine's AGC and noise suppression —
+non-zero, so they pass any all-zeros test, and useless for speech recognition.
+Picking one would give an assistant that appears to work and mishears everything.
+Ranking by host-API tier and then RMS is what separates the true hardware endpoint
+(WDM-KS idx 22, RMS 0.048) from its own suppressed duplicates, not the silence
+floor.
+
+So: enumerate every input device, record a real second from each, compute RMS,
+reject exact-zero and near-dither buffers, rank survivors WDM-KS -> MME ->
+DirectSound -> WASAPI with RMS as the tiebreak, and cache the winner to
+`data/audio_profile.json` keyed by a fingerprint of the device list so a new
+headset re-probes. `verified=True` only when real non-silent audio arrived.
+
+Silence floor is calibrated, not guessed: float32 dither sits ~1e-7, the confirmed
+lying endpoint measures exactly 0.0, and the smallest genuine capture on this box
+is 6e-5. `1e-6` sits ~10x above dither and ~60x below the smallest real signal.
+
+Several devices refuse to open at 16 kHz directly (WDM-KS reports "Invalid
+device"), so open at the device's native rate and resample to 16 kHz mono float32.
+`Player` must cancel within one callback block, not at end-of-buffer — barge-in
+depends on it.
 
 ## T0.3 — stt
 
