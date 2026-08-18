@@ -10,7 +10,8 @@ A voice-first, always-on personal assistant for Manav's Windows 11 laptop. Open-
 
 - **Privacy**: data stays on this machine. All network egress goes through ONE sanctioned module with an enforced allowlist, and a test proves no other file opens a socket. Outbound text passes redaction (usernames, paths, secrets — case-insensitive, both slash styles).
 - **Cost**: free / open-source only. $0 recurring.
-- **RAM**: this is a 16 GB machine Manav also uses. Prefer small models, lazy loading, and an idle footprint near zero. Measure before and after adding anything heavy.
+- **RAM**: this is a 16 GB machine Manav also uses. Prefer small models and lazy loading, and **measure** before and after adding anything heavy.
+  The original wording said "idle footprint near zero". That is measured to be unachievable in-process: CTranslate2 ships a caching allocator that pools freed memory by design, so once Whisper has transcribed once the process floors at ~735-770 MB (plus ~111-135 MB if Kokoro has run) for its lifetime. `unload()` frees VRAM but not this. It is a floor, not a leak -- confirmed by two independent cycle tests. **The real budget: ~60 MB cold, ~850-900 MB after any real use, <1.4 GB mid-turn.** Accepted deliberately by Manav on 2026-08-17 over moving models to a killable subprocess. See `docs/F16_MEMORY_RETENTION.md` and ADR 0006.
 - **Windows 11 native**, Python 3.13, everything under `D:\NOVA` (C: is full). Long paths, spaces, and backslashes are normal — test for them.
 
 ## Security rules (nova-security enforces; everyone follows)
