@@ -35,7 +35,7 @@ after deleting `data/gpu_profile.json`)
 ```
 device=cuda  compute_type=float16  verified=True
 NVIDIA GeForce RTX 5060 Laptop GPU, driver 610.62, ct2 4.8.1
-load 1.68-1.79s | transcribe 0.68-0.69s for 3.0s audio
+load 1.68-1.80s | transcribe 0.48-0.69s for 3.0s audio
 (the first single run reported 1.48s/0.44s; nova-accuracy re-measured across
 5 runs and those were ~20% and ~55% optimistic. Ranges, not points -- these
 fluctuate run to run.)
@@ -56,8 +56,8 @@ Memory, measured across a real 3-turn run (see finding F16):
                               RSS          VRAM
 start                       59.4 MB      264 MiB
 after NovaApp()             64.8 MB      264 MiB   lazy loading confirmed
-after 3 turns             1254.6 MB     2570 MiB
-after app.stop()           912.9 MB      566 MiB   does NOT return to idle
+after 3 turns             1254.6 MB     2479 MiB
+after app.stop()           912.9 MB      367 MiB   host RSS does NOT return
 ```
 
 Warm turn latency ~2.3 s wake-to-voice, including audio playing to completion.
@@ -80,3 +80,13 @@ observed, that bar is **unmet**, no matter how much of the code path is proven.
       `Ctrl+Alt+Space`. If it fails, that becomes a documented limitation.
 
 Command for the human demo: `.venv\Scripts\python.exe -m nova`
+
+### Measurement caveat, learned the hard way
+
+`nvidia-smi` reports **machine-wide** VRAM, not per-process. The 264 MiB
+"baseline" is Windows' own desktop with no NOVA running at all. Any VRAM figure
+taken while another GPU process is resident is contaminated — which is exactly
+how this file came to claim 566 MiB retained when the reproducible number is
+367 MiB. Take VRAM readings on a quiet machine, or read per-process usage.
+
+Host RSS via `psutil` does not have this problem: it is genuinely per-process.
