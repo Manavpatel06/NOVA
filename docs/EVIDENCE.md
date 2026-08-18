@@ -79,6 +79,14 @@ observed, that bar is **unmet**, no matter how much of the code path is proven.
       asserted from memory. Run Task Manager as administrator and press
       `Ctrl+Alt+Space`. If it fails, that becomes a documented limitation.
 
+**Before running the human demo — check the Windows sound output device.**
+Finding F18: `Player` takes the OS default endpoint without verifying it, and
+this machine has four (Realtek Headphones, Realtek Speakers, and an Insignia TV
+over NVIDIA HDMI). If the default is an endpoint nobody is listening to, NOVA is
+inaudible while synthesis succeeds — and the natural conclusion is "NOVA is
+broken" when it is not. One glance at the Windows sound settings protects the
+whole test.
+
 Command for the human demo: `.venv\Scripts\python.exe -m nova`
 
 ### Measurement caveat, learned the hard way
