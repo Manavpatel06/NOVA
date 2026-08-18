@@ -16,7 +16,17 @@ _log = get_logger(__name__)
 
 class Player:
     """Plays PCM audio through the default output device. cancel() may be
-    called from any thread and stops playback within one callback block."""
+    called from any thread and stops playback within one callback block.
+
+    Not safe for concurrent play() calls: `self._stream` is only guarded
+    at the two points it's assigned/torn down (stream creation and
+    close()), not across the whole call. Two overlapping play() calls on
+    the same Player will race on `self._stream` and `_cancel_event`. Fine
+    for M0/M1's turn-taking model (NOVA speaks one utterance at a time,
+    never two at once), but the next caller should not have to discover
+    this against a live mic -- serialize calls, or use one Player per
+    concurrent utterance, if that assumption ever changes (nova-security,
+    T0.2 review)."""
 
     def __init__(self):
         self._stream: sd.OutputStream | None = None
