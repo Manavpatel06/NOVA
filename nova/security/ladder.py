@@ -51,16 +51,32 @@ class ConfirmChannel(Protocol):
     """A working, human-facing approval channel (docs/THREAT_MODEL.md §1.4).
     M0 registers none — that is the point: `Ladder.authorize()` must fail
     closed for every CONFIRM-tier action until M1 wires a real one in, not
-    discover a gap later.
+    discover a gap later. Real implementations live in
+    nova/security/confirm.py.
     """
 
     async def request(self, skill: SkillSpec, params: dict[str, Any]) -> bool:
         """Ask a human to approve `skill.name(**params)`. Return True only on
-        an explicit approval. A decline, a timeout, or a channel error must
-        all return False (or raise, which `Ladder` treats as False) — never
-        hang indefinitely and never let an unclear outcome read as approval.
+        an explicit approval; return False for an explicit decline. A
+        channel that cannot get a clear answer in its own time budget must
+        raise `ConfirmTimeout` rather than returning False — the ladder
+        audits that as `"confirm_timed_out"`, a distinct reason from an
+        explicit decline, because the two mean different things to whoever
+        reads the log later. Any other exception (a broken channel) is
+        treated the same as an explicit decline — never let an unclear
+        outcome read as approval, and never hang indefinitely.
         """
         ...
+
+
+class ConfirmTimeout(Exception):
+    """Raised by a `ConfirmChannel.request()` implementation when no answer
+    arrived within its own time budget. A distinct type, not a plain
+    `return False`, so `Ladder.authorize()` can audit `"confirm_timed_out"`
+    separately from `"confirm_declined"` (docs/THREAT_MODEL.md §1.4 amendment
+    — a timeout and an explicit decline are different facts for whoever
+    reads the audit log later, and must not collapse into the same reason).
+    """
 
 
 @dataclass(frozen=True)
@@ -98,7 +114,11 @@ class Ladder:
         if tier is Tier.CONFIRM:
             if self._confirm_channel is None:
                 return self._deny_audited(skill, params, tier, "no_confirm_channel")
-            approved = await self._ask_channel(skill, params)
+            try:
+                approved = await self._ask_channel(skill, params)
+            except ConfirmTimeout as exc:
+                logger.warning("confirm channel timed out for skill '%s': %s", skill.name, exc)
+                return self._deny_audited(skill, params, tier, "confirm_timed_out")
             if not approved:
                 return self._deny_audited(skill, params, tier, "confirm_declined")
             return self._allow_with_required_audit(skill, params, tier)
@@ -115,7 +135,9 @@ class Ladder:
         assert self._confirm_channel is not None
         try:
             return bool(await self._confirm_channel.request(skill, params))
-        except Exception as exc:  # noqa: BLE001 — a broken channel must deny, never crash the ladder or hang
+        except ConfirmTimeout:
+            raise  # a distinct, audited reason — let authorize() handle it, not the generic decline path below
+        except Exception as exc:  # noqa: BLE001 — any other broken-channel failure must deny, never crash the ladder or hang
             logger.error("confirm channel raised during authorize(skill=%s): %s", skill.name, exc)
             return False
 
