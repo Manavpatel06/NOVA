@@ -18,6 +18,8 @@ would be its own footgun) rather than a bug.
 """
 from __future__ import annotations
 
+import copy
+import dataclasses
 import time
 from pathlib import Path
 
@@ -124,6 +126,90 @@ def test_str_and_repr_carry_the_source_label():
     u = Untrusted(SECRET, source="mail.body")
     assert "mail.body" in str(u)
     assert "mail.body" in repr(u)
+
+
+# ---------------------------------------------------------------------------
+# Regression: dataclasses.asdict()/astuple() bypass (fixed in dbd77d8).
+#
+# A @dataclass-based Untrusted let asdict()/astuple() walk dataclasses.
+# fields() and getattr() the raw attributes directly — a complete, silent,
+# unaudited unwrap via a stdlib call nobody had to write, and recursive: an
+# Untrusted nested inside another dataclass unwrapped the instant anyone
+# called asdict() on the *outer* object. The fix drops @dataclass entirely
+# (hand-rolled __slots__ class), which removes it from
+# dataclasses.is_dataclass() — the exact gate asdict/astuple check first.
+#
+# These tests pin the PROPERTY (content is not extractable through any of
+# these stdlib introspection paths), not the specific implementation
+# (__slots__ vs. something else) — if a future refactor reintroduces
+# @dataclass, these should fail again for the same reason the original bug
+# existed, which is the point.
+# ---------------------------------------------------------------------------
+
+
+def test_is_dataclass_is_false():
+    """This is the specific gate asdict()/astuple() check before doing
+    anything else — verified directly since the fix relies on it."""
+    u = Untrusted(SECRET, source="mail.body")
+    assert dataclasses.is_dataclass(u) is False
+
+
+def test_asdict_cannot_be_called_on_untrusted_at_all():
+    u = Untrusted(SECRET, source="mail.body")
+    with pytest.raises(TypeError):
+        dataclasses.asdict(u)  # type: ignore[arg-type]
+
+
+def test_astuple_cannot_be_called_on_untrusted_at_all():
+    u = Untrusted(SECRET, source="mail.body")
+    with pytest.raises(TypeError):
+        dataclasses.astuple(u)  # type: ignore[arg-type]
+
+
+def test_vars_cannot_reach_the_wrapped_content():
+    """__slots__ means there is no __dict__ for vars() to walk."""
+    u = Untrusted(SECRET, source="mail.body")
+    with pytest.raises(TypeError):
+        vars(u)
+
+
+def test_deepcopy_fails_loudly_rather_than_silently_duplicating_content():
+    """copy.deepcopy's default slotted-object reconstruction calls setattr()
+    to restore state, which hits Untrusted's frozen __setattr__ — the lazy
+    bypass fails loudly here too, it just wasn't the one anyone went looking
+    for."""
+    u = Untrusted(SECRET, source="mail.body")
+    with pytest.raises(AttributeError):
+        copy.deepcopy(u)
+
+
+def test_nested_untrusted_inside_another_dataclass_does_not_leak_via_asdict():
+    """The realistic leak shape: a mail-summary skill's own result dataclass
+    holding an Untrusted field, then something upstream (a router, a log
+    call, a debug dump) calling asdict() on the *outer* object without
+    knowing it contains anything sensitive. Must fail loudly, not return a
+    dict with the raw content sitting in it."""
+
+    @dataclasses.dataclass
+    class MailSummaryDraft:
+        body: object
+        subject: str
+
+    draft = MailSummaryDraft(body=Untrusted(SECRET, source="mail.body"), subject="hi")
+
+    with pytest.raises(AttributeError):
+        dataclasses.asdict(draft)
+
+
+def test_nested_untrusted_inside_a_list_in_a_dataclass_does_not_leak():
+    @dataclasses.dataclass
+    class Batch:
+        items: list
+
+    batch = Batch(items=[Untrusted(SECRET, source="mail.body"), "plain text"])
+
+    with pytest.raises(AttributeError):
+        dataclasses.asdict(batch)
 
 
 # ---------------------------------------------------------------------------

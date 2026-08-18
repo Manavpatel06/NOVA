@@ -97,6 +97,37 @@ def test_junction_escaping_site_packages_is_excluded(tmp_path, monkeypatch, isol
     )
 
 
+def test_non_allowlisted_package_name_is_excluded_even_with_a_legitimate_path(
+    tmp_path, monkeypatch, isolated_dll_state
+):
+    """The second, independent half of the fix: `_ALLOWED_NVIDIA_PACKAGES`
+    and the resolve/containment check are two separate gates. A directory
+    with a perfectly legitimate resolved path (no junction, genuinely inside
+    site-packages) must still be excluded if its package name isn't on the
+    allowlist — nova-dev-stt reported testing this during their own
+    verification (nvidia\\evilpkg\\bin), but nothing pinned it with a test
+    until now."""
+    fake_site = tmp_path / "fake_site_packages"
+    unlisted_bin = fake_site / "nvidia" / "evilpkg" / "bin"
+    unlisted_bin.mkdir(parents=True)  # real directory, no junction involved at all
+
+    allowed_bin = fake_site / "nvidia" / "cublas" / "bin"
+    allowed_bin.mkdir(parents=True)
+
+    monkeypatch.setattr(dll_mod, "_site_roots", lambda: [fake_site.resolve()])
+
+    dll_mod.ensure_dll_directories()
+
+    recorded = isolated_dll_state
+    assert not any(Path(p).resolve() == unlisted_bin.resolve() for p in recorded), (
+        f"a directory under a non-allowlisted nvidia package name was granted "
+        f"DLL search authority despite a legitimate path: recorded={recorded}"
+    )
+    assert any(Path(p).resolve() == allowed_bin.resolve() for p in recorded), (
+        "the allowlisted package's bin dir should still have been found"
+    )
+
+
 def test_ensure_dll_directories_is_idempotent_within_a_single_scan(tmp_path, monkeypatch, isolated_dll_state):
     """Sanity check unrelated to the junction gap: calling it twice in the
     same (fresh) state must not double-add the same real directory."""
