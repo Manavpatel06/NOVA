@@ -160,9 +160,10 @@ class _CallbackStop(Exception):
 class _FakeOutputStream:
     instances: list["_FakeOutputStream"] = []
 
-    def __init__(self, samplerate, channels, dtype, callback, finished_callback):
+    def __init__(self, samplerate, channels, dtype, callback, finished_callback, device=None):
         self.samplerate = samplerate
         self.channels = channels
+        self.device = device  # finding F18: Player now selects an endpoint explicitly
         self.callback = callback
         self.finished_callback = finished_callback
         self.closed = False

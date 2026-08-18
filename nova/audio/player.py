@@ -28,10 +28,29 @@ class Player:
     concurrent utterance, if that assumption ever changes (nova-security,
     T0.2 review)."""
 
-    def __init__(self):
+    def __init__(self, device: int | None = None):
         self._stream: sd.OutputStream | None = None
         self._cancel_event = threading.Event()
         self._lock = threading.Lock()
+        # Finding F18: taking the OS default output endpoint unverified is the
+        # output-side twin of the input-side trap this package exists to avoid.
+        # This machine exposes a television over NVIDIA HDMI alongside its local
+        # sound card, and the OS default moves between them -- landing on the
+        # screen makes NOVA inaudible while synthesis succeeds perfectly.
+        # `device=None` means "ask the prober", not "trust the default".
+        self._device = device
+        if device is None:
+            try:
+                from nova.audio.output import probe_output_device
+
+                self._device = probe_output_device().index
+            except Exception as exc:  # never let device selection stop NOVA speaking
+                _log.warning(
+                    "Output device probe failed (%s); falling back to the OS default. "
+                    "If NOVA is silent, run scripts/probe_output.py.",
+                    exc,
+                )
+                self._device = None
 
     async def play(self, pcm: np.ndarray, samplerate: int) -> None:
         pcm = np.asarray(pcm, dtype=np.float32)
@@ -72,6 +91,7 @@ class Player:
                 samplerate=samplerate,
                 channels=n_channels,
                 dtype="float32",
+                device=self._device,
                 callback=_callback,
                 finished_callback=_finished_callback,
             )
