@@ -20,3 +20,25 @@ tts:
 
 security:
   egress_allowlist: []   # domains nova.security.Egress may reach; empty until a skill needs one
+
+  # Closed allowlist for nova.skills.open_app (docs/THREAT_MODEL.md #1.1).
+  # Symbolic name -> absolute executable path. open_app never accepts a raw
+  # path from the router; it only ever looks a name up here.
+  allowed_apps:
+    notepad: 'C:\Windows\System32\notepad.exe'
+    calculator: 'C:\Windows\System32\calc.exe'
+    explorer: 'C:\Windows\explorer.exe'
+    file explorer: 'C:\Windows\explorer.exe'
+    task manager: 'C:\Windows\System32\Taskmgr.exe'
+    control panel: 'C:\Windows\System32\control.exe'
+
+  # Trusted directories an allowed_apps entry must realpath-land inside at
+  # call time, junctions included. open_app refuses to launch anything that
+  # resolves outside this set.
+  allowed_app_dirs:
+    - 'C:\Windows\System32'
+    - 'C:\Windows\SysWOW64'
+    - 'C:\Windows'
+    - 'C:\Program Files'
+    - 'C:\Program Files (x86)'
+    - 'C:\Program Files\WindowsApps'

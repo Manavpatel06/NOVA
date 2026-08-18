@@ -12,6 +12,7 @@ Design rules this module enforces:
 from __future__ import annotations
 
 import dataclasses
+import math
 import typing
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -58,9 +59,20 @@ class TtsConfig:
 
 @dataclass(frozen=True)
 class SecurityConfig:
-    """Consumed by nova.security (Egress)."""
+    """Consumed by nova.security (Egress) and nova.skills.open_app."""
 
     egress_allowlist: list[str] = field(default_factory=list)
+
+    #: closed allowlist for open_app: symbolic name -> absolute executable
+    #: path. docs/THREAT_MODEL.md §1.1 — open_app resolves only through this
+    #: map, never through a free-text path or a shell.
+    allowed_apps: dict[str, str] = field(default_factory=dict)
+
+    #: directories a resolved allowed_apps entry must realpath-land inside at
+    #: call time (docs/THREAT_MODEL.md §1.1). Checked with path containment,
+    #: not string prefix — a junction pointed out of one of these dirs must
+    #: fail the check even though its lexical path starts with the prefix.
+    allowed_app_dirs: list[str] = field(default_factory=list)
 
 
 @dataclass(frozen=True)
@@ -98,13 +110,30 @@ def _check_value(section: str, key: str, value: Any, expected: Any) -> Any:
             )
         return list(value)
 
+    if origin is dict:
+        key_type, val_type = typing.get_args(expected)
+        if isinstance(value, bool) or not isinstance(value, dict) or not all(
+            isinstance(k, key_type) and isinstance(v, val_type) and not isinstance(v, bool)
+            for k, v in value.items()
+        ):
+            raise ConfigError(
+                f"nova.yaml: '{section}.{key}' must be a mapping of "
+                f"{key_type.__name__} to {val_type.__name__}, got {value!r}"
+            )
+        return dict(value)
+
     if expected is float:
         if isinstance(value, bool) or not isinstance(value, (int, float)):
             raise ConfigError(
                 f"nova.yaml: '{section}.{key}' must be a float, got "
                 f"{type(value).__name__} ({value!r})"
             )
-        return float(value)
+        result = float(value)
+        if math.isnan(result) or math.isinf(result):
+            raise ConfigError(
+                f"nova.yaml: '{section}.{key}' must be a finite number, got {value!r}"
+            )
+        return result
 
     if expected is int:
         if isinstance(value, bool) or not isinstance(value, int):
