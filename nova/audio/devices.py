@@ -112,11 +112,23 @@ def _measure_device(index: int, info: dict, hostapi_name: str) -> _Measurement:
         return _Measurement(index, info["name"], hostapi_name, sr, 0.0, True, False, str(exc))
 
 
-def enumerate_and_measure() -> list[_Measurement]:
+def enumerate_and_measure(
+    devices: list[dict] | None = None,
+    hostapis: list[dict] | None = None,
+) -> list[_Measurement]:
     """Empirically probe every input-capable device. Records ~1s of real
-    audio from each and measures it — never trusts that opening succeeded."""
-    devices = sd.query_devices()
-    hostapis = sd.query_hostapis()
+    audio from each and measures it — never trusts that opening succeeded.
+
+    Accepts an already-queried device/hostapi list so callers that also
+    need those lists for other purposes (probe_input_devices, below) use
+    one consistent snapshot instead of querying PortAudio twice and risking
+    the two queries disagreeing. Defaults to querying fresh when omitted,
+    for standalone callers like scripts/probe_audio.py.
+    """
+    if devices is None:
+        devices = sd.query_devices()
+    if hostapis is None:
+        hostapis = sd.query_hostapis()
     results: list[_Measurement] = []
     for idx, info in enumerate(devices):
         if info.get("max_input_channels", 0) <= 0:
@@ -124,6 +136,34 @@ def enumerate_and_measure() -> list[_Measurement]:
         hostapi_name = hostapis[info["hostapi"]]["name"]
         results.append(_measure_device(idx, info, hostapi_name))
     return results
+
+
+def _resolve_current_index(
+    name: str, hostapi: str, devices: list[dict], hostapis: list[dict]
+) -> int | None:
+    """Find a device's CURRENT index by (name, hostapi) identity.
+
+    nova-security (T0.2 fix): PortAudio/Windows device indices are not a
+    stable identity across reboots, driver reloads, or a Windows Update
+    touching the audio stack. `_fingerprint_devices` sorts before hashing,
+    so it proves "the same set of devices is present" and says nothing
+    about which position each one occupies -- a cached index can silently
+    point at a different device after pure reordering, with the fingerprint
+    still matching. Never hand back a cached index without re-resolving it
+    against a freshly queried device list first.
+
+    If the match is ambiguous (two devices with the identical name on the
+    identical hostapi, e.g. two identical USB mics), the first one found
+    wins. That's a real edge case but a secondary one -- not resolved
+    further here.
+    """
+    for idx, info in enumerate(devices):
+        if info.get("max_input_channels", 0) <= 0:
+            continue
+        hostapi_name = hostapis[info["hostapi"]]["name"]
+        if info["name"] == name and hostapi_name == hostapi:
+            return idx
+    return None
 
 
 def _rank(m: _Measurement) -> tuple[int, float]:
@@ -165,22 +205,62 @@ def _save_cache(fingerprint: str, profile: DeviceProfile, all_measurements: list
     PROFILE_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
 
 
+def _patch_cached_index(cached: dict, new_index: int) -> None:
+    """Self-heal the on-disk cache after resolving index drift (no
+    re-measurement needed -- same device, just a different position), so a
+    human inspecting data/audio_profile.json directly doesn't see a stale
+    index that every real caller already ignores."""
+    cached["profile"]["index"] = new_index
+    try:
+        PROFILE_PATH.write_text(json.dumps(cached, indent=2), encoding="utf-8")
+    except OSError as exc:
+        _log.warning("Could not self-heal audio_profile.json's drifted index: %s", exc)
+
+
 def probe_input_devices(force: bool = False) -> DeviceProfile:
     """Return the best verified working input device, probing empirically
     if needed. Cached in data/audio_profile.json, keyed by a fingerprint of
     the current device list so plugging in a new headset forces a re-probe.
+
+    The fingerprint's only job is deciding whether to re-measure (expensive:
+    ~1s of real audio per candidate device). It is NOT used as proof that a
+    cached index still points at the right device -- indices can reorder
+    without changing the fingerprint (see _resolve_current_index). Index
+    resolution happens fresh on every call, cache hit or miss.
     """
     devices = sd.query_devices()
+    hostapis = sd.query_hostapis()
     fingerprint = _fingerprint_devices(devices)
 
     if not force:
         cached = _load_cache()
         if cached and cached.get("fingerprint") == fingerprint and cached.get("profile"):
             p = cached["profile"]
-            return DeviceProfile(**p)
+            current_index = _resolve_current_index(p["name"], p["hostapi"], devices, hostapis)
+            if current_index is not None:
+                if current_index != p["index"]:
+                    _log.info(
+                        "Device index drifted from %d to %d for %r on %r "
+                        "(same device, different position) -- resolved fresh, "
+                        "self-healing the cache.",
+                        p["index"], current_index, p["name"], p["hostapi"],
+                    )
+                    _patch_cached_index(cached, current_index)
+                return DeviceProfile(**{**p, "index": current_index})
+            _log.warning(
+                "Cached device %r on %r not found at any index despite a "
+                "matching fingerprint; re-probing instead of trusting a "
+                "stale cached index.",
+                p["name"], p["hostapi"],
+            )
+            # fall through to a full re-probe
 
-    _log.info("Probing input devices (fingerprint changed or force=True)...")
-    measurements = enumerate_and_measure()
+    _log.info("Probing input devices (fingerprint changed, cache miss, or force=True)...")
+    # winner.index below comes directly from enumerating this exact
+    # `devices` snapshot (enumerate_and_measure loops `enumerate(devices)`),
+    # the same one just fingerprinted above -- it cannot be stale, no
+    # separate resolution step needed on this path.
+    measurements = enumerate_and_measure(devices, hostapis)
     winner = _choose_winner(measurements)
 
     if winner is None:
