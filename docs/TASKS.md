@@ -53,9 +53,15 @@ Legend: TODO · CLAIMED · IN REVIEW · **DONE**
 | # | Finding | Severity | Owner | Status |
 |---|---|---|---|---|
 | F1 | Cached device index is not a stable identity; fingerprint sorts order away, so a device reorder silently rebinds capture to a different device | HIGH (undoes the host-API ranking that avoids the dead/AGC-crushed endpoints) | nova-dev-audio | queued after T0.6a |
-| F2 | `_dll.py` grants DLL search authority to discovered paths without resolving them; junction under `nvidia/*/bin` escapes the tree | LOW exploitability, cheap fix | nova-dev-stt | queued after T0.4 |
-| F3 | `_paths.py` recomputes constants `nova/__init__.py` already owns — one-source-of-truth violation | LOW | nova-dev-stt | queued after T0.4 |
+| F8 | Hash-pinning deferred to M1: pip's `--require-hashes` is all-or-nothing and auto-enables when ANY line has a hash, so partial pinning breaks `pip install -r` entirely; needs the full transitive closure via pip-compile | MEDIUM (supply chain) | lead | deferred to M1, deliberate |
+| F9 | `_on_event` needs the two-function shim so raw key events leave scope after two reviewed lines | HIGH sensitivity | nova-dev-audio | queued |
+| F10 | `_on_event` has no `except Exception`; Windows silently removes a WH_KEYBOARD_LL hook that throws — kills PTT with no signal | MEDIUM (availability) | nova-dev-audio | queued |
+| F11 | Elevated/UAC window hotkey coverage unverified — needs one human UAC click | UNKNOWN | Manav, at demo | open question |
+| F2 | `_dll.py` junction TOCTOU | LOW | nova-dev-stt | **FIXED** cd6b8bf, defense proven with a real junction |
+| F3 | `_paths.py` duplication | LOW | nova-dev-stt | **FIXED** 73a3226, now a thin re-export shim |
 | F4 | Hotkey hook sees every keystroke system-wide; needs never-log guarantee, possibly structural | HIGH sensitivity | nova-dev-audio + nova-security | in design |
 | F5 | LATCHED state could hold the mic open indefinitely after a stray keypress | HIGH | nova-dev-audio | fix required pre-commit |
 | F6 | `Player` not safe for concurrent `play()`; needs docstring | LOW | nova-dev-audio | queued |
-| F7 | `tts.speed` accepts `.inf`/`.nan`; `stt.model` unchecked vs HF cache | LOW | nova-dev-core | queued |
+| F7 | `tts.speed` inf/nan **FIXED** 13b0b6f; `stt.model` membership check deferred (drags a filesystem dep into pure parsing) | LOW | nova-dev-core | partial, deferred |
+
+| F12 | `Untrusted` fully unwrapped by `dataclasses.asdict()`/`astuple()` — silent, no audit, recursive through nested dataclasses | **CRITICAL** | nova-dev-sec | **FIXED** dbd77d8, verified by lead |
