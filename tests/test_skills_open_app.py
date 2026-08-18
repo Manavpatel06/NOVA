@@ -19,7 +19,9 @@ import pytest
 
 import nova.skills.open_app as open_app_mod
 from nova.config import Config, SecurityConfig
-from nova.skills.registry import SkillCtx
+from nova.security.audit import AuditLog, AuditWriteError
+from nova.security.ladder import Ladder
+from nova.skills.registry import SkillCtx, get_skill
 
 
 class _UnusedLadder:
@@ -262,3 +264,65 @@ async def test_configured_target_missing_on_disk_is_refused(trusted_dir, fake_po
     reply = await open_app_mod.open_app(ctx, "myapp")
     assert reply.success is False
     assert fake_popen.calls == []
+
+
+# ---------------------------------------------------------------------------
+# End-to-end through the real ladder: open_app is ACT tier, so a launch must
+# require the ladder's approval, not just the handler's own checks. None of
+# the tests above exercise this — they all call the handler directly with a
+# placeholder ladder that asserts if touched. This is the seam that proves
+# the SkillSpec.invoke() -> Ladder.authorize() -> handler wiring actually
+# covers open_app specifically, not just a synthetic dummy skill.
+# ---------------------------------------------------------------------------
+
+
+async def test_open_app_end_to_end_is_allowed_and_audited_when_the_ladder_approves(
+    trusted_dir, fake_popen, tmp_path
+):
+    exe = trusted_dir / "notepad.exe"
+    exe.write_bytes(b"fake exe")
+    audit = AuditLog(path=tmp_path / "audit.log")
+    ladder = Ladder(audit)
+    ctx = SkillCtx(
+        config=Config(security=SecurityConfig(
+            allowed_apps={"notepad": str(exe)}, allowed_app_dirs=[str(trusted_dir)],
+        )),
+        ladder=ladder,
+    )
+    spec = get_skill("open_app")
+    assert spec is not None
+
+    reply = await spec.invoke(ctx, app="notepad")
+
+    assert reply.success is True
+    assert len(fake_popen.calls) == 1
+    assert audit.verify().ok is True
+    assert audit.verify().entries == 1  # the ladder's own allow record
+
+
+async def test_open_app_end_to_end_denies_and_never_launches_when_the_audit_write_fails(
+    trusted_dir, fake_popen, tmp_path
+):
+    """ACT tier: an audit-write failure must deny BEFORE the handler ever
+    runs — Popen must never be called on an unrecorded ACT decision."""
+    exe = trusted_dir / "notepad.exe"
+    exe.write_bytes(b"fake exe")
+
+    class _FailingAudit:
+        def record(self, event):
+            raise AuditWriteError("disk full")
+
+    ladder = Ladder(_FailingAudit())
+    ctx = SkillCtx(
+        config=Config(security=SecurityConfig(
+            allowed_apps={"notepad": str(exe)}, allowed_app_dirs=[str(trusted_dir)],
+        )),
+        ladder=ladder,
+    )
+    spec = get_skill("open_app")
+    assert spec is not None
+
+    reply = await spec.invoke(ctx, app="notepad")
+
+    assert reply.success is False
+    assert fake_popen.calls == [], "open_app launched despite the ladder denying the action"
