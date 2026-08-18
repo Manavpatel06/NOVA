@@ -12,12 +12,14 @@ Legend: TODO · CLAIMED · IN REVIEW · **DONE**
 |---|---|---|---|
 | T0.1 | Core: config, bus, logging, pyproject, pytest harness | nova-dev-core | IN REVIEW (built, lead-verified; awaiting tests+security) |
 | T0.2 | Audio: device prober (WASAPI trap), capture, player | nova-dev-audio | CLAIMED |
-| T0.3 | STT: CUDA DLL setup, empirical compute-type probe, Transcriber | nova-dev-stt | CLAIMED |
-| T0.4 | TTS: Kokoro ONNX synthesizer + SAPI fallback | nova-dev-audio | TODO (after T0.2) |
-| T0.5 | Security kernel v0 + skill registry + `time`/`open_app` skills | nova-dev-core | TODO (after T0.1) |
+| T0.3 | STT: CUDA DLL setup, empirical compute-type probe, Transcriber | nova-dev-stt | IN REVIEW (GPU verified by lead from cold cache: cuda/float16/verified) |
+| T0.4 | TTS: Kokoro ONNX synthesizer + SAPI fallback + TTS→STT round trip | nova-dev-stt | CLAIMED (reassigned; audio dev still on T0.2) |
+| T0.5a | Skill registry, Tier, hash-chained AuditLog, `time`/`open_app` | nova-dev-core | CLAIMED |
+| T0.5b | Ladder + Egress (blocked on nova-security's T0.S2 spec) | unassigned | BLOCKED |
 | T0.6 | Turn loop + push-to-talk hotkey, wired end to end | lead | TODO (after all) |
 | T0.T | Contract-first test suites for T0.1–T0.5 | nova-tester | CLAIMED |
-| T0.S | Threat model + review of security kernel and Claude-arm egress boundary | nova-security | CLAIMED |
+| T0.S | Threat model + Claude-arm egress verdict | nova-security | **DONE** (d2cf9fa; contract amended) |
+| T0.S2 | Implementable spec for `Untrusted` + `Egress` + spawn allowlist | nova-security | CLAIMED |
 | T0.A | Independent verification of every M0 claim | nova-accuracy | TODO (after T0.6) |
 | T0.D | README + QUICKSTART reflecting what actually runs | nova-docs | TODO (after T0.6) |
 
@@ -29,3 +31,14 @@ Legend: TODO · CLAIMED · IN REVIEW · **DONE**
   in later without a rewrite.
 - Wake word ships as `hey_jarvis` until "hey nova" is trained in Colab.
 - STT: `large-v3-turbo`, cuda/float16. int8 is broken on Blackwell.
+
+## Measured on this machine (not modelled)
+
+| Fact | Value | How |
+|---|---|---|
+| STT device | cuda, float16, verified | probe re-run cold by lead |
+| Whisper load | 1.48 s | large-v3-turbo |
+| Whisper transcribe | 0.44 s for 3.0 s audio | synthetic tone |
+| VRAM, model resident | 2479 MiB | nvidia-smi |
+| VRAM after unload | 367 MiB | nvidia-smi — the C++ side really frees it |
+| int8 on this stack | **does not crash** | contrary to prior art; refused anyway, deliberately |
