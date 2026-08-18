@@ -30,12 +30,19 @@ end up *more* restricted than its declaration, never less.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Protocol
+from typing import TYPE_CHECKING, Any, Protocol
 
 from nova.log import get_logger
 from nova.security.audit import AuditLog, AuditWriteError
 from nova.security.tiers import Tier
-from nova.skills.registry import SkillSpec
+
+if TYPE_CHECKING:
+    # Deferred to break the ladder.py <-> registry.py import cycle now that
+    # SkillCtx (registry.py) needs to hold a Ladder: this module only ever
+    # uses SkillSpec in type annotations (never isinstance-checks it), and
+    # `from __future__ import annotations` above makes every annotation a
+    # string at runtime, so a real import here is never needed.
+    from nova.skills.registry import SkillSpec
 
 logger = get_logger("security.ladder")
 
