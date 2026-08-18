@@ -243,3 +243,88 @@ the injection test suite is still what proves the *deliberate* one doesn't exist
 - No absolute clock times in fixtures (constitution).
 - Paths: spaces, backslashes and long paths are normal here — test for them.
 - Hardware claims need evidence. "It should work" is not a result.
+
+---
+
+# M1 Interface Contracts
+
+Written **after** these modules landed, which is my error — I assigned M1 work by
+message and never wrote the contract, so nova-tester had code but no spec to test
+against. Recorded here so the promises are testable rather than inferred from
+implementation. Where this disagrees with the code, the contract is the promise
+and the code is wrong.
+
+## T1.2 — governor (`nova/governor.py`)
+
+```python
+TOPIC_TURN_START = "turn.start"   # published by app.py when a turn begins
+TOPIC_TURN_END   = "turn.end"     # ...and when it ends, including on every early return
+
+class Governor:
+    def __init__(self, bus: EventBus, config: GovernorConfig | None = None)
+    def register(self, name, component: LoadableComponent, *, typical_rss_mb: float) -> None
+    def current_rss_mb(self) -> float
+    def snapshot(self) -> GovernorSnapshot
+    def check_once(self) -> None        # public + synchronous: drivable without a poll loop
+```
+
+Promises:
+- **Never unloads mid-turn.** Between `turn.start` and `turn.end` the governor
+  withholds unloading, no matter what RSS says.
+- **Never calls `load()`.** Components lazy-load themselves; the governor only
+  ever drives `unload()`. It reduces; it does not summon.
+- `typical_rss_mb` is **required, no default** — it affects unload *order* only;
+  the decide-to-unload signal is always live `psutil`. A default would be an
+  invented number, and invented numbers are what this project keeps deleting.
+- An unreachable ceiling logs a WARNING and returns. It must not loop, thrash,
+  or crash.
+- The ceiling (900 MB) sits **above** Whisper's measured host-RSS floor
+  (~741 MB), deliberately. A ceiling below the floor makes the governor fight
+  physics: unload, reload, unload, paying latency forever and freeing nothing.
+  Its honest job is *shed Kokoro when both are idle*, not *return to cold idle*.
+  See `docs/GOVERNOR_MEASUREMENTS.md` and ADR 0006.
+
+## T1.1 — wake word + VAD (`nova/audio/wake.py`, `nova/audio/vad.py`)
+
+```python
+TOPIC_WAKE_START = "wake.start"   # payload carries preroll PCM
+TOPIC_WAKE_END   = "wake.end"     # mode: "vad_end" | "arm_timeout"
+
+class Vad:
+    def load(self); def reset(self); def process(self, frame) -> float   # 480-sample frames
+```
+
+Promises:
+- **Wake and push-to-talk are interchangeable arming sources.** The turn loop
+  must not care which fired. That interchangeability is the design goal — the
+  wake word is a second door into the same room, not a parallel pipeline.
+- **Opens no audio device.** `process(frame)` is fed by whoever owns the single
+  `Capture`. Two components competing for the mic is a bug we get to not have.
+- **Never boots deaf-and-silent.** A missing model file → WARNING naming the
+  exact file, `backend_available=False`, `process()` a safe no-op. A config
+  pointing at a nonexistent `hey_nova.onnx` must never look healthy.
+- **`hey_nova.onnx` is a pure file drop-in.** Embedding count is read from the
+  model's own input shape at load time, never hardcoded.
+- **Privacy:** the ring buffer is the one sanctioned exception to the hotkey's
+  zero-buffering rule — bounded, never grows, never logged, never written to
+  disk. Raw PCM rides only on `wake.start`, where downstream legitimately needs
+  it.
+
+## T1.3 — confirm channel (`nova/security/confirm.py`)
+
+`ConfirmChannel` is a `Protocol` with `async request(skill, params) -> bool`, so
+a tray/dialog channel drops in with zero ladder changes.
+
+Three causes, three audited reasons, all denying:
+
+| Cause | Reason |
+|---|---|
+| channel returns `False` | `confirm_declined` |
+| channel raises `ConfirmTimeout` | `confirm_timed_out` |
+| channel raises anything else | `confirm_channel_error` |
+
+An audit log recording that a human declined, when no human was ever consulted,
+is worse than one that says nothing — because it will be believed.
+
+The prompt shows the **actual post-redaction payload**, recursively through
+dicts and lists. Consent is to a specific disclosure, not to a category.
