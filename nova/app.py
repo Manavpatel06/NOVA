@@ -1,0 +1,301 @@
+"""The turn loop — six modules made into an assistant (docs/TASKS.md T0.6b).
+
+The M0 thread, end to end:
+
+    hotkey -> capture -> Whisper -> router -> ladder -> skill -> reply text
+    -> Kokoro -> speakers
+
+`NovaApp` wires to the `EventBus`, not to the other modules directly: it
+subscribes to `ptt.start`/`ptt.end` (published by `nova.interfaces.hotkey`)
+rather than reaching into the hotkey module, so M1's wake word is a drop-in
+publisher swap, not a rewrite of this file.
+
+Every skill call goes through `SkillSpec.invoke()` — never a handler
+directly — because that is the seam `nova-dev-sec` wired `Ladder.authorize()`
+into (`SkillCtx.ladder`, required, not optional-with-a-None-default). This
+module constructs the process's `AuditLog` and `Ladder` at boot (per their
+own docstrings: "one instance, constructed at boot"), calls `bind_audit()`
+so `Untrusted.reveal()` is never running audit-less, and threads
+`self.ladder` into every `SkillCtx` it builds. It never calls
+`ladder.authorize()` itself — that would double-authorize (and double-audit)
+every invocation, since `invoke()` already does it.
+
+Fails loudly, never silently: every stage that can fail is caught, logged
+with a WARNING/ERROR naming the stage, and answered with *something* spoken
+(via `Synthesizer`, which already falls back to Windows SAPI) rather than
+leaving Manav staring at silence.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import queue
+import time
+from typing import Any
+
+import numpy as np
+
+import nova.skills  # import triggers discover_skills() (nova/skills/__init__.py)
+from nova.audio.capture import Capture
+from nova.audio.player import Player
+from nova.brain.router import Router
+from nova.config import Config, load_config
+from nova.interfaces.hotkey import TOPIC_PTT_END, TOPIC_PTT_START, Hotkey, PTTEvent
+from nova.log import get_logger
+from nova.security.audit import AuditLog
+from nova.security.ladder import Ladder
+from nova.security.untrusted import bind_audit
+from nova.skills.registry import Reply, SkillCtx
+from nova.stt.transcriber import Transcriber
+from nova.tts.synthesizer import Synthesizer
+
+_log = get_logger(__name__)
+
+#: how often the capture reader thread re-checks the stop flag while
+#: waiting for the next audio frame (Capture.read()'s timeout= parameter)
+_CAPTURE_POLL_S = 0.2
+
+
+class NovaApp:
+    """Owns one instance of every M0 module and wires them through the bus.
+    Construction is cheap and loads no models (Transcriber/Synthesizer are
+    lazy: the underlying WhisperModel/Kokoro session loads on first real
+    use, not at construction) -- see the T0.6b report for measured idle vs.
+    mid-turn RSS/VRAM.
+    """
+
+    def __init__(self, config: Config | None = None) -> None:
+        self.config = config or load_config()
+
+        from nova.bus import EventBus
+
+        self.bus = EventBus()
+
+        # --- security kernel, constructed at boot per Ladder's/AuditLog's
+        # own docstrings; see module docstring for why this app does not
+        # call ladder.authorize() itself.
+        self.audit = AuditLog()
+        bind_audit(self.audit)
+        self.ladder = Ladder(self.audit)
+
+        # --- brain: router reads the live skill registry, populated by the
+        # `import nova.skills` above.
+        self.router = Router(
+            confidence_floor=self.config.brain.confidence_floor,
+            ambiguity_margin=self.config.brain.ambiguity_margin,
+        )
+
+        # --- speech I/O. Constructing these does not load a model; both
+        # classes lazy-load on first real use (Transcriber.transcribe(),
+        # Synthesizer.say()).
+        self.transcriber = Transcriber()
+        self.synth = Synthesizer()
+        self.player = Player()
+        self.hotkey = Hotkey(self.bus)
+
+        # --- capture session state, populated per ptt.start/ptt.end pair
+        self._capture: Capture | None = None
+        self._capturing = False
+        self._capture_stop: asyncio.Event | None = None
+        self._capture_task: asyncio.Task[list[np.ndarray]] | None = None
+
+        # serializes turns -- a stray second ptt.start mid-turn must not
+        # start a second, overlapping run_turn()
+        self._turn_lock = asyncio.Lock()
+
+        self.bus.subscribe(TOPIC_PTT_START, self._on_ptt_start)
+        self.bus.subscribe(TOPIC_PTT_END, self._on_ptt_end)
+
+    # -- lifecycle ----------------------------------------------------------
+
+    async def start(self) -> None:
+        """Arm the hotkey and start listening. Loads no models."""
+        self.hotkey.start(loop=asyncio.get_running_loop())
+        if not self.hotkey.backend_available:
+            _log.warning(
+                "NovaApp started but the hotkey backend is unavailable -- "
+                "NOVA has no input path until this is fixed (see the WARNING "
+                "above naming why)."
+            )
+        else:
+            _log.info("NovaApp ready: hold %r to talk", self.hotkey.combo)
+
+    async def stop(self) -> None:
+        """Tear down cleanly: stop the hotkey, release loaded models."""
+        self.hotkey.stop()
+        self.transcriber.unload()
+        self.synth.unload()
+
+    # -- bus handlers ---------------------------------------------------
+
+    async def _on_ptt_start(self, event: PTTEvent) -> None:
+        if self._capturing:
+            _log.warning("ptt.start received while a capture is already in progress; ignoring")
+            return
+        try:
+            if self._capture is None:
+                self._capture = Capture()
+            self._capture.start()
+        except Exception as exc:
+            _log.error("Capture failed to start (%s); this turn will produce no audio", exc)
+            return
+
+        self._capturing = True
+        self._capture_stop = asyncio.Event()
+        self._capture_task = asyncio.create_task(self._read_capture_until_stopped())
+        _log.info("ptt.start: capture began")
+
+    async def _read_capture_until_stopped(self) -> list[np.ndarray]:
+        assert self._capture is not None and self._capture_stop is not None
+        capture = self._capture
+        stop_event = self._capture_stop
+
+        def _blocking_reader() -> list[np.ndarray]:
+            frames: list[np.ndarray] = []
+            while not stop_event.is_set():
+                try:
+                    frames.append(capture.read(timeout=_CAPTURE_POLL_S))
+                except queue.Empty:
+                    continue
+                except Exception as exc:
+                    _log.error("Capture.read() failed mid-turn (%s); ending capture early", exc)
+                    break
+            return frames
+
+        return await asyncio.to_thread(_blocking_reader)
+
+    async def _on_ptt_end(self, event: PTTEvent) -> None:
+        if not self._capturing or self._capture_task is None or self._capture_stop is None:
+            _log.warning("ptt.end received with no active capture; ignoring")
+            return
+
+        self._capturing = False
+        self._capture_stop.set()
+        frames = await self._capture_task
+        self._capture_task = None
+        try:
+            assert self._capture is not None
+            self._capture.stop()
+        except Exception as exc:
+            _log.warning("Capture.stop() failed (%s)", exc)
+
+        if not frames:
+            _log.warning("ptt session (mode=%s) produced no audio frames", event.mode)
+            await self._speak("I didn't catch that.")
+            return
+
+        pcm = np.concatenate(frames)
+        duration_s = len(pcm) / 16000
+        _log.info("ptt.end (mode=%s): captured %.2fs of audio", event.mode, duration_s)
+        await self.run_turn(pcm, source=f"ptt:{event.mode}")
+
+    # -- the turn ---------------------------------------------------------
+
+    async def run_turn(self, pcm: np.ndarray, *, source: str = "capture") -> Reply | None:
+        """Run one full turn: STT -> router -> ladder-gated skill -> TTS.
+        Returns the skill's Reply, or None if the turn ended in a spoken
+        clarification or a caught failure (both cases still *speak*
+        something -- never a silent no-op).
+        """
+        async with self._turn_lock:
+            t_start = time.monotonic()
+            timings: dict[str, float] = {}
+
+            # --- STT ---------------------------------------------------
+            t0 = time.monotonic()
+            try:
+                text = await asyncio.to_thread(self.transcriber.transcribe, pcm)
+            except Exception as exc:
+                _log.error("Turn (%s): Transcriber.transcribe() failed (%s)", source, exc)
+                await self._speak("Sorry, I had trouble hearing that.")
+                return None
+            timings["stt"] = time.monotonic() - t0
+
+            text = text.strip()
+            if not text:
+                _log.info("Turn (%s): STT returned empty text; nothing to route", source)
+                await self._speak("I didn't catch that.")
+                return None
+            _log.info("Turn (%s): heard %r", source, text)
+
+            # --- router --------------------------------------------------
+            t0 = time.monotonic()
+            try:
+                match = self.router.route(text)
+            except Exception as exc:
+                _log.error("Turn (%s): Router.route(%r) failed (%s)", source, text, exc)
+                await self._speak("Sorry, something went wrong understanding that.")
+                return None
+            timings["route"] = time.monotonic() - t0
+
+            if match.clarification is not None:
+                # Constitutional requirement, not an error path: below the
+                # confidence floor (or ambiguous), NOVA asks rather than
+                # guesses -- it never acts on a low-confidence match as if
+                # certain.
+                _log.info(
+                    "Turn (%s): confidence %.3f -- asking for clarification instead of acting",
+                    source, match.confidence,
+                )
+                await self._speak(match.clarification)
+                self._log_timings(source, timings, t_start)
+                return None
+
+            # --- skill, through the ladder's one entry point ------------
+            assert match.spec is not None
+            t0 = time.monotonic()
+            ctx = SkillCtx(config=self.config, ladder=self.ladder)
+            try:
+                reply = await match.spec.invoke(ctx, **match.params)
+            except Exception as exc:
+                _log.error("Turn (%s): skill %r raised (%s)", source, match.spec.name, exc)
+                await self._speak(f"Sorry, something went wrong with {match.spec.name}.")
+                return None
+            timings["skill"] = time.monotonic() - t0
+
+            # --- TTS + playback ------------------------------------------
+            t0 = time.monotonic()
+            await self._speak(reply.text)
+            timings["speak"] = time.monotonic() - t0
+
+            self._log_timings(source, timings, t_start)
+            return reply
+
+    async def _speak(self, text: str) -> None:
+        """Synthesize and play `text`. NOVA must never go silently mute:
+        Synthesizer already falls back to Windows SAPI if Kokoro fails, so
+        the only way this logs an error is if *both* engines failed."""
+        try:
+            pcm, samplerate = await asyncio.to_thread(self.synth.say, text)
+        except Exception as exc:
+            _log.error(
+                "Synthesizer.say(%r) failed even with its SAPI fallback (%s); "
+                "NOVA cannot speak this turn", text, exc,
+            )
+            return
+        try:
+            await self.player.play(pcm, samplerate)
+        except Exception as exc:
+            _log.error("Player.play() failed (%s); the reply was %r", exc, text)
+
+    @staticmethod
+    def _log_timings(source: str, timings: dict[str, float], t_start: float) -> None:
+        timings["total"] = time.monotonic() - t_start
+        _log.info("Turn (%s) timings (s): %s", source, {k: round(v, 3) for k, v in timings.items()})
+
+
+async def _run() -> None:
+    app = NovaApp()
+    await app.start()
+    try:
+        await asyncio.Event().wait()  # run until interrupted
+    finally:
+        await app.stop()
+
+
+def run() -> None:
+    """Entry point for `python -m nova`."""
+    try:
+        asyncio.run(_run())
+    except KeyboardInterrupt:
+        pass
