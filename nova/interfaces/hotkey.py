@@ -258,70 +258,98 @@ class Hotkey:
 
     # -- hook callback: runs on the keyboard library's own hook thread ----
 
-    def _on_event(self, event) -> bool:
+    def _extract_combo_event(self, event) -> tuple[str, str, float] | None:
         """PRIVACY RULE -- read before touching this function.
 
-        keyboard.hook() delivers EVERY keystroke on this machine to this
-        callback: passwords, messages, card numbers, all of it. That is
+        This is the ONLY place in the module that ever touches the raw
+        `event` object. keyboard.hook() delivers EVERY keystroke on this
+        machine here: passwords, messages, card numbers, all of it. That is
         inherent to a global low-level hook and an accepted cost for a PTT
-        hotkey, but it means this function must never become a keylogger
-        by accident:
+        hotkey, but it means this function must never become a keylogger by
+        accident, and it must stay small and reviewable enough that "never"
+        is easy to verify by reading it rather than by policing every future
+        change to a bigger function:
           - a non-combo key is identified and discarded on the very next
-            line, immediately, unconditionally. It is never buffered
-            (not even transiently "for state"), never logged, at any level
-            including DEBUG, and its name/scan code never leaves this
-            function.
-          - the combo keys themselves are tracked only as membership in a
-            small fixed set (self._held) -- never logged individually,
-            only ever surfaced as durations/state-transition names.
-          - only a timestamp and a coarse mode string ("hold"/"latch"/
-            "latch_timeout") ever cross the bus (PTTEvent) or hit a log
-            line. No key name, scan code, or per-event detail does.
-        If you're tempted to add a debug print of `event` here: don't.
-        That is exactly how a keylog ends up in data/nova.log, which is a
-        file that later gets attached to a bug report.
+            line, immediately, unconditionally. It is never buffered (not
+            even transiently), never logged at any level including DEBUG,
+            and its name/scan code never leaves this function.
+          - on a match, only a minimal (key, event_type, ts) tuple is
+            returned -- never the event object itself. Everything below
+            this function (the state machine) receives only that stripped
+            tuple, so it structurally cannot reach for raw key data: the
+            event isn't in scope past these few lines.
+        THIS FUNCTION MUST NEVER CONTAIN A LOGGING CALL. Not even at DEBUG,
+        not even temporarily "for development." That is exactly how a
+        keylog ends up in data/nova.log, which is a file that later gets
+        attached to a bug report.
         """
         name = _canonical(getattr(event, "name", None))
         if name not in self._combo_keys:
-            return True  # discard immediately: not our combo, no trace kept
-
-        now = time.monotonic()
+            return None
         event_type = getattr(event, "event_type", None)
+        return (name, event_type, time.monotonic())
 
-        with self._state_lock:
-            if event_type == "down":
-                self._held.add(name)
-                if self._state == _State.IDLE and self._combo_keys <= self._held:
-                    self._state = _State.ARMED
-                    self._press_time = now
-                    self._publish(TOPIC_PTT_START, PTTEvent(ts=time.time()))
+    def _on_event(self, event) -> bool:
+        """Hook callback -- runs on the keyboard library's own hook thread,
+        for every keystroke on the machine. Delegates immediately to
+        _extract_combo_event (see its docstring for the privacy rule) and
+        never touches `event` itself beyond that one handoff.
 
-            elif event_type == "up":
-                self._held.discard(name)
-                # Releasing a multi-key combo fires one 'up' event per key,
-                # a few ms apart (measured: space/alt/ctrl each ~50ms apart
-                # when releasing in physical order). Acting on the first
-                # one would treat the second and third as spurious
-                # re-triggers. Only act once every combo key is confirmed up.
-                if self._held & self._combo_keys:
-                    return True
+        Wrapped in a broad except: an uncaught exception here propagates
+        into keyboard's third-party hook dispatch, and Windows can silently
+        remove a WH_KEYBOARD_LL hook that throws or hangs -- which would
+        kill push-to-talk with no NOVA-side signal at all. Logs only the
+        exception's type name, never the exception message or `event`
+        (either could echo back something keystroke-derived).
+        """
+        try:
+            extracted = self._extract_combo_event(event)
+            if extracted is None:
+                return True  # not our combo; discard, don't suppress
+            key, event_type, now = extracted
 
-                if self._state == _State.ARMED:
-                    held_duration = now - self._press_time
-                    if held_duration < self._tap_threshold_s:
-                        self._state = _State.LATCHED
-                        self._arm_latch_timer_locked()
-                        _log.info(
-                            "Hotkey: tap detected (%.0fms) -> latched (listening)",
-                            held_duration * 1000,
-                        )
-                    else:
+            with self._state_lock:
+                if event_type == "down":
+                    self._held.add(key)
+                    if self._state == _State.IDLE and self._combo_keys <= self._held:
+                        self._state = _State.ARMED
+                        self._press_time = now
+                        self._publish(TOPIC_PTT_START, PTTEvent(ts=time.time()))
+
+                elif event_type == "up":
+                    self._held.discard(key)
+                    # Releasing a multi-key combo fires one 'up' event per
+                    # key, a few ms apart (measured: space/alt/ctrl each
+                    # ~50ms apart when releasing in physical order). Acting
+                    # on the first one would treat the second and third as
+                    # spurious re-triggers. Only act once every combo key
+                    # is confirmed up.
+                    if self._held & self._combo_keys:
+                        return True
+
+                    if self._state == _State.ARMED:
+                        held_duration = now - self._press_time
+                        if held_duration < self._tap_threshold_s:
+                            self._state = _State.LATCHED
+                            self._arm_latch_timer_locked()
+                            _log.info(
+                                "Hotkey: tap detected (%.0fms) -> latched (listening)",
+                                held_duration * 1000,
+                            )
+                        else:
+                            self._state = _State.IDLE
+                            self._publish(TOPIC_PTT_END, PTTEvent(ts=time.time(), mode="hold"))
+                    elif self._state == _State.LATCHED:
                         self._state = _State.IDLE
-                        self._publish(TOPIC_PTT_END, PTTEvent(ts=time.time(), mode="hold"))
-                elif self._state == _State.LATCHED:
-                    self._state = _State.IDLE
-                    self._cancel_latch_timer_locked()
-                    self._publish(TOPIC_PTT_END, PTTEvent(ts=time.time(), mode="latch"))
+                        self._cancel_latch_timer_locked()
+                        self._publish(TOPIC_PTT_END, PTTEvent(ts=time.time(), mode="latch"))
+        except Exception as exc:
+            _log.warning(
+                "Hotkey callback raised %s; continuing so the hook stays "
+                "installed (an uncaught exception here can get the hook "
+                "silently removed by Windows).",
+                type(exc).__name__,
+            )
 
         return True  # never suppress; NOVA observes, doesn't own this combo exclusively
 
