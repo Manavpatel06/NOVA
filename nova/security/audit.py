@@ -27,6 +27,7 @@ import hashlib
 import json
 import re
 import threading
+from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -34,6 +35,7 @@ from typing import Any
 
 from nova import AUDIT_LOG_PATH
 from nova.log import get_logger
+from nova.security.redact import redact
 
 logger = get_logger("security.audit")
 
@@ -52,10 +54,15 @@ _MAX_DEPTH = 6
 _REDACTED = "<redacted>"
 
 
-def _sanitize(value: Any, depth: int = 0) -> Any:
-    """Recursively cap string length, cap list length, and redact
-    secret-shaped dict keys. Applied to every event before it is hashed or
-    written — the audit log is a permanent record, not a scratch log."""
+def _sanitize(value: Any, depth: int = 0, *, redact_terms: Sequence[str] = ()) -> Any:
+    """Recursively cap string length, cap list length, redact secret-shaped
+    dict keys, and run every string value through the one shared content
+    redactor (F14: composing nova.security.redact.redact() here, not just
+    matching on key names, closes the gap the moment an ACT/CONFIRM skill
+    takes free text — a raw path or email address in a `params` value used
+    to sail through the key-based check untouched). Applied to every event
+    before it is hashed or written — the audit log is a permanent record,
+    not a scratch log."""
     if depth > _MAX_DEPTH:
         return "<max-depth-exceeded>"
     if isinstance(value, dict):
@@ -64,11 +71,12 @@ def _sanitize(value: Any, depth: int = 0) -> Any:
             if isinstance(k, str) and _SECRET_KEY_RE.search(k):
                 out[k] = _REDACTED
                 continue
-            out[k] = _sanitize(v, depth + 1)
+            out[k] = _sanitize(v, depth + 1, redact_terms=redact_terms)
         return out
     if isinstance(value, list):
-        return [_sanitize(v, depth + 1) for v in value[:_MAX_LIST_ITEMS]]
+        return [_sanitize(v, depth + 1, redact_terms=redact_terms) for v in value[:_MAX_LIST_ITEMS]]
     if isinstance(value, str):
+        value = redact(value, redact_terms=redact_terms)
         if len(value) > _MAX_STRING_LEN:
             omitted = len(value) - _MAX_STRING_LEN
             return f"{value[:_MAX_STRING_LEN]}...<truncated {omitted} chars>"
@@ -107,9 +115,10 @@ class AuditLog:
     """The durable record of every ACT/CONFIRM decision NOVA makes. Not a
     general-purpose logger — see nova.log for that."""
 
-    def __init__(self, path: Path | None = None) -> None:
+    def __init__(self, path: Path | None = None, *, redact_terms: Sequence[str] = ()) -> None:
         self._path = Path(path) if path is not None else AUDIT_LOG_PATH
         self._lock = threading.Lock()
+        self._redact_terms = tuple(redact_terms)
 
     def record(self, event: dict[str, Any]) -> None:
         """Append `event` to the chain. Raises AuditWriteError if the entry
@@ -121,7 +130,7 @@ class AuditLog:
                 seq = 0 if last is None else last["seq"] + 1
                 prev_hash = GENESIS_HASH if last is None else last["hash"]
                 ts = datetime.now(timezone.utc).isoformat()
-                sanitized_event = _sanitize(event)
+                sanitized_event = _sanitize(event, redact_terms=self._redact_terms)
                 entry_hash = _entry_hash(seq, ts, sanitized_event, prev_hash)
                 entry = {
                     "seq": seq,
