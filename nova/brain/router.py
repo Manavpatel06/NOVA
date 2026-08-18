@@ -1,5 +1,11 @@
 """The router: text in, a skill (or a clarifying question) out.
 
+The calibration *method* behind the two config numbers below (not just the
+current numbers) is written up durably in docs/ROUTER_CALIBRATION.md --
+read that before re-tuning confidence_floor/ambiguity_margin for a grown
+registry; this docstring is the in-code summary, that doc is the one meant
+to survive independently of this file.
+
 ## Matching, deterministically, against `examples` alone
 
 No LLM, no second pattern list anywhere: every skill's `examples` (already
