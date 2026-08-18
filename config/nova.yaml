@@ -53,6 +53,13 @@ hotkey:
   tap_threshold_ms: 300      # <= this held duration = tap (latch toggle); > this = hold (classic PTT)
   latch_timeout_ms: 30000    # LATCHED auto-expires after this long with no closing tap
 
+wake:
+  model_path: hey_jarvis_v0.1.onnx   # resolved against models/wake/; swap for hey_nova.onnx later, zero code changes
+  threshold: 0.55             # the one knob Manav will actually tune
+  preroll_ms: 1000             # audio kept before detection so the first syllables aren't lost
+  arm_timeout_ms: 15000        # hard ceiling if VAD never detects end-of-speech
+  vad_silence_ms: 800          # trailing silence that ends an armed turn once speech has started
+
 brain:
   # Calibrated against a labelled phrase set, not chosen decoratively --
   # see nova/brain/router.py's module docstring for the method and the

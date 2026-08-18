@@ -91,6 +91,19 @@ class HotkeyConfig:
 
 
 @dataclass(frozen=True)
+class WakeConfig:
+    """Consumed by nova.audio.wake (WakeWord)."""
+
+    #: filename resolved against models/wake/ (nova.WAKE_MODEL_DIR) -- swap
+    #: in hey_nova.onnx later with zero code changes.
+    model_path: str = "hey_jarvis_v0.1.onnx"
+    threshold: float = 0.55  # the one knob Manav will actually tune
+    preroll_ms: int = 1000  # audio kept before detection so the first syllables of the command aren't lost
+    arm_timeout_ms: int = 15000  # hard ceiling if VAD never detects end-of-speech
+    vad_silence_ms: int = 800  # consecutive trailing silence (VAD) that ends an armed turn once speech has started
+
+
+@dataclass(frozen=True)
 class BrainConfig:
     """Consumed by nova.brain.router.Router. See its module docstring for how
     these two numbers were chosen (calibrated against a labelled phrase set,
@@ -134,6 +147,7 @@ class Config:
     tts: TtsConfig = field(default_factory=TtsConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
     hotkey: HotkeyConfig = field(default_factory=HotkeyConfig)
+    wake: WakeConfig = field(default_factory=WakeConfig)
     brain: BrainConfig = field(default_factory=BrainConfig)
     governor: GovernorConfig = field(default_factory=GovernorConfig)
 
@@ -144,6 +158,7 @@ _SECTIONS: dict[str, type] = {
     "tts": TtsConfig,
     "security": SecurityConfig,
     "hotkey": HotkeyConfig,
+    "wake": WakeConfig,
     "brain": BrainConfig,
     "governor": GovernorConfig,
 }
