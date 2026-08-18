@@ -91,6 +91,26 @@ Audio)`, index 4, opened and accepted a buffer.
 
 Audibility itself still needs your ears — no probe can close that.
 
+### Remote control changes what the demo proves
+
+Measured 2026-08-18: NOVA runs in the **physical console session**
+(`SESSIONNAME=Console`, no RDP/TeamViewer/AnyDesk processes present). Its audio
+devices are the laptop's own — so NOVA speaks into the room containing the
+laptop and listens to that same room, wherever the human happens to be.
+
+Consequences for anyone demoing over a remote-control tool:
+
+- **Hearing NOVA remotely usually works** — most remote tools stream host audio
+  to the client.
+- **Speaking to NOVA remotely usually does not** — few forward the client's
+  microphone to the host. The wake word and push-to-talk both capture the
+  laptop's mic, in the laptop's room.
+
+So a remote session can close the *speakers are audible* item but generally
+cannot close *a real human voice transcribes correctly*. That one needs someone
+in front of the machine, or a deliberate substitute (feeding recorded human
+speech through `Transcriber` rather than through `Capture`).
+
 Command for the human demo: `.venv\Scripts\python.exe -m nova`
 
 ### Measurement caveat, learned the hard way
