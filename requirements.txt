@@ -1,0 +1,37 @@
+# NOVA — pinned runtime dependencies
+#
+# Every version here is what is ACTUALLY INSTALLED and running on Manav's
+# machine, captured from the venv rather than aspirational. Regenerate with:
+#   .venv/Scripts/python.exe -m pip list --format=freeze
+#
+# Python 3.13.14, Windows 11, RTX 5060 (Blackwell sm_120).
+
+# --- core ---
+numpy==2.5.2
+PyYAML==6.0.3
+psutil==7.2.2
+
+# --- audio I/O ---
+sounddevice==0.5.6
+soundfile==0.14.0
+
+# --- speech to text ---
+faster-whisper==1.2.1
+ctranslate2==4.8.1
+tokenizers==0.23.1
+
+# CUDA runtime for CTranslate2. Windows does not search PATH for extension-module
+# DLLs, so nova/stt/_dll.py adds these wheels' bin/ dirs via os.add_dll_directory()
+# BEFORE ctranslate2 is imported. Without them, WhisperModel loads and then dies at
+# the FIRST inference with "cublas64_12.dll is not found" -- reproduced live here.
+nvidia-cublas-cu12==12.9.2.10
+nvidia-cudnn-cu12==9.24.0.43
+
+# --- text to speech ---
+onnxruntime==1.29.0
+kokoro-onnx==0.5.0
+misaki==0.7.4          # kokoro-onnx's grapheme-to-phoneme dependency
+
+# --- interfaces ---
+keyboard==0.13.5       # global hotkey; system-wide low-level hook
+pywin32==312           # foreground-window checks, SAPI fallback voice
