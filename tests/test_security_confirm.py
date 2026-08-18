@@ -10,6 +10,8 @@ ConsoleConfirmChannel's real timeout behavior.
 from __future__ import annotations
 
 import io
+import subprocess
+import sys
 import time
 
 import pytest
@@ -231,3 +233,58 @@ async def test_console_channel_timeout_wired_through_the_real_ladder_denies():
     assert decision.allowed is False
     assert decision.reason == "confirm_timed_out"
     assert audit.records[-1]["reason"] == "confirm_timed_out"
+
+
+# ---------------------------------------------------------------------------
+# Regression: a timed-out confirm must not prevent process exit.
+#
+# nova-dev-sec's first draft used loop.run_in_executor(None, stream.readline)
+# — the default ThreadPoolExecutor registers an atexit hook that joins every
+# worker thread, so a reader blocked forever on a real readline() froze the
+# whole interpreter at shutdown, with nothing pointing at the confirm path
+# (it would present to Manav as "NOVA sometimes won't exit"). Fixed with a
+# dedicated daemon=True thread instead. A real, deterministic test for "the
+# process doesn't hang" has to actually exit a real process — an in-process
+# test can't observe interpreter-shutdown behavior at all. Bounded and not
+# flaky: the reader thread sleeps for 30s (never returns in any plausible
+# test run), while the whole subprocess is asserted to exit within 10s —
+# a regression to the non-daemon design would make this test fail by timing
+# out at 10s, not by hanging for the full 30s.
+# ---------------------------------------------------------------------------
+
+
+def test_a_timed_out_confirm_does_not_prevent_process_exit():
+    script = (
+        "import asyncio, io, time\n"
+        "from nova.security.confirm import ConsoleConfirmChannel\n"
+        "from nova.security.ladder import ConfirmTimeout\n"
+        "from nova.security.tiers import Tier\n"
+        "from nova.skills.registry import Reply, SkillSpec\n"
+        "\n"
+        "async def handler(ctx):\n"
+        "    return Reply(text='ok')\n"
+        "\n"
+        "skill = SkillSpec(name='x', tier=Tier.CONFIRM, examples=('x',), trusts_input=False, handler=handler)\n"
+        "\n"
+        "class NeverAnswers:\n"
+        "    def readline(self):\n"
+        "        time.sleep(30)\n"
+        "        return 'y\\n'\n"
+        "\n"
+        "async def main():\n"
+        "    channel = ConsoleConfirmChannel(timeout_s=0.1, stream_in=NeverAnswers(), stream_out=io.StringIO())\n"
+        "    try:\n"
+        "        await channel.request(skill, {})\n"
+        "    except ConfirmTimeout:\n"
+        "        pass\n"
+        "\n"
+        "asyncio.run(main())\n"
+        "print('EXITED_CLEANLY')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert "EXITED_CLEANLY" in result.stdout, (
+        f"process did not print its exit marker; stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
