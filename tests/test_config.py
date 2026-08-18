@@ -193,6 +193,71 @@ def test_list_field_accepts_list_of_str(tmp_path):
     assert cfg.security.egress_allowlist == ["api.example.com", "x.com"]
 
 
+def test_float_field_rejects_infinity(tmp_path):
+    """docs/SECURITY_SPEC.md §4 flagged tts.speed: float accepting YAML's
+    .inf/.nan literals as a robustness gap; config.py has since closed it."""
+    bad = _write(tmp_path / "nova.yaml", "tts:\n  speed: .inf\n")
+    with pytest.raises(ConfigError, match="finite"):
+        load_config(bad)
+
+
+def test_float_field_rejects_nan(tmp_path):
+    bad = _write(tmp_path / "nova.yaml", "tts:\n  speed: .nan\n")
+    with pytest.raises(ConfigError, match="finite"):
+        load_config(bad)
+
+
+def test_dict_field_accepts_str_to_str_mapping(tmp_path):
+    cfg = load_config(
+        _write(
+            tmp_path / "nova.yaml",
+            "security:\n  allowed_apps:\n    notepad: C:\\Windows\\System32\\notepad.exe\n",
+        )
+    )
+    assert cfg.security.allowed_apps == {"notepad": "C:\\Windows\\System32\\notepad.exe"}
+
+
+def test_dict_field_rejects_non_dict(tmp_path):
+    bad = _write(tmp_path / "nova.yaml", "security:\n  allowed_apps: [not, a, mapping]\n")
+    with pytest.raises(ConfigError, match="allowed_apps"):
+        load_config(bad)
+
+
+def test_dict_field_rejects_non_string_value(tmp_path):
+    bad = _write(tmp_path / "nova.yaml", "security:\n  allowed_apps:\n    notepad: 123\n")
+    with pytest.raises(ConfigError, match="allowed_apps"):
+        load_config(bad)
+
+
+def test_dict_field_rejects_bool_value(tmp_path):
+    """SECURITY_SPEC.md praised config.py's list-field bool guard by name
+    (bool is an int subclass in Python); the dict-field path added later for
+    allowed_apps needs the same discipline for its str-typed values, checked
+    directly rather than assumed to match."""
+    bad = _write(tmp_path / "nova.yaml", "security:\n  allowed_apps:\n    notepad: true\n")
+    with pytest.raises(ConfigError, match="allowed_apps"):
+        load_config(bad)
+
+
+def test_redact_terms_field_accepts_list_of_str(tmp_path):
+    cfg = load_config(
+        _write(tmp_path / "nova.yaml", "security:\n  redact_terms: [Manav, Acme Corp]\n")
+    )
+    assert cfg.security.redact_terms == ["Manav", "Acme Corp"]
+
+
+def test_hotkey_section_defaults(tmp_path):
+    cfg = load_config(_write(tmp_path / "nova.yaml", ""))
+    assert cfg.hotkey.combo == "ctrl+alt+space"
+    assert cfg.hotkey.tap_threshold_ms == 300
+
+
+def test_hotkey_section_unknown_key_named_in_error(tmp_path):
+    bad = _write(tmp_path / "nova.yaml", "hotkey:\n  _bogus: 1\n")
+    with pytest.raises(ConfigError, match="_bogus"):
+        load_config(bad)
+
+
 # ---------------------------------------------------------------------------
 # Immutability
 # ---------------------------------------------------------------------------
