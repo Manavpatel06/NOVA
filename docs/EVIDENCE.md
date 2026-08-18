@@ -69,11 +69,22 @@ First turn ~5.1 s with the one-time model load folded in.
 ### Pending — requires a human, and cannot be closed without one
 
 M0's exit bar in `docs/ROADMAP.md` is *"Manav holds the hotkey, says 'open
-notepad', Notepad opens, NOVA says so out loud."* Until the three below are
-observed, that bar is **unmet**, no matter how much of the code path is proven.
+notepad', Notepad opens, NOVA says so out loud."* **One of the three below is now
+closed; two remain.** Until they are observed, that bar is **unmet**, no matter
+how much of the code path is proven.
 
-- [ ] **Speakers are audible.** Playback timing and cancellation are verified;
-      that a human can hear it is not. No agent can close this.
+- [x] **Speakers are audible — CLOSED 2026-08-18 by Manav.** He confirmed hearing
+      NOVA's own voice during the 2026-08-17 development session, produced by
+      `scripts/probe_tts.py` / `probe_turn.py` / `probe_roundtrip.py` playing real
+      Kokoro audio through `Player` on this laptop. This is *this* build's
+      playback path, not the retired build's — asked and answered explicitly,
+      because the retired build also had Kokoro and hearing it would have proved
+      nothing about this one.
+      Caveat kept deliberately: this predates the F18 output-device fix
+      (`df37f5e`), so it proves the laptop's speakers work and that Kokoro
+      reaches them — not that the new prober picks the right endpoint every time.
+      `scripts/probe_output.py` plays a tone through the current path if that
+      ever needs re-confirming.
 - [ ] **A real human voice transcribes correctly.** All STT evidence to date is
       Kokoro's synthetic speech, which is real speech but not a human in a room
       with ambient noise.
