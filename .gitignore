@@ -22,3 +22,6 @@ token*.json
 # OS noise
 Thumbs.db
 Desktop.ini
+
+# Packaging artefacts
+*.egg-info/

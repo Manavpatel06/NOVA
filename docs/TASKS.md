@@ -10,7 +10,7 @@ Legend: TODO · CLAIMED · IN REVIEW · **DONE**
 
 | # | Task | Owner | State |
 |---|---|---|---|
-| T0.1 | Core: config, bus, logging, pyproject, pytest harness | nova-dev-core | CLAIMED |
+| T0.1 | Core: config, bus, logging, pyproject, pytest harness | nova-dev-core | IN REVIEW (built, lead-verified; awaiting tests+security) |
 | T0.2 | Audio: device prober (WASAPI trap), capture, player | nova-dev-audio | CLAIMED |
 | T0.3 | STT: CUDA DLL setup, empirical compute-type probe, Transcriber | nova-dev-stt | CLAIMED |
 | T0.4 | TTS: Kokoro ONNX synthesizer + SAPI fallback | nova-dev-audio | TODO (after T0.2) |
