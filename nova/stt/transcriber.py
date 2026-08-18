@@ -63,12 +63,35 @@ class Transcriber:
         )
 
     def unload(self) -> None:
+        """Drop the loaded model and reclaim what CTranslate2 will actually
+        give back.
+
+        VRAM recovers cleanly and repeatably (2479 -> 367 MiB, docs/
+        GOVERNOR_MEASUREMENTS.md). Host RSS does not, once `transcribe()`
+        has run at least once in this process: it settles at ~740-780 MB and
+        stays there for the rest of the process's life, through this method
+        and through `gc.collect()`. Investigated and confirmed exhausted,
+        not unimplemented: this drops the last Python reference (the
+        strongest release available -- stronger than calling the
+        underlying `ctranslate2.models.Whisper.unload_model(to_cpu=False)`
+        directly, which was tried and measured byte-identical: 741.7 -> 741.7
+        MB RSS, no change). The retained memory is below any public
+        ctranslate2/faster-whisper API's reach -- almost certainly a
+        native-side (CTranslate2/MKL/CUDA host-pinned) allocator arena the
+        C++ runtime keeps rather than returns to the OS. Nothing left to try
+        here without patching CTranslate2 itself. `nova.governor.Governor`
+        (T1.2) is calibrated around this floor (`rss_ceiling_mb=900`, per
+        docs/GOVERNOR_MEASUREMENTS.md) rather than assuming this method
+        returns the process to cold-idle.
+        """
         if self._model is None:
             return
         self._model = None
         gc.collect()
         logger.info(
-            "Transcriber unloaded (%s/%s)", self._profile.device, self._profile.compute_type
+            "Transcriber unloaded (%s/%s) -- VRAM is fully reclaimed; host RSS "
+            "is not, once transcribe() has run (see this method's docstring)",
+            self._profile.device, self._profile.compute_type,
         )
 
     def transcribe(self, pcm: np.ndarray) -> str:

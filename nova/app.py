@@ -24,6 +24,12 @@ Fails loudly, never silently: every stage that can fail is caught, logged
 with a WARNING/ERROR naming the stage, and answered with *something* spoken
 (via `Synthesizer`, which already falls back to Windows SAPI) rather than
 leaving Manav staring at silence.
+
+`run_turn()` publishes `nova.governor.TOPIC_TURN_START`/`TOPIC_TURN_END`
+around its entire body (`try`/`finally`, so every early return still ends
+the turn) — the signal T1.2's `Governor` needs to never unload a component
+mid-turn. This module never calls `Governor.check_once()` itself; the
+governor drives its own poll loop once started.
 """
 
 from __future__ import annotations
@@ -40,6 +46,7 @@ from nova.audio.capture import Capture
 from nova.audio.player import Player
 from nova.brain.router import Router
 from nova.config import Config, load_config
+from nova.governor import TOPIC_TURN_END, TOPIC_TURN_START, Governor
 from nova.interfaces.hotkey import TOPIC_PTT_END, TOPIC_PTT_START, Hotkey, PTTEvent
 from nova.log import get_logger
 from nova.security.audit import AuditLog
@@ -93,6 +100,13 @@ class NovaApp:
         self.player = Player()
         self.hotkey = Hotkey(self.bus)
 
+        # --- governor (T1.2): drives existing load()/unload() lifecycle,
+        # never calls load() itself. typical_rss_mb hints are measured, not
+        # guessed -- see docs/GOVERNOR_MEASUREMENTS.md.
+        self.governor = Governor(self.bus, self.config.governor)
+        self.governor.register("transcriber", self.transcriber, typical_rss_mb=780.0)
+        self.governor.register("synth", self.synth, typical_rss_mb=1150.0)
+
         # --- capture session state, populated per ptt.start/ptt.end pair
         self._capture: Capture | None = None
         self._capturing = False
@@ -119,10 +133,13 @@ class NovaApp:
             )
         else:
             _log.info("NovaApp ready: hold %r to talk", self.hotkey.combo)
+        await self.governor.start()
 
     async def stop(self) -> None:
-        """Tear down cleanly: stop the hotkey, release loaded models."""
+        """Tear down cleanly: stop the hotkey, the governor, release loaded
+        models."""
         self.hotkey.stop()
+        await self.governor.stop()
         self.transcriber.unload()
         self.synth.unload()
 
@@ -198,68 +215,72 @@ class NovaApp:
         something -- never a silent no-op).
         """
         async with self._turn_lock:
-            t_start = time.monotonic()
-            timings: dict[str, float] = {}
-
-            # --- STT ---------------------------------------------------
-            t0 = time.monotonic()
+            await self.bus.publish(TOPIC_TURN_START, None)
             try:
-                text = await asyncio.to_thread(self.transcriber.transcribe, pcm)
-            except Exception as exc:
-                _log.error("Turn (%s): Transcriber.transcribe() failed (%s)", source, exc)
-                await self._speak("Sorry, I had trouble hearing that.")
-                return None
-            timings["stt"] = time.monotonic() - t0
+                t_start = time.monotonic()
+                timings: dict[str, float] = {}
 
-            text = text.strip()
-            if not text:
-                _log.info("Turn (%s): STT returned empty text; nothing to route", source)
-                await self._speak("I didn't catch that.")
-                return None
-            _log.info("Turn (%s): heard %r", source, text)
+                # --- STT -----------------------------------------------
+                t0 = time.monotonic()
+                try:
+                    text = await asyncio.to_thread(self.transcriber.transcribe, pcm)
+                except Exception as exc:
+                    _log.error("Turn (%s): Transcriber.transcribe() failed (%s)", source, exc)
+                    await self._speak("Sorry, I had trouble hearing that.")
+                    return None
+                timings["stt"] = time.monotonic() - t0
 
-            # --- router --------------------------------------------------
-            t0 = time.monotonic()
-            try:
-                match = self.router.route(text)
-            except Exception as exc:
-                _log.error("Turn (%s): Router.route(%r) failed (%s)", source, text, exc)
-                await self._speak("Sorry, something went wrong understanding that.")
-                return None
-            timings["route"] = time.monotonic() - t0
+                text = text.strip()
+                if not text:
+                    _log.info("Turn (%s): STT returned empty text; nothing to route", source)
+                    await self._speak("I didn't catch that.")
+                    return None
+                _log.info("Turn (%s): heard %r", source, text)
 
-            if match.clarification is not None:
-                # Constitutional requirement, not an error path: below the
-                # confidence floor (or ambiguous), NOVA asks rather than
-                # guesses -- it never acts on a low-confidence match as if
-                # certain.
-                _log.info(
-                    "Turn (%s): confidence %.3f -- asking for clarification instead of acting",
-                    source, match.confidence,
-                )
-                await self._speak(match.clarification)
+                # --- router ------------------------------------------------
+                t0 = time.monotonic()
+                try:
+                    match = self.router.route(text)
+                except Exception as exc:
+                    _log.error("Turn (%s): Router.route(%r) failed (%s)", source, text, exc)
+                    await self._speak("Sorry, something went wrong understanding that.")
+                    return None
+                timings["route"] = time.monotonic() - t0
+
+                if match.clarification is not None:
+                    # Constitutional requirement, not an error path: below
+                    # the confidence floor (or ambiguous), NOVA asks rather
+                    # than guesses -- it never acts on a low-confidence
+                    # match as if certain.
+                    _log.info(
+                        "Turn (%s): confidence %.3f -- asking for clarification instead of acting",
+                        source, match.confidence,
+                    )
+                    await self._speak(match.clarification)
+                    self._log_timings(source, timings, t_start)
+                    return None
+
+                # --- skill, through the ladder's one entry point ----------
+                assert match.spec is not None
+                t0 = time.monotonic()
+                ctx = SkillCtx(config=self.config, ladder=self.ladder)
+                try:
+                    reply = await match.spec.invoke(ctx, **match.params)
+                except Exception as exc:
+                    _log.error("Turn (%s): skill %r raised (%s)", source, match.spec.name, exc)
+                    await self._speak(f"Sorry, something went wrong with {match.spec.name}.")
+                    return None
+                timings["skill"] = time.monotonic() - t0
+
+                # --- TTS + playback ----------------------------------------
+                t0 = time.monotonic()
+                await self._speak(reply.text)
+                timings["speak"] = time.monotonic() - t0
+
                 self._log_timings(source, timings, t_start)
-                return None
-
-            # --- skill, through the ladder's one entry point ------------
-            assert match.spec is not None
-            t0 = time.monotonic()
-            ctx = SkillCtx(config=self.config, ladder=self.ladder)
-            try:
-                reply = await match.spec.invoke(ctx, **match.params)
-            except Exception as exc:
-                _log.error("Turn (%s): skill %r raised (%s)", source, match.spec.name, exc)
-                await self._speak(f"Sorry, something went wrong with {match.spec.name}.")
-                return None
-            timings["skill"] = time.monotonic() - t0
-
-            # --- TTS + playback ------------------------------------------
-            t0 = time.monotonic()
-            await self._speak(reply.text)
-            timings["speak"] = time.monotonic() - t0
-
-            self._log_timings(source, timings, t_start)
-            return reply
+                return reply
+            finally:
+                await self.bus.publish(TOPIC_TURN_END, None)
 
     async def _speak(self, text: str) -> None:
         """Synthesize and play `text`. NOVA must never go silently mute:
