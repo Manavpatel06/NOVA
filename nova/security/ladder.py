@@ -114,11 +114,19 @@ class Ladder:
         if tier is Tier.CONFIRM:
             if self._confirm_channel is None:
                 return self._deny_audited(skill, params, tier, "no_confirm_channel")
+            # Three distinct causes, three distinct audited reasons — a
+            # human declining and a channel that never asked anyone are not
+            # the same fact, and collapsing them would put a false
+            # statement in the log (docs/THREAT_MODEL.md §1.4 amendment,
+            # lead's ruling 2026-08-18).
             try:
-                approved = await self._ask_channel(skill, params)
+                approved = bool(await self._confirm_channel.request(skill, params))
             except ConfirmTimeout as exc:
                 logger.warning("confirm channel timed out for skill '%s': %s", skill.name, exc)
                 return self._deny_audited(skill, params, tier, "confirm_timed_out")
+            except Exception as exc:  # noqa: BLE001 — any other broken-channel failure must deny, never crash the ladder or hang
+                logger.error("confirm channel raised during authorize(skill=%s): %s", skill.name, exc)
+                return self._deny_audited(skill, params, tier, "confirm_channel_error")
             if not approved:
                 return self._deny_audited(skill, params, tier, "confirm_declined")
             return self._allow_with_required_audit(skill, params, tier)
@@ -130,16 +138,6 @@ class Ladder:
             return self._allow_with_degrading_audit(skill, params, tier)
 
         raise TypeError(f"Ladder.authorize(): unknown tier {tier!r} for skill {skill.name!r}")
-
-    async def _ask_channel(self, skill: SkillSpec, params: dict[str, Any]) -> bool:
-        assert self._confirm_channel is not None
-        try:
-            return bool(await self._confirm_channel.request(skill, params))
-        except ConfirmTimeout:
-            raise  # a distinct, audited reason — let authorize() handle it, not the generic decline path below
-        except Exception as exc:  # noqa: BLE001 — any other broken-channel failure must deny, never crash the ladder or hang
-            logger.error("confirm channel raised during authorize(skill=%s): %s", skill.name, exc)
-            return False
 
     def _allow_with_required_audit(self, skill: SkillSpec, params: dict[str, Any], tier: Tier) -> Decision:
         """ACT/CONFIRM path: an audit-write failure here is a deny, not a
