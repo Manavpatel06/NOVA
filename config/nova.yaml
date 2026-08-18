@@ -42,3 +42,12 @@ security:
     - 'C:\Program Files'
     - 'C:\Program Files (x86)'
     - 'C:\Program Files\WindowsApps'
+
+  # Manav's own private terms (name, employer, ...) redacted case-
+  # insensitively by nova.security.redact. Empty by default -- opt-in,
+  # never inferred.
+  redact_terms: []
+
+hotkey:
+  combo: ctrl+alt+space   # `keyboard` package hotkey string
+  tap_threshold_ms: 300   # <= this held duration = tap (latch toggle); > this = hold (classic PTT)

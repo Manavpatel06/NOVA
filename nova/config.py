@@ -74,6 +74,20 @@ class SecurityConfig:
     #: fail the check even though its lexical path starts with the prefix.
     allowed_app_dirs: list[str] = field(default_factory=list)
 
+    #: Manav's own private terms (name, employer, etc.), matched case-
+    #: insensitively and redacted by nova.security.redact.redact(). Empty by
+    #: default — this is opt-in content he provides, never inferred
+    #: (docs/SECURITY_SPEC.md §2.3).
+    redact_terms: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class HotkeyConfig:
+    """Consumed by nova.interfaces.hotkey (Hotkey)."""
+
+    combo: str = "ctrl+alt+space"  # `keyboard` package hotkey string
+    tap_threshold_ms: int = 300  # <= this held duration = tap (latch toggle); > this = hold (classic PTT)
+
 
 @dataclass(frozen=True)
 class Config:
@@ -81,6 +95,7 @@ class Config:
     stt: SttConfig = field(default_factory=SttConfig)
     tts: TtsConfig = field(default_factory=TtsConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
+    hotkey: HotkeyConfig = field(default_factory=HotkeyConfig)
 
 
 _SECTIONS: dict[str, type] = {
@@ -88,6 +103,7 @@ _SECTIONS: dict[str, type] = {
     "stt": SttConfig,
     "tts": TtsConfig,
     "security": SecurityConfig,
+    "hotkey": HotkeyConfig,
 }
 
 
