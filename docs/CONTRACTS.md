@@ -84,12 +84,27 @@ class Transcriber:
 1. Windows ignores `PATH` for extension-module DLLs. Call `os.add_dll_directory()`
    on every `site-packages/nvidia/*/bin` **before** anything imports `ctranslate2`,
    and record them in `dll_directories`. Put nvidia wheel dirs ahead of torch's.
-2. `ctranslate2.get_supported_compute_types()` advertises int8 on this Blackwell
-   card and then dies with `CUBLAS_STATUS_NOT_SUPPORTED` on first inference.
-   Trust nothing: load a real model and run a real transcription per candidate,
-   in order `float16 → int8_float16`, and keep the first that returns.
-   `verified=True` only after an inference completed. Never select int8 on
-   compute capability ≥ 12. Cache keyed by (gpu name, driver, ct2 version).
+2. Trust no capability list: load a real model and run a real transcription per
+   candidate, in order `float16 → int8_float16`, keep the first that returns,
+   and set `verified=True` only after an inference completed. Cache keyed by
+   (gpu name, driver, ct2 version).
+
+   **int8 is refused on compute capability ≥ 12 -- and the reason has changed.**
+   Prior art recorded int8 loading fine and then dying with
+   `CUBLAS_STATUS_NOT_SUPPORTED` on the first encoder run. Measured on this
+   machine (driver 610.62, cuBLAS 12.9.2, cuDNN 9.24, ct2 4.8.1, compute
+   capability 12.0), **that failure does not reproduce**: `int8` and
+   `int8_float16` both completed on tiny.en and on large-v3-turbo. The refusal
+   is retained as a deliberate, documented choice, not because int8 currently
+   crashes -- `float16` is verified, costs ~2.4 GB of an 8 GB card, and int8
+   leaves nothing on the table worth a silent mid-conversation crash if a
+   driver update reintroduces the fault. Revisit only if VRAM becomes the
+   binding constraint.
+
+   Residual asymmetry, recorded rather than assumed away: the probe verifies
+   with `tiny.en` for speed while the assistant runs `large-v3-turbo`, so a
+   compute type that works small and fails large would pass. `GpuProfile` must
+   record which model the verification actually ran against.
 
 ## T0.4 — tts
 
