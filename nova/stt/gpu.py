@@ -13,17 +13,18 @@ candidates on compute capability >= 12, never merely deprioritized.
 
 from __future__ import annotations
 
+import gc
 import json
-import logging
 import subprocess
 from dataclasses import asdict, dataclass
 
 import numpy as np
 
+from nova.log import get_logger
 from nova.stt._dll import ensure_dll_directories
 from nova.stt._paths import DATA_DIR, GPU_PROFILE_PATH, HF_HUB_CACHE_DIR
 
-logger = logging.getLogger("nova.stt.gpu")
+logger = get_logger(__name__)
 
 _PROBE_MODEL = "tiny.en"  # fast; used for probing only, never for real transcription
 
@@ -44,6 +45,15 @@ _OOM_MARKERS = (
     "cublas_status_alloc_failed",
 )
 
+# "An out-of-memory failure deserves a retry" (docs/CONTRACTS.md) means
+# retry, not just advance -- an OOM can be transient (another process's VRAM
+# use, allocator fragmentation) and a garbage-collection pass can free
+# enough to succeed on a second attempt of the SAME candidate. Only after
+# that retry also fails do we treat it like an unsupported-kernel failure
+# and move to the next (lower-memory) candidate. An unsupported-kernel
+# failure is never transient, so it gets no retry -- it advances immediately.
+_OOM_RETRIES = 1
+
 
 @dataclass(frozen=True)
 class GpuProfile:
@@ -54,6 +64,13 @@ class GpuProfile:
     driver: str
     ct2_version: str
     dll_directories: list[str]
+    # Residual asymmetry, recorded rather than assumed away: probe_gpu()
+    # verifies with a small model (tiny.en) for speed, but Transcriber runs
+    # large-v3-turbo. A compute type that works small and fails large would
+    # otherwise pass silently. Default "" only for backward compatibility
+    # with a pre-existing cache file that predates this field; probe_gpu()
+    # always sets it explicitly on every fresh probe.
+    verified_model: str = ""
 
 
 def _run_nvidia_smi(query: str) -> str | None:
@@ -161,6 +178,7 @@ def _probe_cpu(ct2_version: str, dll_dirs: list[str]) -> GpuProfile:
             driver="",
             ct2_version=ct2_version,
             dll_directories=dll_dirs,
+            verified_model=_PROBE_MODEL,
         )
     logger.warning("No CPU compute type could be verified either; returning unverified profile")
     return GpuProfile(
@@ -171,6 +189,7 @@ def _probe_cpu(ct2_version: str, dll_dirs: list[str]) -> GpuProfile:
         driver="",
         ct2_version=ct2_version,
         dll_directories=dll_dirs,
+        verified_model="",
     )
 
 
@@ -221,24 +240,41 @@ def probe_gpu(force: bool = False) -> GpuProfile:
 
     last_error: Exception | None = None
     for compute_type in candidates:
-        try:
-            _try_transcribe("cuda", compute_type)
-        except Exception as exc:
-            kind = _classify_failure(exc)
-            if kind == "oom":
-                logger.warning(
-                    "GPU compute type %r ran out of memory; trying next "
-                    "(lower-memory) candidate: %s", compute_type, exc,
-                )
-            elif kind == "unsupported_kernel":
-                logger.warning(
-                    "GPU compute type %r has no supported kernel on this "
-                    "card (compute capability %.1f); trying next candidate: %s",
-                    compute_type, compute_capability or -1.0, exc,
-                )
+        candidate_error: Exception | None = None
+        for attempt in range(_OOM_RETRIES + 1):
+            try:
+                _try_transcribe("cuda", compute_type)
+            except Exception as exc:
+                candidate_error = exc
+                kind = _classify_failure(exc)
+                if kind == "oom" and attempt < _OOM_RETRIES:
+                    logger.warning(
+                        "GPU compute type %r ran out of memory (attempt %d/%d); "
+                        "retrying the same candidate after a GC pass: %s",
+                        compute_type, attempt + 1, _OOM_RETRIES + 1, exc,
+                    )
+                    gc.collect()
+                    continue
+                if kind == "oom":
+                    logger.warning(
+                        "GPU compute type %r still out of memory after retrying; "
+                        "trying next (lower-memory) candidate: %s", compute_type, exc,
+                    )
+                elif kind == "unsupported_kernel":
+                    logger.warning(
+                        "GPU compute type %r has no supported kernel on this "
+                        "card (compute capability %.1f); trying next candidate: %s",
+                        compute_type, compute_capability or -1.0, exc,
+                    )
+                else:
+                    logger.warning("GPU compute type %r failed (%s): %s", compute_type, kind, exc)
+                break
             else:
-                logger.warning("GPU compute type %r failed (%s): %s", compute_type, kind, exc)
-            last_error = exc
+                candidate_error = None
+                break
+
+        if candidate_error is not None:
+            last_error = candidate_error
             continue
 
         profile = GpuProfile(
@@ -249,6 +285,7 @@ def probe_gpu(force: bool = False) -> GpuProfile:
             driver=driver or "",
             ct2_version=ct2_version,
             dll_directories=dll_dirs,
+            verified_model=_PROBE_MODEL,
         )
         _save_cache(profile)
         return profile

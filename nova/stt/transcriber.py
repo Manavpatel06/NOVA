@@ -8,16 +8,16 @@ supported. See `nova.stt.gpu` for why that distinction matters.
 from __future__ import annotations
 
 import gc
-import logging
 import time
 
 import numpy as np
 
+from nova.log import get_logger
 from nova.stt._dll import ensure_dll_directories
 from nova.stt._paths import HF_HUB_CACHE_DIR
 from nova.stt.gpu import GpuProfile, probe_gpu
 
-logger = logging.getLogger("nova.stt.transcriber")
+logger = get_logger(__name__)
 
 _MODEL_NAME = "large-v3-turbo"
 
@@ -39,6 +39,14 @@ class Transcriber:
         if self._model is not None:
             return
         from faster_whisper import WhisperModel
+
+        if self._profile.verified_model and self._profile.verified_model != _MODEL_NAME:
+            logger.info(
+                "GPU profile was verified against %r, not %r -- device/compute_type "
+                "worked on the smaller probe model; this load is the first real "
+                "test of that combination against %r.",
+                self._profile.verified_model, _MODEL_NAME, _MODEL_NAME,
+            )
 
         t0 = time.monotonic()
         self._model = WhisperModel(
