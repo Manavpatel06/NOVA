@@ -171,6 +171,24 @@ enumerates `trusts_input=True` skills and blocks any that lacks hostile-content
 tests. Duplicate skill names raise loudly; they never silently overwrite. M0
 ships two skills: `time` (READ) and `open_app` (ACT).
 
+### Redaction config
+
+`SecurityConfig.redact_terms: list[str]`, empty by default — Manav's own private
+terms, on top of the shape-based rules. Redaction matches the *shape* of a home
+directory (`C:\Users\<x>`, `/home/<x>`, both slash styles) rather than needing to
+know the username, because nothing but `Config` may read the environment. One
+shared implementation in `nova/security/redact.py`; no per-feature copies.
+
+### Process-spawn allowlist (for the rescoped AST test)
+
+Three entries, each earning it, plus one reserved:
+- `nova/security/egress.py` — transport imports, and nothing else may have them.
+- `nova/stt/gpu.py` — spawns `nvidia-smi` with fixed argv, read-only, no external
+  input. Verified present at `gpu.py:61` before the test was written; it predates
+  the rule and would otherwise have broken T0.3 the moment the test landed.
+- `nova/skills/open_app.py` — realpath-validated launch only.
+- Reserved, not pre-approved: M4's Claude CLI adapter, added when the file exists.
+
 ### Audit failure means deny
 
 `record()` raises on write failure, and `Ladder.authorize()` denies any ACT or
