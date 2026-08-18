@@ -90,12 +90,28 @@ class HotkeyConfig:
 
 
 @dataclass(frozen=True)
+class BrainConfig:
+    """Consumed by nova.brain.router.Router. See its module docstring for how
+    these two numbers were chosen (calibrated against a labelled phrase set,
+    not picked decoratively)."""
+
+    #: below this score, route() asks for clarification instead of acting.
+    confidence_floor: float = 0.42
+
+    #: if the top-2 skill scores are closer than this, treat the match as
+    #: cross-domain-ambiguous and clarify even if the top score clears the
+    #: floor.
+    ambiguity_margin: float = 0.08
+
+
+@dataclass(frozen=True)
 class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     stt: SttConfig = field(default_factory=SttConfig)
     tts: TtsConfig = field(default_factory=TtsConfig)
     security: SecurityConfig = field(default_factory=SecurityConfig)
     hotkey: HotkeyConfig = field(default_factory=HotkeyConfig)
+    brain: BrainConfig = field(default_factory=BrainConfig)
 
 
 _SECTIONS: dict[str, type] = {
@@ -104,6 +120,7 @@ _SECTIONS: dict[str, type] = {
     "tts": TtsConfig,
     "security": SecurityConfig,
     "hotkey": HotkeyConfig,
+    "brain": BrainConfig,
 }
 
 

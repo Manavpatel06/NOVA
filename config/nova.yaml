@@ -51,3 +51,10 @@ security:
 hotkey:
   combo: ctrl+alt+space   # `keyboard` package hotkey string
   tap_threshold_ms: 300   # <= this held duration = tap (latch toggle); > this = hold (classic PTT)
+
+brain:
+  # Calibrated against a labelled phrase set, not chosen decoratively --
+  # see nova/brain/router.py's module docstring for the method and the
+  # measured score gap these two numbers sit inside.
+  confidence_floor: 0.42
+  ambiguity_margin: 0.08
