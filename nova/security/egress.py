@@ -63,6 +63,44 @@ class EgressError(RuntimeError):
     allowlist, or the URL itself doesn't parse into a usable host."""
 
 
+class EgressRedirectBlocked(EgressError):
+    """Raised when a `fetch()` response tries to redirect anywhere.
+    Redirects are never followed, for M0: `fetch()` validates only the URL
+    it was given, and `urllib.request.urlopen()` follows HTTP redirects by
+    default with nothing re-validating where the redirect actually lands —
+    an allowlisted host that has (or is tricked into serving) an open
+    redirect defeats a host-based allowlist otherwise, and this needs no bug
+    in `Egress`'s own logic, only an OAuth callback, a URL shortener, or a
+    misconfigured server on an otherwise-legitimate allowlisted host.
+    nova-security demonstrated this with two local servers (a 302 from an
+    allowlisted-standin to a non-allowlisted one, followed transparently),
+    not just asserted it. A future caller may opt into a specific,
+    re-validated hop if one is ever genuinely needed; nothing does yet.
+    """
+
+    def __init__(self, *, original_url: str, redirect_url: str, status: int) -> None:
+        self.original_url = original_url
+        self.redirect_url = redirect_url
+        self.status = status
+        super().__init__(
+            f"fetch({original_url!r}) received a {status} redirect to {redirect_url!r} — "
+            f"redirects are not followed; the target host is never re-validated against the allowlist"
+        )
+
+
+class _NoRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Installed process-wide (via `install_opener`) the moment an `Egress`
+    is constructed — `Egress` is THE ONLY MODULE THAT MAY REACH THE
+    NETWORK, so there is exactly one legitimate installer of this policy.
+    `redirect_request` is the single choke point every 301/302/303/307/308
+    handler in the base `HTTPRedirectHandler` funnels through, so overriding
+    it once blocks every redirect status code, not just 302.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: N802 — urllib's method name
+        raise EgressRedirectBlocked(original_url=req.full_url, redirect_url=newurl, status=code)
+
+
 class Egress:
     """The one sanctioned network/process-egress boundary. No runtime
     allowlist mutator exists on this class, anywhere — no `add_allowed_host`,
@@ -92,6 +130,14 @@ class Egress:
         self._audit = audit
         self._redact_terms = tuple(redact_terms)
 
+        # Refuse every redirect at the urllib layer, process-wide — see
+        # _NoRedirectHandler and EgressRedirectBlocked above. install_opener
+        # replaces urllib.request's default HTTPRedirectHandler (our class
+        # is a subclass of it) for every urlopen() call in the process;
+        # since this module is the only sanctioned urlopen() call site
+        # (enforced by the AST test), that scope is exactly right.
+        urllib.request.install_opener(urllib.request.build_opener(_NoRedirectHandler()))
+
     @property
     def allowed_hosts(self) -> frozenset[str]:
         return self._allowed_hosts
@@ -116,8 +162,20 @@ class Egress:
         if not allowed:
             raise EgressError(f"host {host!r} (from {url!r}) is not on the egress allowlist")
 
-        with urllib.request.urlopen(url) as response:  # noqa: S310 — the one sanctioned transport call
-            return response.read()
+        try:
+            with urllib.request.urlopen(url) as response:  # noqa: S310 — the one sanctioned transport call
+                return response.read()
+        except EgressRedirectBlocked as exc:
+            # A blocked redirect is exactly the event someone will want in
+            # the log later — audited distinctly from an ordinary denial,
+            # never silently swallowed.
+            self._audit.record({
+                "kind": "egress.fetch_redirect_blocked",
+                "host": host,
+                "redirect_target_host": normalize_host(urlsplit(exc.redirect_url).hostname or ""),
+                "status": exc.status,
+            })  # raises on write failure — propagates, same discipline as everywhere else in this module
+            raise
 
     def release_for_process(self, purpose: str, payload: str) -> str:
         """Redact `payload`, audit lengths and a boolean (never the text),
