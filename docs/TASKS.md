@@ -47,3 +47,15 @@ Legend: TODO · CLAIMED · IN REVIEW · **DONE**
 | VRAM, model resident | 2479 MiB | nvidia-smi |
 | VRAM after unload | 367 MiB | nvidia-smi — the C++ side really frees it |
 | int8 on this stack | **does not crash** | contrary to prior art; refused anyway, deliberately |
+
+## Open findings (routed, not yet fixed)
+
+| # | Finding | Severity | Owner | Status |
+|---|---|---|---|---|
+| F1 | Cached device index is not a stable identity; fingerprint sorts order away, so a device reorder silently rebinds capture to a different device | HIGH (undoes the host-API ranking that avoids the dead/AGC-crushed endpoints) | nova-dev-audio | queued after T0.6a |
+| F2 | `_dll.py` grants DLL search authority to discovered paths without resolving them; junction under `nvidia/*/bin` escapes the tree | LOW exploitability, cheap fix | nova-dev-stt | queued after T0.4 |
+| F3 | `_paths.py` recomputes constants `nova/__init__.py` already owns — one-source-of-truth violation | LOW | nova-dev-stt | queued after T0.4 |
+| F4 | Hotkey hook sees every keystroke system-wide; needs never-log guarantee, possibly structural | HIGH sensitivity | nova-dev-audio + nova-security | in design |
+| F5 | LATCHED state could hold the mic open indefinitely after a stray keypress | HIGH | nova-dev-audio | fix required pre-commit |
+| F6 | `Player` not safe for concurrent `play()`; needs docstring | LOW | nova-dev-audio | queued |
+| F7 | `tts.speed` accepts `.inf`/`.nan`; `stt.model` unchecked vs HF cache | LOW | nova-dev-core | queued |
