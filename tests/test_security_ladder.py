@@ -18,7 +18,7 @@ from __future__ import annotations
 import pytest
 
 from nova.security.audit import AuditWriteError
-from nova.security.ladder import ConfirmChannel, Decision, Ladder
+from nova.security.ladder import ConfirmChannel, ConfirmTimeout, Decision, Ladder
 from nova.security.tiers import Tier
 from nova.skills.registry import Reply, SkillSpec
 
@@ -57,6 +57,11 @@ class _DecliningChannel:
 class _RaisingChannel:
     async def request(self, skill, params):
         raise RuntimeError("dialog crashed")
+
+
+class _TimingOutChannel:
+    async def request(self, skill, params):
+        raise ConfirmTimeout("no answer within the channel's own time budget")
 
 
 # ---------------------------------------------------------------------------
@@ -194,13 +199,43 @@ async def test_confirm_with_a_declining_channel_denies_with_a_distinct_reason():
     assert decision.reason == "confirm_declined"
 
 
-async def test_confirm_channel_that_raises_is_treated_as_a_decline_not_a_crash():
+async def test_confirm_channel_that_raises_denies_with_its_own_distinct_reason():
+    """docs/THREAT_MODEL.md §1.4 amendment (2026-08-18): a broken channel and
+    an explicit decline are different facts for whoever reads the audit log
+    later and must not collapse into the same reason. Verified against the
+    real code, not assumed from an older draft of this test."""
     audit = _FakeAudit()
     ladder = Ladder(audit, confirm_channel=_RaisingChannel())
     decision = await ladder.authorize(_make_skill(Tier.CONFIRM), {})  # must not raise
 
     assert decision.allowed is False
-    assert decision.reason == "confirm_declined"
+    assert decision.reason == "confirm_channel_error"
+
+
+async def test_confirm_channel_timeout_denies_with_its_own_distinct_reason():
+    audit = _FakeAudit()
+    ladder = Ladder(audit, confirm_channel=_TimingOutChannel())
+    decision = await ladder.authorize(_make_skill(Tier.CONFIRM), {})  # must not raise
+
+    assert decision.allowed is False
+    assert decision.reason == "confirm_timed_out"
+
+
+async def test_the_four_confirm_denial_reasons_are_all_distinct():
+    """no_confirm_channel / confirm_declined / confirm_timed_out /
+    confirm_channel_error must never collapse into each other — each is
+    audited as a different fact."""
+    audit = _FakeAudit()
+    skill = _make_skill(Tier.CONFIRM)
+
+    no_channel = await Ladder(audit).authorize(skill, {})
+    declined = await Ladder(audit, confirm_channel=_DecliningChannel()).authorize(skill, {})
+    timed_out = await Ladder(audit, confirm_channel=_TimingOutChannel()).authorize(skill, {})
+    channel_error = await Ladder(audit, confirm_channel=_RaisingChannel()).authorize(skill, {})
+
+    reasons = {no_channel.reason, declined.reason, timed_out.reason, channel_error.reason}
+    assert reasons == {"no_confirm_channel", "confirm_declined", "confirm_timed_out", "confirm_channel_error"}
+    assert len(reasons) == 4  # no two collapsed into the same string
 
 
 async def test_confirm_approved_but_audit_write_fails_still_denies():

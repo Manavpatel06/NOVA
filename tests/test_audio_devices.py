@@ -303,6 +303,84 @@ def test_unrecognized_hostapi_is_ranked_last(probe):
 
 
 # ---------------------------------------------------------------------------
+# F1 regression (docs/TASKS.md, fixed 7afe5d0): a cached device INDEX is not
+# a stable identity. _fingerprint_devices sorts before hashing, so a pure
+# reorder of the same device set (a driver reload, Windows Update touching
+# the audio stack) leaves the fingerprint unchanged while the same index now
+# points at a different physical device. probe_input_devices must re-resolve
+# the cached winner's index by (name, hostapi) identity on every call, cache
+# hit or miss -- never hand back a stale index unchecked.
+# ---------------------------------------------------------------------------
+
+
+def test_pure_reorder_resolves_the_same_device_not_a_different_one_at_the_old_index(probe):
+    device_a = _device("mic A", _HOSTAPI_IDX["Windows WDM-KS"])
+    device_b = _device("mic B", _HOSTAPI_IDX["MME"])
+    probe.configure(
+        [device_a, device_b],
+        {0: _quiet_real(QUIET_REAL_RMS, seed=0), 1: _quiet_real(QUIET_REAL_RMS, seed=1)},
+    )
+    first = probe_input_devices(force=False)
+    assert first.name == "mic A"
+    assert first.index == 0
+
+    # Same two devices, same fingerprint (order-independent) -- but a
+    # reorder now puts mic B first. Index 0 means something different now.
+    probe.configure(
+        [device_b, device_a],
+        {0: _quiet_real(QUIET_REAL_RMS, seed=1), 1: _quiet_real(QUIET_REAL_RMS, seed=0)},
+    )
+
+    second = probe_input_devices(force=False)  # cache hit: fingerprint unchanged
+
+    assert second.name == "mic A", (
+        "a pure reorder silently rebound capture to a different physical device"
+    )
+    assert second.index == 1  # mic A is now at index 1; the stale cached index (0) is not reused
+    assert probe.rec_calls == [], "resolving a reorder must not require re-measuring (no rec() calls)"
+
+
+def test_reorder_resolution_self_heals_the_on_disk_cached_index(probe):
+    import json
+
+    device_a = _device("mic A", _HOSTAPI_IDX["Windows WDM-KS"])
+    device_b = _device("mic B", _HOSTAPI_IDX["MME"])
+    probe.configure(
+        [device_a, device_b],
+        {0: _quiet_real(QUIET_REAL_RMS, seed=0), 1: _quiet_real(QUIET_REAL_RMS, seed=1)},
+    )
+    probe_input_devices(force=False)
+
+    probe.configure(
+        [device_b, device_a],
+        {0: _quiet_real(QUIET_REAL_RMS, seed=1), 1: _quiet_real(QUIET_REAL_RMS, seed=0)},
+    )
+    probe_input_devices(force=False)
+
+    on_disk = json.loads(probe.cache_path.read_text(encoding="utf-8"))
+    assert on_disk["profile"]["index"] == 1, "the on-disk cache still shows the stale, pre-reorder index"
+
+
+def test_cached_device_vanishing_despite_matching_fingerprint_falls_back_to_reprobe(probe, monkeypatch):
+    """A contrived but real-shaped edge case: if index resolution somehow
+    can't find the cached device even though the fingerprint matched, the
+    module must re-probe rather than trust a stale index or crash."""
+    import nova.audio.devices as devices_mod
+
+    devices = [_device("mic A", _HOSTAPI_IDX["Windows WDM-KS"])]
+    probe.configure(devices, {0: _quiet_real(QUIET_REAL_RMS)})
+    probe_input_devices(force=False)
+
+    monkeypatch.setattr(devices_mod, "_resolve_current_index", lambda *a, **kw: None)
+    probe.configure(devices, {0: _quiet_real(QUIET_REAL_RMS, seed=99)})
+
+    result = probe_input_devices(force=False)  # must not raise, must fall through to a real re-probe
+
+    assert result.name == "mic A"
+    assert probe.rec_calls == [0]  # a fresh measurement actually happened
+
+
+# ---------------------------------------------------------------------------
 # Caching: hit skips re-probe, force bypasses cache, device-list change
 # invalidates the cache
 # ---------------------------------------------------------------------------
