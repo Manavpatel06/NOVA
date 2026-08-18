@@ -20,10 +20,21 @@ hook -> callback path this module relies on.
 Two modes, disambiguated by how long the combo is held between the moment
 it's fully pressed and the moment any part of it is released:
   - HOLD:  press, hold, release -> armed only while held (classic PTT).
-  - TAP-LATCH: quick press+release -> armed until the *next* quick tap.
+  - TAP-LATCH: quick press+release -> armed until the *next* quick tap, or
+    until latch_timeout_ms elapses with no closing tap (failsafe against an
+    accidental short press leaving the mic open indefinitely -- the retired
+    build had the same arm-timeout gate for the same reason).
 Both publish "ptt.start" the instant the full combo is down (latency
 matters more than knowing the eventual mode), and "ptt.end" once the
-session is classified as over.
+session is classified as over, with a mode field ("hold" / "latch" /
+"latch_timeout") an M1 tray indicator can key off later without this
+module changing.
+
+PRIVACY: keyboard.hook() is a system-wide low-level hook -- it sees every
+keystroke on this machine, not just the PTT combo. That is inherent to the
+mechanism, an accepted cost for a global hotkey, and it makes this module's
+callback the most sensitive function in the codebase. See the comment on
+_on_event for the rule this file follows because of that.
 """
 from __future__ import annotations
 
@@ -50,6 +61,18 @@ DEFAULT_COMBO = "ctrl+alt+space"
 # human (an agent can't gather that data) -- a documented, revisable
 # default, not a claimed-precise number.
 DEFAULT_TAP_THRESHOLD_MS = 300
+
+# LATCHED auto-expires after this long with no closing tap. This is a
+# failsafe ceiling on how long a stray/accidental tap can leave the mic
+# open, not a VAD-aware silence timeout -- this module has no visibility
+# into speech activity, only key events. Once a turn loop with real speech
+# awareness exists, it may want to publish something this module can use to
+# extend the timer; out of scope here. 30s picked as a round, generous
+# number a real deliberate latch (user talking, pausing to think, talking
+# again) shouldn't hit, while still bounding the worst case. Config-
+# overridable and, like the other two defaults, not claimed to be tuned
+# against real usage yet.
+DEFAULT_LATCH_TIMEOUT_MS = 30_000
 
 # Windows reports left/right modifier keys as distinct event names
 # ("left ctrl", "right alt", ...) even though a combo like "ctrl+alt+space"
@@ -83,15 +106,15 @@ def _default_hotkey_config():
             return hotkey_cfg
         _log.warning(
             "nova.config.Config has no 'hotkey' section yet; using built-in "
-            "defaults (combo=%r, tap_threshold_ms=%d). Ask nova-dev-core "
-            "about landing HotkeyConfig.",
-            DEFAULT_COMBO, DEFAULT_TAP_THRESHOLD_MS,
+            "defaults (combo=%r, tap_threshold_ms=%d, latch_timeout_ms=%d). "
+            "Ask nova-dev-core about landing HotkeyConfig.",
+            DEFAULT_COMBO, DEFAULT_TAP_THRESHOLD_MS, DEFAULT_LATCH_TIMEOUT_MS,
         )
     except Exception as exc:
         _log.warning(
             "Could not load config/nova.yaml (%s); using built-in hotkey "
-            "defaults (combo=%r, tap_threshold_ms=%d)",
-            exc, DEFAULT_COMBO, DEFAULT_TAP_THRESHOLD_MS,
+            "defaults (combo=%r, tap_threshold_ms=%d, latch_timeout_ms=%d)",
+            exc, DEFAULT_COMBO, DEFAULT_TAP_THRESHOLD_MS, DEFAULT_LATCH_TIMEOUT_MS,
         )
     return None
 
@@ -105,7 +128,9 @@ class _State(Enum):
 @dataclass(frozen=True)
 class PTTEvent:
     ts: float
-    mode: str | None = None  # None for ptt.start; "hold" or "latch" for ptt.end
+    # None for ptt.start; "hold" / "latch" / "latch_timeout" for ptt.end.
+    # Never carries key identities -- see the PRIVACY note on _on_event.
+    mode: str | None = None
 
 
 class Hotkey:
@@ -118,6 +143,7 @@ class Hotkey:
         bus: EventBus,
         combo: str | None = None,
         tap_threshold_ms: int | None = None,
+        latch_timeout_ms: int | None = None,
         loop: asyncio.AbstractEventLoop | None = None,
     ):
         cfg = _default_hotkey_config()
@@ -125,7 +151,16 @@ class Hotkey:
         threshold_ms = tap_threshold_ms if tap_threshold_ms is not None else (
             cfg.tap_threshold_ms if cfg is not None else DEFAULT_TAP_THRESHOLD_MS
         )
+        # getattr, not cfg.latch_timeout_ms: this field may not have landed
+        # in nova.config yet even once cfg itself is available (same
+        # defensive pattern, finer-grained -- see the message to
+        # nova-dev-core requesting it).
+        timeout_ms = latch_timeout_ms if latch_timeout_ms is not None else (
+            getattr(cfg, "latch_timeout_ms", DEFAULT_LATCH_TIMEOUT_MS)
+            if cfg is not None else DEFAULT_LATCH_TIMEOUT_MS
+        )
         self._tap_threshold_s = threshold_ms / 1000.0
+        self._latch_timeout_s = timeout_ms / 1000.0
         self._combo_keys = frozenset(
             k.strip().lower() for k in self._combo_str.split("+") if k.strip()
         )
@@ -137,6 +172,10 @@ class Hotkey:
         self._state = _State.IDLE
         self._held: set[str] = set()
         self._press_time = 0.0
+        self._latch_timer: threading.Timer | None = None
+        # Guards _state/_held/_latch_timer, which the hook thread (_on_event)
+        # and the latch-timeout timer thread (_on_latch_timeout) both touch.
+        self._state_lock = threading.Lock()
         self._start_stop_lock = threading.Lock()
         self._remove_hook = None  # callable returned by keyboard.hook(), or None
         self.backend_available = False
@@ -194,11 +233,12 @@ class Hotkey:
                 return
 
             self.backend_available = True
-            self._state = _State.IDLE
-            self._held.clear()
+            with self._state_lock:
+                self._state = _State.IDLE
+                self._held.clear()
             _log.info(
-                "Hotkey armed: combo=%r tap_threshold_ms=%d",
-                self._combo_str, int(self._tap_threshold_s * 1000),
+                "Hotkey armed: combo=%r tap_threshold_ms=%d latch_timeout_ms=%d",
+                self._combo_str, int(self._tap_threshold_s * 1000), int(self._latch_timeout_s * 1000),
             )
 
     def stop(self) -> None:
@@ -210,50 +250,111 @@ class Hotkey:
                     _log.warning("Error removing hotkey hook: %s", exc)
                 self._remove_hook = None
             self.backend_available = False
-            self._state = _State.IDLE
-            self._held.clear()
+            with self._state_lock:
+                self._state = _State.IDLE
+                self._held.clear()
+                self._cancel_latch_timer_locked()
             _log.info("Hotkey stopped")
 
     # -- hook callback: runs on the keyboard library's own hook thread ----
 
     def _on_event(self, event) -> bool:
+        """PRIVACY RULE -- read before touching this function.
+
+        keyboard.hook() delivers EVERY keystroke on this machine to this
+        callback: passwords, messages, card numbers, all of it. That is
+        inherent to a global low-level hook and an accepted cost for a PTT
+        hotkey, but it means this function must never become a keylogger
+        by accident:
+          - a non-combo key is identified and discarded on the very next
+            line, immediately, unconditionally. It is never buffered
+            (not even transiently "for state"), never logged, at any level
+            including DEBUG, and its name/scan code never leaves this
+            function.
+          - the combo keys themselves are tracked only as membership in a
+            small fixed set (self._held) -- never logged individually,
+            only ever surfaced as durations/state-transition names.
+          - only a timestamp and a coarse mode string ("hold"/"latch"/
+            "latch_timeout") ever cross the bus (PTTEvent) or hit a log
+            line. No key name, scan code, or per-event detail does.
+        If you're tempted to add a debug print of `event` here: don't.
+        That is exactly how a keylog ends up in data/nova.log, which is a
+        file that later gets attached to a bug report.
+        """
         name = _canonical(getattr(event, "name", None))
         if name not in self._combo_keys:
-            return True  # not part of our combo; don't suppress, don't act
+            return True  # discard immediately: not our combo, no trace kept
 
         now = time.monotonic()
         event_type = getattr(event, "event_type", None)
 
-        if event_type == "down":
-            self._held.add(name)
-            if self._state == _State.IDLE and self._combo_keys <= self._held:
-                self._state = _State.ARMED
-                self._press_time = now
-                self._publish(TOPIC_PTT_START, PTTEvent(ts=time.time()))
+        with self._state_lock:
+            if event_type == "down":
+                self._held.add(name)
+                if self._state == _State.IDLE and self._combo_keys <= self._held:
+                    self._state = _State.ARMED
+                    self._press_time = now
+                    self._publish(TOPIC_PTT_START, PTTEvent(ts=time.time()))
 
-        elif event_type == "up":
-            self._held.discard(name)
-            # Releasing a multi-key combo fires one 'up' event per key, a
-            # few ms apart (measured: space/alt/ctrl each ~50ms apart when
-            # releasing in physical order). Acting on the first one would
-            # treat the second and third as spurious re-triggers. Only act
-            # once every combo key is confirmed up.
-            if self._held & self._combo_keys:
-                return True
+            elif event_type == "up":
+                self._held.discard(name)
+                # Releasing a multi-key combo fires one 'up' event per key,
+                # a few ms apart (measured: space/alt/ctrl each ~50ms apart
+                # when releasing in physical order). Acting on the first
+                # one would treat the second and third as spurious
+                # re-triggers. Only act once every combo key is confirmed up.
+                if self._held & self._combo_keys:
+                    return True
 
-            if self._state == _State.ARMED:
-                held_duration = now - self._press_time
-                if held_duration < self._tap_threshold_s:
-                    self._state = _State.LATCHED
-                    _log.info("Hotkey: tap detected (%.0fms) -> latched (listening)", held_duration * 1000)
-                else:
+                if self._state == _State.ARMED:
+                    held_duration = now - self._press_time
+                    if held_duration < self._tap_threshold_s:
+                        self._state = _State.LATCHED
+                        self._arm_latch_timer_locked()
+                        _log.info(
+                            "Hotkey: tap detected (%.0fms) -> latched (listening)",
+                            held_duration * 1000,
+                        )
+                    else:
+                        self._state = _State.IDLE
+                        self._publish(TOPIC_PTT_END, PTTEvent(ts=time.time(), mode="hold"))
+                elif self._state == _State.LATCHED:
                     self._state = _State.IDLE
-                    self._publish(TOPIC_PTT_END, PTTEvent(ts=time.time(), mode="hold"))
-            elif self._state == _State.LATCHED:
-                self._state = _State.IDLE
-                self._publish(TOPIC_PTT_END, PTTEvent(ts=time.time(), mode="latch"))
+                    self._cancel_latch_timer_locked()
+                    self._publish(TOPIC_PTT_END, PTTEvent(ts=time.time(), mode="latch"))
 
         return True  # never suppress; NOVA observes, doesn't own this combo exclusively
+
+    # -- latch-timeout failsafe: LATCHED must never be able to last forever --
+
+    def _cancel_latch_timer_locked(self) -> None:
+        """Caller must hold self._state_lock."""
+        if self._latch_timer is not None:
+            self._latch_timer.cancel()
+            self._latch_timer = None
+
+    def _arm_latch_timer_locked(self) -> None:
+        """Caller must hold self._state_lock."""
+        self._cancel_latch_timer_locked()
+        timer = threading.Timer(self._latch_timeout_s, self._on_latch_timeout)
+        timer.daemon = True
+        self._latch_timer = timer
+        timer.start()
+
+    def _on_latch_timeout(self) -> None:
+        """Runs on the Timer's own thread, not the hook thread -- guard
+        against racing a real closing tap or a stop() call landing at the
+        same moment."""
+        with self._state_lock:
+            self._latch_timer = None
+            if self._state != _State.LATCHED or not self.backend_available:
+                return  # already ended for real, or stopped in the meantime
+            self._state = _State.IDLE
+            self._publish(TOPIC_PTT_END, PTTEvent(ts=time.time(), mode="latch_timeout"))
+        _log.info(
+            "Hotkey: latch auto-expired after %.1fs with no closing tap",
+            self._latch_timeout_s,
+        )
 
     def _publish(self, topic: str, payload: PTTEvent) -> None:
         if self._loop is None:
