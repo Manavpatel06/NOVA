@@ -5,6 +5,18 @@
 #   .venv/Scripts/python.exe -m pip list --format=freeze
 #
 # Python 3.13.14, Windows 11, RTX 5060 (Blackwell sm_120).
+#
+# THIS FILE PINS DIRECT DEPENDENCIES ONLY, not the transitive closure. That gap
+# is real and has bitten once: tqdm (via faster-whisper/huggingface_hub) and
+# joblib (via phonemizer-fork) went missing from the shared venv and took the
+# TTS tests red, with nothing here to notice. Until the closure is pinned --
+# deferred to M1 with hash-pinning, since --require-hashes needs the full
+# closure anyway (finding F8) -- the guard is:
+#
+#     .venv/Scripts/python.exe -m pip check
+#
+# Run it before trusting a red suite. "No broken requirements found" rules out
+# this whole class of failure in one second.
 
 # --- core ---
 numpy==2.5.2
