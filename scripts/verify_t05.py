@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import shutil
 import subprocess
 import tempfile
 import time as time_module
@@ -17,6 +18,7 @@ from pathlib import Path
 import nova.skills  # triggers discovery on import
 from nova.config import Config, SecurityConfig, load_config
 from nova.security.audit import AuditLog, AuditWriteError, verify_chain
+from nova.security.ladder import Ladder
 from nova.security.tiers import Tier
 from nova.security.untrusted import Untrusted, bind_audit
 from nova.security.untrusted import reveal as reveal_untrusted
@@ -67,10 +69,19 @@ async def main() -> None:
     else:
         raise SystemExit("FAIL: expected SkillError for empty examples")
 
+    # --- SkillCtx now requires a real Ladder (nova-dev-sec, wiring the seam
+    # left in registry.py) -- every invoke() below goes through it, so this
+    # is also proof the demo path produces real audit records, not zero.
+    section("Ladder: wiring into SkillCtx")
+    main_audit_dir = Path(tempfile.mkdtemp(prefix="nova_verify_t05_"))
+    main_audit = AuditLog(path=main_audit_dir / "audit.log")
+    ladder = Ladder(main_audit)  # no confirm_channel -- M0 ships no CONFIRM skill
+    print(f"Ladder constructed with AuditLog at {main_audit_dir / 'audit.log'}")
+
     # --- time skill: real invocation ----------------------------------------
     section("time skill: real invocation")
     cfg = load_config()
-    ctx = SkillCtx(config=cfg)
+    ctx = SkillCtx(config=cfg, ladder=ladder)
     reply = await get_skill("time").invoke(ctx)
     print(f"time -> Reply(text={reply.text!r}, success={reply.success})")
     assert reply.success
@@ -143,7 +154,7 @@ async def main() -> None:
                 allowed_app_dirs=[str(trusted)],
             ),
         )
-        evil_ctx = SkillCtx(config=evil_config)
+        evil_ctx = SkillCtx(config=evil_config, ladder=ladder)
         reply = await get_skill("open_app").invoke(evil_ctx, app="evil")
         print(f"open_app('evil') via junction -> success={reply.success}, text={reply.text!r}")
         assert reply.success is False, "FAIL: junction-redirected path was NOT refused"
@@ -245,6 +256,20 @@ async def main() -> None:
         assert recorded["event"]["kind"] == "untrusted.reveal"
         assert recorded["event"]["source"] == "mail.body"
         assert "ignore all previous" not in json.dumps(recorded)  # content never hits the log
+
+    # --- Ladder: the demo path's real accumulated audit trail ---------------
+    section("Ladder: accumulated audit trail from every invoke() above")
+    main_status = main_audit.verify()
+    main_lines = (main_audit_dir / "audit.log").read_text(encoding="utf-8").strip().splitlines()
+    print(f"verify() -> {main_status}")
+    assert main_status.ok and main_status.entries == len(main_lines)
+    assert main_status.entries > 0, "FAIL: zero audit records from the demo path -- exactly the gap being closed"
+    kinds = [json.loads(l)["event"]["skill"] for l in main_lines]
+    print(f"{main_status.entries} records, one per invoke() call: {kinds}")
+    assert "time" in kinds and kinds.count("open_app") >= 6, kinds
+    print(f"first record: {main_lines[0]}")
+    print(f"last record:  {main_lines[-1]}")
+    shutil.rmtree(main_audit_dir, ignore_errors=True)
 
     print("\nALL CHECKS PASSED")
 

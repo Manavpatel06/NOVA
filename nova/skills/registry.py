@@ -16,10 +16,19 @@ from __future__ import annotations
 import importlib
 import pkgutil
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from nova.config import Config
 from nova.security.tiers import Tier
+
+if TYPE_CHECKING:
+    # Deferred to break the registry.py <-> ladder.py import cycle: SkillCtx
+    # holds a Ladder, Ladder.authorize() takes a SkillSpec -- this module
+    # only ever uses Ladder in a type annotation (never isinstance-checked),
+    # and `from __future__ import annotations` above makes every annotation
+    # a string at runtime, so a real import here is never needed. Mirrors
+    # the same move on ladder.py's side (nova-dev-sec, c1ea631).
+    from nova.security.ladder import Ladder
 
 Handler = Callable[..., Awaitable["Reply"]]
 
@@ -41,9 +50,16 @@ class Reply:
 class SkillCtx:
     """Per-invocation context threaded into every skill handler. Grows as
     real skills need more (bus access, etc.) — add a field only once a skill
-    actually reads it, same rule as Config."""
+    actually reads it, same rule as Config.
+
+    `ladder` is required, not optional-with-a-None-default: a SkillCtx that
+    lets invoke() silently skip authorization is exactly the unaudited-
+    action gap docs/THREAT_MODEL.md closes. Every real caller constructs one
+    Ladder (with a real AuditLog) at boot and threads it through here.
+    """
 
     config: Config
+    ladder: "Ladder"
 
 
 @dataclass(frozen=True)
@@ -55,22 +71,13 @@ class SkillSpec:
     handler: Handler
 
     async def invoke(self, ctx: SkillCtx, **params: Any) -> Reply:
-        # --- SEAM: Ladder.authorize() slots in here -------------------------
-        # Pending docs/THREAT_MODEL.md §1.4/§4 (Ladder is not yet
-        # implemented — nova-security is still defining exactly what
-        # "no confirm channel" and "audit-write failure" must do). When it
-        # lands, this becomes:
-        #
-        #     decision = await ladder.authorize(self, params)
-        #     if not decision.allowed:
-        #         return Reply(text=decision.reason, success=False)
-        #
-        # Every caller of a skill goes through SkillSpec.invoke(), so wiring
-        # the ladder in is a one-line change at this single call site, not a
-        # hunt through every skill. Note for whoever builds Ladder: per the
-        # threat model, EVERY invocation (including READ) must still produce
-        # an AuditLog record — "free" means no confirmation friction, not
-        # unaudited.
+        # Every caller of a skill goes through here, so this is the one place
+        # that enforces the permission ladder and produces an audit record
+        # for every invocation, including READ ("free" means no confirmation
+        # friction, not unaudited — docs/THREAT_MODEL.md §4).
+        decision = await ctx.ladder.authorize(self, params)
+        if not decision.allowed:
+            return Reply(text=decision.reason, success=False)
         return await self.handler(ctx, **params)
 
 

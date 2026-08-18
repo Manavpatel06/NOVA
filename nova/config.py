@@ -87,6 +87,7 @@ class HotkeyConfig:
 
     combo: str = "ctrl+alt+space"  # `keyboard` package hotkey string
     tap_threshold_ms: int = 300  # <= this held duration = tap (latch toggle); > this = hold (classic PTT)
+    latch_timeout_ms: int = 30000  # LATCHED auto-expires after this long with no closing tap
 
 
 @dataclass(frozen=True)

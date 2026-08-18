@@ -49,8 +49,9 @@ security:
   redact_terms: []
 
 hotkey:
-  combo: ctrl+alt+space   # `keyboard` package hotkey string
-  tap_threshold_ms: 300   # <= this held duration = tap (latch toggle); > this = hold (classic PTT)
+  combo: ctrl+alt+space      # `keyboard` package hotkey string
+  tap_threshold_ms: 300      # <= this held duration = tap (latch toggle); > this = hold (classic PTT)
+  latch_timeout_ms: 30000    # LATCHED auto-expires after this long with no closing tap
 
 brain:
   # Calibrated against a labelled phrase set, not chosen decoratively --
