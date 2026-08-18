@@ -267,50 +267,120 @@ async def test_quick_tap_enters_latched_and_a_second_tap_ends_it():
     assert hk._state.value == "idle"
 
 
-async def test_latch_auto_expires_after_the_timeout_with_no_closing_tap(fake_keyboard_module):
-    """The failsafe (F5): a stray/accidental tap must not be able to hold
-    the mic open indefinitely. Uses a short latch_timeout_ms so the test
-    stays fast — the property under test is 'it fires eventually', not the
-    production 30s value.
+class _FakeTimer:
+    """Stands in for threading.Timer so the latch failsafe is testable
+    without ever waiting on a real wall-clock interval. Per the lead's
+    ruling: a test that depends on a real timer firing within a real
+    interval fails under load, on a busy machine, or with six agents
+    hammering the CPU (exactly this machine, exactly what happened —
+    test_latch_auto_expires_after_the_timeout_with_no_closing_tap was
+    observed flaky both isolated and in the full suite). This tests the
+    promise (a timer is scheduled with the configured duration; firing it
+    publishes ptt.end(mode="latch_timeout")) rather than the scheduler."""
 
-    Goes through the real start() (with a fake keyboard backend) rather than
-    poking backend_available directly: _on_latch_timeout only fires if
-    backend_available is True (it guards against publishing after stop()),
-    so this needs the hotkey to be genuinely 'running', not just mid-combo.
-    """
+    instances: list["_FakeTimer"] = []
+
+    def __init__(self, interval, function):
+        self.interval = interval
+        self.function = function
+        self.daemon = False
+        self.started = False
+        self.cancelled = False
+        _FakeTimer.instances.append(self)
+
+    def start(self):
+        self.started = True
+
+    def cancel(self):
+        self.cancelled = True
+
+
+@pytest.fixture
+def fake_timer(monkeypatch):
+    import threading as _threading
+
+    _FakeTimer.instances.clear()
+    monkeypatch.setattr(_threading, "Timer", _FakeTimer)
+    return _FakeTimer
+
+
+async def test_latch_timer_is_armed_with_the_configured_duration(fake_timer):
     bus = _FakeBus()
-    hk = _make_hotkey(bus=bus, loop=asyncio.get_running_loop(), tap_threshold_ms=200, latch_timeout_ms=80)
-    hk.start()
+    hk = _make_hotkey(bus=bus, loop=asyncio.get_running_loop(), tap_threshold_ms=200, latch_timeout_ms=12345)
 
     _press(hk, "ctrl"); _press(hk, "alt"); _press(hk, "space")
     _release(hk, "space"); _release(hk, "alt"); _release(hk, "ctrl")
     await _wait_until(lambda: len(bus.published) == 1)
     assert hk._state.value == "latched"
 
-    await _wait_until(lambda: len(bus.published) == 2, timeout=2.0)
+    assert len(fake_timer.instances) == 1
+    timer = fake_timer.instances[-1]
+    assert timer.interval == pytest.approx(12.345)  # seconds, from latch_timeout_ms=12345
+    assert timer.started is True
 
+
+async def test_latch_timer_firing_ends_the_latch_with_timeout_mode(fake_timer):
+    """The failsafe itself (F5): firing the scheduled timer -- not waiting
+    for it -- must end LATCHED and publish ptt.end(mode='latch_timeout')."""
+    bus = _FakeBus()
+    hk = _make_hotkey(bus=bus, loop=asyncio.get_running_loop(), tap_threshold_ms=200, latch_timeout_ms=30_000)
+    hk.backend_available = True  # _on_latch_timeout no-ops unless "running"
+
+    _press(hk, "ctrl"); _press(hk, "alt"); _press(hk, "space")
+    _release(hk, "space"); _release(hk, "alt"); _release(hk, "ctrl")
+    await _wait_until(lambda: len(bus.published) == 1)
+    assert hk._state.value == "latched"
+
+    timer = fake_timer.instances[-1]
+    timer.function()  # fire the timeout callback directly, no real waiting
+
+    await _wait_until(lambda: len(bus.published) == 2)
     assert bus.published[1][0] == TOPIC_PTT_END
     assert bus.published[1][1].mode == "latch_timeout"
     assert hk._state.value == "idle"
 
 
-async def test_a_second_tap_before_timeout_cancels_the_failsafe_timer():
-    """If the closing tap beats the timeout, only ONE ptt.end should ever
-    be published — the timer must actually be cancelled, not just ignored."""
+async def test_latch_timer_does_not_fire_if_backend_became_unavailable_meanwhile(fake_timer):
+    """_on_latch_timeout's own guard: a timer that outlives stop() must not
+    publish a stray ptt.end for a session that already ended for real."""
+    bus = _FakeBus()
+    hk = _make_hotkey(bus=bus, loop=asyncio.get_running_loop(), tap_threshold_ms=200, latch_timeout_ms=30_000)
+    hk.backend_available = True
+
+    _press(hk, "ctrl"); _press(hk, "alt"); _press(hk, "space")
+    _release(hk, "space"); _release(hk, "alt"); _release(hk, "ctrl")
+    await _wait_until(lambda: len(bus.published) == 1)
+
+    hk.backend_available = False  # e.g. stop() ran before the timer fired
+    timer = fake_timer.instances[-1]
+    timer.function()
+
+    await asyncio.sleep(0.05)
+    assert len(bus.published) == 1  # no spurious ptt.end
+
+
+async def test_a_second_tap_before_timeout_cancels_the_failsafe_timer(fake_timer):
+    """If the closing tap beats the timeout, the scheduled timer must
+    actually be cancelled, not merely superseded/ignored."""
     bus = _FakeBus()
     hk = _make_hotkey(bus=bus, loop=asyncio.get_running_loop(), tap_threshold_ms=200, latch_timeout_ms=300)
 
     _press(hk, "ctrl"); _press(hk, "alt"); _press(hk, "space")
     _release(hk, "space"); _release(hk, "alt"); _release(hk, "ctrl")
     await _wait_until(lambda: len(bus.published) == 1)
+    armed_timer = fake_timer.instances[-1]
+    assert armed_timer.cancelled is False
 
     _press(hk, "ctrl"); _press(hk, "alt"); _press(hk, "space")
     _release(hk, "space"); _release(hk, "alt"); _release(hk, "ctrl")
     await _wait_until(lambda: len(bus.published) == 2)
 
-    await asyncio.sleep(0.5)  # well past latch_timeout_ms=300 -- must NOT fire again
-    assert len(bus.published) == 2
+    assert armed_timer.cancelled is True
     assert bus.published[1][1].mode == "latch"  # ended by the tap, not the timeout
+    # And even if it somehow still fired late, it must be a no-op now:
+    armed_timer.function()
+    await asyncio.sleep(0.05)
+    assert len(bus.published) == 2
 
 
 # ---------------------------------------------------------------------------

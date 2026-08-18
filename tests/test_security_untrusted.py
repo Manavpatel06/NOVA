@@ -346,30 +346,55 @@ def test_reveal_over_a_thousand_calls_stays_fast_and_never_leaks():
 
 
 # ---------------------------------------------------------------------------
-# AST guard: no non-trusts_input skill module ever imports/calls reveal
-# (docs/SECURITY_SPEC.md §1.3 layer 3). The router/humanizer layers don't
-# exist yet in M0 (no nova/brain/ package on disk) — scoped to what exists:
-# every skill module, plus a floor check that catches reveal() leaking into
-# any other nova/ module that isn't explicitly the definition site.
+# AST guard: no non-trusts_input skill module ever imports/calls reveal, and
+# — F17 (nova-accuracy, HIGH): docs/SECURITY_SPEC.md's "exactly one named
+# reveal()" claim was not structurally true. `u._value` is a second, silent,
+# unaudited way out that the original scan never looked for: nothing catches
+# `text = u._value` in a future router or parameter-binder, and all three
+# §1.3 enforcement layers would be defeated with zero test failure. Same
+# allowlist-of-one technique as the `reveal` scan, applied to `._value`
+# access as well. (docs/SECURITY_SPEC.md §1.3 layer 3.)
+#
+# `gc.get_referents(u)` also reaches `_value` and is deliberately NOT covered
+# here — the lead's scoping call, which this suite agrees with: that's the
+# *deliberate* bypass class the spec explicitly declines to defend against
+# (Python has no real private attributes; pretending otherwise via a
+# ref-graph-walking check would be theatre, not enforcement). `._value` is
+# the *lazy* class — someone reaching for the obvious attribute without
+# malice — and that one is closeable and worth closing.
+#
+# nova/brain/router.py landed after this file was first written (f39f436);
+# the AST scan below covers all of nova/, including it, so no re-scoping was
+# needed once the module existed.
 # ---------------------------------------------------------------------------
 
 
-def _imports_or_calls_reveal(path) -> bool:
+def _finds_untrusted_bypass(path) -> list[str]:
+    """Returns every AST-detectable way `path` reaches into an Untrusted's
+    guts: importing/calling `reveal`, or accessing `._value` directly."""
     import ast
 
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    hits: list[str] = []
     for node in ast.walk(tree):
         if isinstance(node, ast.ImportFrom) and node.module == "nova.security.untrusted":
             if any(alias.name == "reveal" for alias in node.names):
-                return True
+                hits.append(f"imports reveal at line {node.lineno}")
         if isinstance(node, ast.Attribute) and node.attr == "reveal":
-            return True
+            hits.append(f"references .reveal at line {node.lineno}")
         if isinstance(node, ast.Name) and node.id == "reveal":
-            return True
-    return False
+            hits.append(f"references bare name reveal at line {node.lineno}")
+        if isinstance(node, ast.Attribute) and node.attr == "_value":
+            hits.append(f"accesses ._value at line {node.lineno}")
+    return hits
 
 
-def test_no_trusts_input_false_skill_imports_or_calls_reveal():
+def _imports_or_calls_reveal(path) -> bool:
+    """Kept for callers that only care about the reveal() half."""
+    return any("reveal" in hit for hit in _finds_untrusted_bypass(path))
+
+
+def test_no_trusts_input_false_skill_bypasses_untrusted_via_reveal_or_value():
     import nova.skills  # triggers discovery
     from nova.skills.registry import all_skills
 
@@ -380,24 +405,44 @@ def test_no_trusts_input_false_skill_imports_or_calls_reveal():
         module_file = skills_dir / f"{spec.handler.__module__.rsplit('.', 1)[-1]}.py"
         if not module_file.exists():
             continue
-        assert not _imports_or_calls_reveal(module_file), (
-            f"skill '{name}' (trusts_input=False) imports/calls reveal() in {module_file}"
-        )
+        hits = _finds_untrusted_bypass(module_file)
+        assert not hits, f"skill '{name}' (trusts_input=False) bypasses Untrusted in {module_file}: {hits}"
 
 
-def test_reveal_is_not_imported_anywhere_outside_its_own_definition_module():
-    """Floor check for the router/skill-param-binder rule before those
-    modules exist: today, NOTHING should import reveal at all (M0 ships zero
+def test_untrusted_is_never_bypassed_anywhere_outside_its_own_definition_module():
+    """Floor check for the router/skill-param-binder rule: today, NOTHING
+    should import reveal or touch ._value at all (M0 ships zero
     trusts_input=True skills). Once one lands, this test should be narrowed
-    to allow exactly that skill's module — not relaxed further."""
+    to allow exactly that skill's module for `reveal` — never for `._value`,
+    which has no licensed caller anywhere outside untrusted.py itself."""
     import nova
 
     root = untrusted_mod.__file__
     nova_root = Path(nova.__file__).resolve().parent
-    offenders = []
+    offenders = {}
     for path in nova_root.rglob("*.py"):
         if str(path) == root:
             continue
-        if _imports_or_calls_reveal(path):
-            offenders.append(str(path))
-    assert not offenders, f"reveal() is imported/called outside its own module: {offenders}"
+        hits = _finds_untrusted_bypass(path)
+        if hits:
+            offenders[str(path)] = hits
+    assert not offenders, f"Untrusted bypassed outside its own module: {offenders}"
+
+
+def test_value_attribute_access_is_flagged_even_when_reveal_is_not_used():
+    """Proves the extended scan actually distinguishes the two bypass
+    shapes — a regression guard on the guard itself, using a throwaway
+    fixture file rather than asserting against real source."""
+    import tempfile
+    from pathlib import Path as _Path
+
+    with tempfile.TemporaryDirectory() as tmp:
+        fixture = _Path(tmp) / "bypass_via_value.py"
+        fixture.write_text(
+            "def sneaky(u):\n"
+            "    return u._value  # never calls reveal() at all\n",
+            encoding="utf-8",
+        )
+        hits = _finds_untrusted_bypass(fixture)
+        assert any("_value" in h for h in hits)
+        assert not any("reveal" in h for h in hits)
