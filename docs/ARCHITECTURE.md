@@ -95,14 +95,45 @@ the constitution's confidence-honesty rule, enforced in the router, not in prose
   other file and fails the build if it imports a network library.
 - **Redaction + output sanitizing**: one shared implementation each, no copies.
 
-## Resource budget (16 GB machine Manav also uses)
+## Resource budget — measured, and it contradicts what I first wrote
 
-| State | Target RSS | VRAM |
-|---|---|---|
-| Idle (listening only) | < 300 MB | 0 |
-| Mid-turn (STT + TTS resident) | < 1.5 GB | ~2.4 GB |
-| Brain loaded (LLM resident) | < 1.5 GB | ~5.5 GB |
+The table that was here was a set of targets I invented. nova-dev-core measured
+the real thing (`scripts/measure_governor.py`, published in
+`docs/GOVERNOR_MEASUREMENTS.md`). The measurements win.
 
-These are targets to **measure**, not model. The prior build's memory table was
-admittedly invented; ours gets numbers from `psutil` on this machine or it does
-not go in the docs.
+| State | RSS | VRAM |
+|---|---:|---:|
+| Idle, cold — nothing ever loaded | 57.4 MB | 264 MiB |
+| Whisper loaded, before any transcription | 257.9 MB | 2339 MiB |
+| Whisper, **after one `transcribe()`** | 741.6 MB | 2479 MiB |
+| Whisper unloaded | **741.7 MB — unchanged** | 367 MiB — recovered |
+| Kokoro resident | ~1155–1192 MB | 367 MiB |
+| Both resident | 1348.3 MB | 2351 MiB |
+| Both unloaded (end state) | 960.2 MB | 367 MiB |
+
+### What this actually means
+
+**"Idle under 300 MB" is true exactly once — cold, before Whisper has ever
+transcribed anything.** It is not true as a *return-to-idle* claim. One
+transcription costs roughly 484 MB of host RSS that `unload()`, `del` and
+`gc.collect()` cannot reclaim, and that floor persists for the life of the
+process. VRAM behaves correctly (2479 → 367 MiB), and Kokoro's `unload()` does
+free host RSS — so this is specific to the CTranslate2/CUDA host-side allocator,
+not a general leak. **"Mid-turn under 1.5 GB" does hold**: 1348 MB measured.
+
+So the honest description of what the governor can do in M1 is *"shed Kokoro when
+both models are loaded and idle"* — not *"return NOVA to cold idle."* The ceiling
+is set at 900 MB to reflect that: above Whisper's real floor, below both-resident.
+A ceiling below the floor would make the governor thrash against physics.
+
+Lowering Whisper's floor is a `Transcriber`-side question, not a governor one.
+
+### Known, unresolved
+
+Repeated load/unload cycles drift **+124.8 MB, +74.6 MB, +0.4 MB** across three
+3-cycle runs — real, non-zero, and front-loaded rather than obviously unbounded.
+Three cycles establishes the pattern but cannot rule out slow long-run growth.
+A 10–20 cycle run is required before M1 exits. Until then, whether NOVA is safe to
+leave running all day is **an open question, not a settled one** — which matters
+more than any single number here, because always-on is the entire product.
+
