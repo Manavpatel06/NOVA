@@ -21,8 +21,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import re
-from dataclasses import dataclass
-from typing import TYPE_CHECKING, Generic, TypeVar
+from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 if TYPE_CHECKING:
     from nova.security.audit import AuditLog
@@ -38,7 +37,6 @@ _SOURCE_RE = re.compile(r"^[a-z][a-z0-9_]*(?:\.[a-z][a-z0-9_]*)?$")
 _CALLER_RE = re.compile(r"^[a-z_][a-z0-9_.]*:[A-Za-z_][A-Za-z0-9_]*$")
 
 
-@dataclass(frozen=True, slots=True, eq=False)
 class Untrusted(Generic[T]):
     """A value that came from outside NOVA's control (email bodies, calendar
     invites, web content, document text — CLAUDE.md rule 2). Not a str
@@ -49,16 +47,35 @@ class Untrusted(Generic[T]):
     needs to treat something as untrusted wraps it itself at the boundary;
     it never receives a pre-wrapped value from a function whose signature
     promised `str`.
+
+    Deliberately NOT a `@dataclass` (docs/SECURITY_SPEC.md §1 amendment,
+    2026-08-17): `dataclasses.asdict()`/`astuple()` walk `dataclasses.
+    fields()` and `getattr()` the raw attributes directly, entirely
+    bypassing `__str__`/`__repr__`/`__format__` — a dataclass-based
+    Untrusted was a *complete, silent, unaudited* unwrap via a standard-
+    library call nobody had to write, and it is recursive: an Untrusted
+    nested inside another dataclass unwraps the instant anyone calls
+    asdict() on the *outer* object. Hand-rolling as a plain class with
+    `__slots__` removes it from `dataclasses.is_dataclass()` entirely, which
+    is what asdict/astuple gate on — this closes the whole class of bypass,
+    not just the one call site that was found.
     """
 
-    _value: T
-    source: str
+    __slots__ = ("_value", "source")
 
-    def __post_init__(self) -> None:
-        if isinstance(self._value, Untrusted):
+    def __init__(self, value: T, source: str) -> None:
+        if isinstance(value, Untrusted):
             raise TypeError("Untrusted may not wrap an Untrusted (no re-labelling to hide provenance)")
-        if not _SOURCE_RE.match(self.source):
-            raise ValueError(f"Untrusted.source must be a dotted lowercase tag, got {self.source!r}")
+        if not _SOURCE_RE.match(source):
+            raise ValueError(f"Untrusted.source must be a dotted lowercase tag, got {source!r}")
+        object.__setattr__(self, "_value", value)
+        object.__setattr__(self, "source", source)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        raise AttributeError(f"Untrusted is frozen — cannot set {name!r} after construction")
+
+    def __delattr__(self, name: str) -> None:
+        raise AttributeError(f"Untrusted is frozen — cannot delete {name!r}")
 
     # -- deliberately NOT implemented: __add__, __radd__, __contains__,
     # -- __iter__, __getitem__, __bool__. Each is a way "just use it a
