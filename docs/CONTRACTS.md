@@ -104,6 +104,10 @@ silently mute.
 
 ## T0.5 — security + skills
 
+Amended after nova-security's threat model (`docs/THREAT_MODEL.md`). The changes
+below are requirements, not suggestions — each closes a hole the retired build
+actually shipped.
+
 ```python
 class Tier(Enum): READ = "read"; ACT = "act"; CONFIRM = "confirm"
 
@@ -113,15 +117,65 @@ async def handler(ctx: SkillCtx, **params) -> Reply: ...
 class Ladder:
     async def authorize(self, skill: SkillSpec, params: dict) -> Decision
 class AuditLog:
-    def record(self, event: dict) -> None      # append-only, hash-chained
-class Egress:                                   # THE ONLY MODULE THAT OPENS A SOCKET
-    def fetch(self, url: str) -> bytes          # enforced allowlist, redaction on the way out
+    def record(self, event: dict) -> None   # append-only, hash-chained; RAISES on write failure
+    def verify(self) -> ChainStatus         # walks the chain, reports the first break
+class Egress:                               # THE ONLY MODULE THAT MAY REACH THE NETWORK
+    def fetch(self, url: str) -> bytes                              # allowlisted URLs
+    def release_for_process(self, purpose: str, payload: str) -> str  # text crossing to a spawned process
 ```
 
 Registry is import-time discovery of `nova/skills/*.py`. No hand-wiring: the
 router reads `examples`, the ladder reads `tier`, and the injection suite
 enumerates `trusts_input=True` skills and blocks any that lacks hostile-content
-tests. M0 ships two skills: `time` (READ) and `open_app` (ACT).
+tests. Duplicate skill names raise loudly; they never silently overwrite. M0
+ships two skills: `time` (READ) and `open_app` (ACT).
+
+### Audit failure means deny
+
+`record()` raises on write failure, and `Ladder.authorize()` denies any ACT or
+CONFIRM action whose audit write failed. The rule inherited from the old build —
+*"we could not log that this left"* must mean *"it did not leave"* — extends to
+actions, not just egress. Silent proceed-without-a-record is forbidden.
+
+### CONFIRM fails closed, and audibly
+
+`authorize()` on a CONFIRM-tier action with no confirmation channel registered
+returns an **audited** `Decision.deny` with reason `no_confirm_channel`. Test this
+in M0 even though M0 ships no CONFIRM skills, so that M1 only has to attach a
+channel rather than discover a silent bypass. The retired build's real failure
+was not a missing dialog — it had two — but that CONFIRM defaulted to
+unapprovable for most of its life *with no loud signal*, and was never once
+verified against a human clicking anything.
+
+### `open_app` is arbitrary code execution wearing a hat
+
+`os.startfile("http://evil.example")` opens the default browser and fetches the
+URL **through the shell**, so `Egress` never sees it. UNC paths
+(`\host\share\payload.exe`) do the same across the network. Therefore:
+closed allowlist of known applications in config; reject URL-shaped and UNC-shaped
+input *before* touching any Windows API; `realpath`-verify the resolved target
+against the allowed-directory set **at call time**, not at load time (junctions
+move); `Popen([resolved_path], shell=False)` with an argument list, never a bare
+string, never `shell=True`; unknown app name is a refusal, not a best guess.
+
+### The no-network test bans spawning, not just sockets
+
+The old AST test walked `nova/` for socket-family imports — and its `TRANSPORTS`
+set never included `subprocess`, while **seven** files under `nova/` imported it.
+The promise stayed green over a hole you could drive a process through. So the
+test is rescoped and renamed to enforce what it actually claims: **no file may
+open a socket, or spawn a process capable of opening one.** Banned outside a short
+named allowlist: `subprocess`, `os.system`, `os.popen`, `os.exec*`, `os.spawn*`,
+`os.startfile`, `asyncio.create_subprocess_*`, plus the socket family.
+
+### `Untrusted` is a type, not a label
+
+A `str` subclass is a naming convention that the first `f"{x}"` defeats. To be
+structural: **not** a `str` subclass, so passing it where `str` is annotated fails
+loudly instead of duck-typing through; no `__str__`/`__format__` returning the raw
+content; exactly one named `reveal()`; and an AST test asserting the router and the
+skill-parameter binder never call it. This makes the *lazy* bypass fail loudly —
+the injection test suite is still what proves the *deliberate* one doesn't exist.
 
 ## Cross-cutting rules
 
