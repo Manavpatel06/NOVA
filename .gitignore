@@ -1,0 +1,24 @@
+# Retired previous build — off-limits, pending manual deletion
+_OLD_ARCHIVE/
+
+# Environments and caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+cache/
+models/
+
+# Runtime state and secrets
+logs/
+data/
+*.key
+*.env
+.env*
+client_secret*.json
+token*.json
+
+# OS noise
+Thumbs.db
+Desktop.ini
