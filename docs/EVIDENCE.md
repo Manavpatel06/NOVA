@@ -35,7 +35,10 @@ after deleting `data/gpu_profile.json`)
 ```
 device=cuda  compute_type=float16  verified=True
 NVIDIA GeForce RTX 5060 Laptop GPU, driver 610.62, ct2 4.8.1
-load 1.48s | transcribe 0.44s for 3.0s audio
+load 1.68-1.79s | transcribe 0.68-0.69s for 3.0s audio
+(the first single run reported 1.48s/0.44s; nova-accuracy re-measured across
+5 runs and those were ~20% and ~55% optimistic. Ranges, not points -- these
+fluctuate run to run.)
 ```
 
 Command: `.venv/Scripts/python.exe scripts/probe_roundtrip.py`

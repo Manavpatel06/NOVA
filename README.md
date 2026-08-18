@@ -31,7 +31,7 @@ Numbers below are marked either **read directly** (this agent has no execution t
 | STT device | cuda, float16, verified=True | consistent across `data/gpu_profile.json` and lead-verified (re-run from cold cache) |
 | GPU | RTX 5060 Laptop GPU (Blackwell sm_120), driver 610.62, ct2 4.8.1 | lead-verified |
 | STT probe caveat | `probe_gpu()` verifies against `tiny.en`, not `large-v3-turbo` — the two can diverge; `GpuProfile.verified_model` records which model actually ran | read directly, `nova/stt/gpu.py` + `data/gpu_profile.json` |
-| Whisper load / transcribe latency | 1.48s load, 0.44s for 3.0s of synthetic audio | lead-verified |
+| Whisper load / transcribe latency | 1.68-1.79 s load, 0.68-0.69 s transcribe (ranges, 5 runs; an earlier single-run 1.48 s / 0.44 s was optimistic -- nova-accuracy re-measured) | lead-verified |
 | VRAM resident / after unload | 2479 MiB / 367 MiB | lead-verified — `Transcriber` measured in isolation via `nvidia-smi` |
 | Memory after a full turn loop's `app.stop()` | RSS 912.9 MB (from a 59.4 MB baseline), VRAM 566 MiB (from 264 MiB) — **retained, not released** | lead-verified, `docs/EVIDENCE.md` — disagrees with the isolated `Transcriber`-only row above; open question, see `docs/decisions/0006-open-question-memory-does-not-return-to-baseline.md` (finding F16) |
 | int8 on this stack | loads and runs without crashing, refused anyway by deliberate policy | `docs/decisions/0002-int8-refused-on-blackwell.md` |
@@ -61,10 +61,12 @@ Short ADRs for choices the team made deliberately, under `docs/decisions/`:
 - [`0004-wdm-ks-host-api-ranking-not-silence-floor-alone.md`](docs/decisions/0004-wdm-ks-host-api-ranking-not-silence-floor-alone.md) — mic candidates are ranked by host API tier first, RMS second, because the AGC-suppressed WASAPI/MME duplicates of the working mic are non-zero and would otherwise sometimes win a straight loudness contest.
 - [`0005-untrusted-is-not-a-dataclass.md`](docs/decisions/0005-untrusted-is-not-a-dataclass.md) — `Untrusted[T]` is hand-rolled, not a `@dataclass`, because `dataclasses.asdict()`/`astuple()` bypass every string-protocol defense a dataclass version had, silently and recursively (finding F12, CRITICAL).
 - [`0006-open-question-memory-does-not-return-to-baseline.md`](docs/decisions/0006-open-question-memory-does-not-return-to-baseline.md) — **open question, not a decision**: ~850 MB RSS / ~300 MiB VRAM stay retained after `app.stop()` unloads both models. Diagnosis in progress (finding F16, HIGH).
+- [`0007-wake-word-vendored-not-openwakeword-dependency.md`](docs/decisions/0007-wake-word-vendored-not-openwakeword-dependency.md) — `nova/audio/wake.py` is a from-scratch onnxruntime pipeline, not the `openwakeword` package, because that package imports `requests` unconditionally at module load — a general-purpose HTTP client entering `nova/`'s dependency graph would be invisible to the AST no-socket test, which only scans `nova/*.py`, not `site-packages`.
+- [`0008-ptt-hook-callback-structurally-cannot-keylog.md`](docs/decisions/0008-ptt-hook-callback-structurally-cannot-keylog.md) — the global keyboard hook's callback is split so the raw per-keystroke event exists in scope for two reviewed lines only; everything downstream (the tap/hold/latch state machine) receives a stripped, non-identifying tuple and has no way to reach for raw key data even by accident.
 
-## What's next
+## What's next (M1, in progress)
 
-M1 adds a wake word (`hey_jarvis` as a stand-in — model files for it already sit in `models/wake/`, but no `nova/audio/wake.py` exists yet), VAD endpointing, a tray icon, and a working CONFIRM UI. See `docs/ROADMAP.md` for the full milestone list and `docs/TASKS.md` for the live task board, findings register, and measured-facts table this README's numbers are drawn from.
+`nova/audio/wake.py` (wake-word detection, `hey_jarvis` stand-in) and `nova/audio/vad.py` (VAD) both now exist in code — this README previously said neither did; that was stale the moment M1 work landed, and this section is a live target, not a fixed snapshot. Check `docs/TASKS.md`'s task board for current state before trusting this paragraph over it. M1 also adds a tray icon and a working CONFIRM UI. See `docs/ROADMAP.md` for the full milestone list and `docs/TASKS.md` for the live task board, findings register, and measured-facts table this README's numbers are drawn from.
 
 ## Getting started
 
