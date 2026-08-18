@@ -128,12 +128,41 @@ A ceiling below the floor would make the governor thrash against physics.
 
 Lowering Whisper's floor is a `Transcriber`-side question, not a governor one.
 
-### Known, unresolved
+### Diagnosed: a caching allocator, not a leak
 
-Repeated load/unload cycles drift **+124.8 MB, +74.6 MB, +0.4 MB** across three
-3-cycle runs — real, non-zero, and front-loaded rather than obviously unbounded.
-Three cycles establishes the pattern but cannot rule out slow long-run growth.
-A 10–20 cycle run is required before M1 exits. Until then, whether NOVA is safe to
-leave running all day is **an open question, not a settled one** — which matters
-more than any single number here, because always-on is the entire product.
+nova-dev-core traced it (`docs/F16_MEMORY_RETENTION.md`) and nova-accuracy
+independently confirmed the shape. It is **native library memory, not a Python
+leak**: `tracemalloc` accounts for ~23-25 MB while real RSS sits ~737 MB above
+baseline — Python's allocator can see about 3% of what is retained. The cause was
+confirmed rather than inferred: the installed `ctranslate2.dll` contains the
+strings `CT2_CUDA_ALLOCATOR` and `CT2_CUDA_CACHING_ALLOCATOR_CONFIG`. CTranslate2
+ships a caching allocator **by design** — it pools freed memory for reuse instead
+of returning it to the OS, one layer below anything `gc.collect()` can reach.
+`dir(ctranslate2)` exposes no release or reset call.
 
+**Host RSS is a floor, not a leak.** Two independent measurements agree: 10 cycles
+flat-to-declining (dev-core), and 20 cycles plateauing after the first ~5 at
+~840 MB, oscillating ±2 MB with no trend (accuracy, script written from scratch).
+
+Real achievable idle, once `transcribe()` has run in a process: **~735-770 MB**,
+plus ~111-135 MB if Kokoro has also run. Combined and measured additively:
+**~850-900 MB**. Kokoro, unlike Whisper, releases ~76% of its host RSS on unload,
+and onnxruntime here is CPU-only — so Kokoro is no part of the VRAM story.
+
+### Still open
+
+- **VRAM creeps ~7-8 MiB per cycle** (367 → 439 MiB over 10 cycles) and has not
+  visibly plateaued. Needs a 30-50 cycle recheck before M1 exits.
+- **All VRAM numbers in this project are total-GPU deltas, not per-process.**
+  `nvidia-smi --query-compute-apps` returns `[N/A]` on this driver, so no
+  per-process figure is available at all. A transient 4556 MiB reading was
+  observed mid-run with nothing in-process to explain it. Treat every VRAM
+  number here as an upper bound measured on a shared machine.
+
+### The consequence
+
+"Idle near zero" is unachievable in-process with these libraries as integrated.
+The only lever anyone has identified is a **process boundary** — models in a
+subprocess that can be killed, so the OS reclaims the arena — trading reload
+latency for a real return to near-zero. That is a design decision for Manav, not
+one to make quietly inside a governor.
