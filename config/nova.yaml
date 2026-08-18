@@ -1,0 +1,22 @@
+# NOVA — the one config file (docs/CONTRACTS.md).
+#
+# Every key here has a real consumer in an M0 module (see nova/config.py for
+# the mapping). Unknown keys anywhere in this file are a hard error at load
+# time — that's deliberate: a config file full of options nothing reads is
+# how the retired build lost track of what was true.
+
+audio:
+  samplerate: 16000   # Hz — required by the STT/VAD models; nova.audio.Capture
+  channels: 1          # mono
+  frame_ms: 30         # capture frame size (ms) handed to Capture.read()
+
+stt:
+  model: large-v3-turbo   # faster-whisper model name, resolved from cache/hf/hub
+  language: en
+
+tts:
+  voice: af_heart      # Kokoro voice id
+  speed: 1.0
+
+security:
+  egress_allowlist: []   # domains nova.security.Egress may reach; empty until a skill needs one
