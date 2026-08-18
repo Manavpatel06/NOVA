@@ -59,3 +59,12 @@ brain:
   # measured score gap these two numbers sit inside.
   confidence_floor: 0.42
   ambiguity_margin: 0.08
+
+governor:
+  # Measured, not modelled -- see docs/GOVERNOR_MEASUREMENTS.md for the
+  # real numbers and the command that produced each one. 900 MB sits just
+  # above Transcriber's measured post-use host-RSS floor (~740-780 MB) and
+  # below "both resident" (~1150-1350 MB) -- the realistic job this does
+  # is shedding Kokoro when both are loaded and idle.
+  poll_interval_s: 5.0
+  rss_ceiling_mb: 900.0

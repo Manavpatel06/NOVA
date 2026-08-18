@@ -106,6 +106,28 @@ class BrainConfig:
 
 
 @dataclass(frozen=True)
+class GovernorConfig:
+    """Consumed by nova.governor.Governor. Defaults are measured, not
+    modelled — see docs/GOVERNOR_MEASUREMENTS.md for the real numbers and
+    the command that produced each one."""
+
+    #: how often the background poll checks RSS against the ceiling.
+    poll_interval_s: float = 5.0
+
+    #: above this, with no turn in flight, unload the largest registered
+    #: idle component (re-measuring and continuing until back under the
+    #: ceiling or nothing left to unload). 900 MB sits just above the
+    #: measured Transcriber-alone-after-real-use floor (~740-780 MB host
+    #: RSS on this machine -- Transcriber.unload() frees VRAM but not host
+    #: RSS once it has actually transcribed something, a real finding, not
+    #: a bug -- see docs/GOVERNOR_MEASUREMENTS.md) and comfortably below
+    #: "both resident" (~1150-1350 MB), so the realistic job this ceiling
+    #: does is shedding Kokoro when both are loaded and idle, not returning
+    #: all the way to cold-idle once Whisper has ever run.
+    rss_ceiling_mb: float = 900.0
+
+
+@dataclass(frozen=True)
 class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     stt: SttConfig = field(default_factory=SttConfig)
@@ -113,6 +135,7 @@ class Config:
     security: SecurityConfig = field(default_factory=SecurityConfig)
     hotkey: HotkeyConfig = field(default_factory=HotkeyConfig)
     brain: BrainConfig = field(default_factory=BrainConfig)
+    governor: GovernorConfig = field(default_factory=GovernorConfig)
 
 
 _SECTIONS: dict[str, type] = {
@@ -122,6 +145,7 @@ _SECTIONS: dict[str, type] = {
     "security": SecurityConfig,
     "hotkey": HotkeyConfig,
     "brain": BrainConfig,
+    "governor": GovernorConfig,
 }
 
 
