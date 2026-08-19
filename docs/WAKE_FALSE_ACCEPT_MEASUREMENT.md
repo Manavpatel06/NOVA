@@ -1,7 +1,23 @@
 # Wake-word false-accept measurement — T1.6, F27
 
 Owner: nova-dev-2. Companion to `nova/audio/wake.py` and `nova/config.py`'s
-`WakeConfig.threshold` bounds (T1.5). Every number below came from:
+`WakeConfig.threshold` bounds (T1.5).
+
+**Status update, read this first**: the run below was invalidated after the
+fact — F36 (output device landing on an indirection layer) and F40 (input
+prober selecting a loopback/monitor-capture device) were both still live
+when it was taken, and either could have corrupted the acoustic numbers.
+After both were fixed, a real false accept was found and confirmed
+reproducible: **"hey jazz"**, an ordinary two-word phrase, cleared the old
+0.55 default, then kept getting worse every time it was sampled again
+(0.5125, then 0.6449, then 0.9321 across three separate sessions). See the
+**"Final outcome (post-fix)"** section at the end for what that means and
+what shipped. The measurement methodology and the direct-fed/acoustic
+divergence finding below are still accurate and still the reason the final
+numbers are trusted at all — only the specific acoustic scores in Result 2
+predate the device fixes and should not be read as current.
+
+Every number below came from:
 
 ```
 D:\NOVA\.venv\Scripts\python.exe scripts\measure_wake_false_accept.py
@@ -157,7 +173,57 @@ case in `docs/THREAT_MODEL_ALWAYS_ON.md` for F28 (tier-capping acoustic-only
 arming) rather than trusting the threshold as the access-control mechanism
 on its own.
 
-## Recommendation
+## Final outcome (post-fix)
+
+The recommendation immediately below this heading was written before F36
+and F40 landed and is kept for the record; it is superseded by this
+section.
+
+Once F36 (output landing on an indirection layer) and F40 (input prober
+selecting a loopback device) were both fixed, `scripts/measure_wake_false_
+accept.py` was re-run — the fourth attempt, after two earlier invalidations
+each traced to a different bug (F37: direct-fed scoring inverting the
+danger ranking; F39: the output indirection layer; F40: the loopback
+input). That run passed its own positive control ("hey jarvis" 0.9960–
+0.9967) and found a real false accept: **"hey jazz"** peaked at 0.6449
+across 3 acoustic trials, above the 0.55 default.
+
+A floor of 0.70 (default 0.75) was derived from that single run's peak —
+and immediately refuted by the next one. Before committing, the same
+measurement was re-run independently and "hey jazz" peaked at **0.9321**;
+six dedicated follow-up trials of that phrase alone gave a 0.466–0.924
+range, two of six still above 0.75. **The observed ceiling rose every
+single time anyone sampled more: 0.5125, then 0.6449, then 0.9321 across
+three separate sessions.** That is the signature of a right tail this
+project cannot bound by sampling harder — a floor derived from an observed
+maximum will keep being exceeded by the next run, and will look reasonable
+right up until it doesn't. Raising the floor further to chase "hey jazz"
+was considered and rejected on that basis, not attempted and abandoned.
+
+A second, independent reason rules out chasing a higher floor (recorded as
+**F41**): every true-positive score in this entire measurement, including
+the 0.996–0.999 quoted throughout this document, is Kokoro-synthetic — a
+TTS voice through speakers into a mic. No human has ever spoken to this
+detector. Pushing the floor higher to try to clear "hey jazz" risks landing
+on a threshold Manav's own real voice can't reliably clear either, with no
+way to measure that risk before he actually tries it.
+
+**Shipped**: `WakeConfig.threshold` default raised to **0.75**, floor
+enforced at **0.70** (`nova/config.py`'s `Bounds`) — explicitly labelled in
+the code as **defence in depth, not a closed floor**. It roughly halves
+the observed false-accept exposure (of the six dedicated "hey jazz" trials,
+3 fire at 0.55, 2 still fire at 0.75) without claiming to close it.
+
+**F27's real resolution is F28, not this number.** This measurement is now
+the strongest concrete argument for capping acoustic-only arming below ACT
+tier: if a wake-armed action can't reach ACT, a false accept costs a
+spurious listening state, not a launched process — a containable failure,
+unlike a threshold that holds until it doesn't. Put to Manav in those terms
+rather than resolved unilaterally in code.
+
+---
+
+## Recommendation (superseded — kept for the record, see above)
 
 **F27 stays open.** The current default (0.55) is not shown to be unsafe by
 anything measured here; nothing supports moving it, in either direction,
