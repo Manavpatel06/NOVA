@@ -328,3 +328,50 @@ is worse than one that says nothing — because it will be believed.
 
 The prompt shows the **actual post-redaction payload**, recursively through
 dicts and lists. Consent is to a specific disclosure, not to a category.
+
+## T1.7 — the duplex gate (finding F26), `nova/audio/duplex.py`
+
+**This is a precondition for wiring `wake.py` into `app.py`, not a follow-up.**
+The retired build hit the self-echo loop, documented it as *"a loop, not a
+glitch"*, and shipped `aec.py` for it. This tree has no equivalent and no
+coordination point at all — `Player.play()` and `WakeWord.process()` do not know
+about each other. It is masked today only because push-to-talk stops `Capture`
+before `_speak()` runs, which is a side effect of PTT's shape rather than a
+control. Wiring the wake word in without one reproduces a solved bug on purpose.
+
+```python
+class DuplexGate:
+    def mic_open(self) -> bool          # False while NOVA is speaking (+ hangover)
+    def on_speak_start(self) -> None    # bus: TOPIC_SPEAK_START
+    def on_speak_end(self) -> None      # bus: TOPIC_SPEAK_END, starts the hangover
+```
+
+Requirements:
+
+- **Half-duplex is sufficient for M1.** Mute while `Player` is active, with a
+  short hangover after. Full acoustic echo cancellation is explicitly *not*
+  required to ship safely — neither full-duplex backend has a reliable Windows
+  wheel, and the prior build reached the same conclusion. Do not build AEC.
+- **Bus-driven, not direct calls.** `TOPIC_SPEAK_START`/`TOPIC_SPEAK_END` already
+  exist and are already published by `NovaApp._speak()` for the tray. Subscribe;
+  do not reach into `Player`. Two components already coordinate through those
+  topics — a third is free.
+- **`WakeWord.process()` consults the gate and returns early when the mic is
+  shut.** It must not score audio captured while NOVA is talking. That is the
+  entire point: the detector getting a clean shot at NOVA's own reply is the
+  loop.
+- **The hangover is a guess and must say so.** The retired build used 180 ms,
+  reasoning about speaker decay plus WASAPI output buffering, and never measured
+  it. Pick a number, put the reasoning next to it, make it config-driven, and
+  label it as untuned rather than as a finding.
+- **Fail closed.** If gate state is unknown or the subscription never arrived,
+  the mic is treated as shut for wake purposes. A gate that fails open is the
+  same as no gate, and it would fail open exactly when something has gone wrong.
+- **Push-to-talk is unaffected.** PTT already closes `Capture` around speech and
+  is the deliberate barge-in path (`Ctrl+Alt+Space` cancels playback inline).
+  The gate must not break it.
+
+Explicitly **not** in scope here, and tracked separately: the arming-source
+signal and tier cap (F28) are Manav's decision, and the threshold floor (F27)
+needs the false-accept measurement now running. This contract is the part that
+holds regardless of how either resolves.
