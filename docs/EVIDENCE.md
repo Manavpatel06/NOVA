@@ -66,6 +66,26 @@ after app.stop()           912.9 MB      367 MiB   host RSS does NOT return
 Warm turn latency ~2.3 s wake-to-voice, including audio playing to completion.
 First turn ~5.1 s with the one-time model load folded in.
 
+### Re-verified after M1 work (lead, 2026-08-18)
+
+Same `scripts/probe_turn.py`, re-run after roughly thirty commits touching the
+turn loop's dependencies — lazy output-device resolution (F25), the
+`nova/threadsafe.py` migration across five call sites (F30), tray wiring, the
+dialog CONFIRM channel, the governor, and config bounds. Unit tests do not catch
+integration breakage; this does.
+
+| Turn | Result |
+|---|---|
+| "what time is it" | `"It's 6:15 PM."` — correct |
+| "open notepad" | Notepad launched for real, pid 32072, then closed |
+| "what's the weather today" | below floor → clarification, zero skills invoked |
+
+RSS 1250 MB with both models loaded, 912.2 MB after `stop()`; VRAM 2507 → 395 MiB.
+Consistent with the F16/F21 measurements, and the ~395 vs 367 MiB spread is the
+machine-wide-reading caveat below, not drift.
+
+Warm turn ~2.3 s. Nothing regressed.
+
 ### Pending — requires a human, and cannot be closed without one
 
 M0's exit bar in `docs/ROADMAP.md` is *"Manav holds the hotkey, says 'open
