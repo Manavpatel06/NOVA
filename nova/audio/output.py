@@ -76,9 +76,40 @@ class OutputProfile:
     reason: str  # why this endpoint, in words, for the log and for a human
 
 
+#: Endpoints that are not devices at all — they are indirection layers that
+#: resolve to "whatever Windows' default is" **at stream-open time**, not at
+#: probe time.
+#:
+#: These defeat this entire module if selected. Finding F36: the first
+#: non-display candidate on this machine is "Microsoft Sound Mapper - Output",
+#: so when the OS default was a display endpoint — precisely the case F18 exists
+#: to handle — this code would reject the TV, pick Sound Mapper, and Sound Mapper
+#: would resolve straight back to the TV. A fix that silently undoes itself in
+#: the one scenario it was written for.
+#:
+#: Found by nova-dev-2 while measuring wake-word false accepts: identical clips
+#: swung from 0.98 to 0.015 seconds apart, because playback was landing
+#: somewhere different each time.
+INDIRECTION_ENDPOINT_MARKERS: tuple[str, ...] = (
+    "microsoft sound mapper",
+    "primary sound driver",
+    "primary sound capture driver",
+)
+
+
+def is_indirection_endpoint(name: str) -> bool:
+    lowered = name.lower()
+    return any(marker in lowered for marker in INDIRECTION_ENDPOINT_MARKERS)
+
+
 def is_display_endpoint(name: str) -> bool:
     lowered = name.lower()
     return any(marker in lowered for marker in DISPLAY_ENDPOINT_MARKERS)
+
+
+def _is_usable_local_endpoint(name: str) -> bool:
+    """A concrete, local sound card — not a screen, not an indirection layer."""
+    return not is_display_endpoint(name) and not is_indirection_endpoint(name)
 
 
 def _verify_opens(index: int, samplerate: int) -> bool:
@@ -149,7 +180,7 @@ def probe_output_device(force: bool = False) -> OutputProfile:
         local = [
             (i, d)
             for i, d in enumerate(devices)
-            if d["max_output_channels"] > 0 and not is_display_endpoint(d["name"])
+            if d["max_output_channels"] > 0 and _is_usable_local_endpoint(d["name"])
         ]
         same_api = [(i, d) for i, d in local if d["hostapi"] == default["hostapi"]]
         candidates = same_api or local
