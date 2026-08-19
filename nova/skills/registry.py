@@ -61,11 +61,23 @@ def _find_untrusted(value: Any, path: str) -> str | None:
     hypothetical: the `Untrusted.asdict()` bypass (F12) was serious
     specifically because it was recursive through nested dataclasses/lists,
     so the same container shapes are worth checking here on the way in.
+
+    F29 (nova-security): dict KEYS are checked too, not just values.
+    `Untrusted` defines `__hash__`, so it is perfectly legal as a dict key —
+    `params={"filters": {Untrusted(...): "x"}}` reached the handler with the
+    key intact, unflagged and un-audited, because the first version of this
+    function only ever recursed into `value.items()`'s second element. The
+    top-level `params` dict is protected by Python itself (`**params`
+    requires `str` keys), which is exactly why this was missed on first
+    read and exactly why a *nested* dict has no such protection.
     """
     if isinstance(value, Untrusted):
         return path
     if isinstance(value, dict):
         for key, item in value.items():
+            key_hit = _find_untrusted(key, f"{path}.<key>" if path else "<key>")
+            if key_hit:
+                return key_hit
             hit = _find_untrusted(item, f"{path}.{key}" if path else str(key))
             if hit:
                 return hit
