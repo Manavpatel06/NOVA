@@ -67,6 +67,7 @@ from typing import IO, TYPE_CHECKING, Any
 from nova.log import get_logger
 from nova.security.ladder import ConfirmTimeout
 from nova.security.redact import redact
+from nova.threadsafe import post_callback
 
 if TYPE_CHECKING:
     from nova.skills.registry import SkillSpec
@@ -175,9 +176,12 @@ class ConsoleConfirmChannel:
     whole process hung on shutdown waiting for it — a real, reproduced hang,
     not a hypothetical. A daemon thread is abandoned at interpreter exit
     instead of joined, so a timeout here costs one dangling thread (whose
-    eventual stray input is silently dropped), never a frozen process. A
-    future tray/dialog channel (M1) doesn't share this limitation at all,
-    since it isn't reading a blocking stream.
+    eventual stray input is silently dropped — via `nova.threadsafe.
+    post_callback`, F30; before that fix, a stray line arriving after the
+    event loop had already closed raised `RuntimeError` on this thread
+    instead), never a frozen process. A future tray/dialog channel (M1)
+    doesn't share this limitation at all, since it isn't reading a blocking
+    stream.
     """
 
     def __init__(
@@ -202,12 +206,20 @@ class ConsoleConfirmChannel:
         result: asyncio.Future[str] = loop.create_future()
 
         def _read_one_line() -> None:
+            # post_callback (F30): this thread is abandoned (daemon=True,
+            # per the class docstring) if the timeout below fires first, and
+            # can wake up long after `loop` has closed -- reproduced
+            # directly by nova-tester. Previously this called
+            # loop.call_soon_threadsafe() unguarded, so that wakeup raised
+            # RuntimeError on a thread with nothing to catch it, before
+            # _settle_result/_settle_exception's own done-guard was ever
+            # reached.
             try:
                 line = self._in.readline()
             except Exception as exc:  # noqa: BLE001 — hand any read failure back to the awaiting side
-                loop.call_soon_threadsafe(_settle_exception, result, exc)
+                post_callback(loop, _settle_exception, result, exc)
                 return
-            loop.call_soon_threadsafe(_settle_result, result, line)
+            post_callback(loop, _settle_result, result, line)
 
         threading.Thread(target=_read_one_line, daemon=True, name="nova-confirm-console-readline").start()
 
@@ -272,7 +284,14 @@ class DialogConfirmChannel:
     `asyncio.Future` this channel awaited is already done, so
     `_settle_result`/`_settle_exception` (shared with `ConsoleConfirmChannel`)
     silently drop the late answer rather than retroactively approving
-    something the ladder already audited as denied.
+    something the ladder already audited as denied. That "silently drop"
+    claim was only true while the event loop stayed open (F30, nova-tester):
+    a click arriving after NovaApp has already shut down and closed the
+    loop used to raise `RuntimeError` on this thread instead of dropping
+    quietly. `_show_dialog` now posts through `nova.threadsafe.
+    post_callback`, which absorbs that case too — a late click drops
+    cleanly (DEBUG-logged) whether the loop is merely done-with-this-Future
+    or fully closed.
     """
 
     def __init__(self, *, timeout_s: float = 60.0, redact_terms: tuple[str, ...] = ()) -> None:
@@ -287,6 +306,11 @@ class DialogConfirmChannel:
         result: asyncio.Future[int] = loop.create_future()
 
         def _show_dialog() -> None:
+            # post_callback (F30): identical hazard to
+            # ConsoleConfirmChannel._read_one_line above -- this thread is
+            # abandoned on timeout (class docstring's documented limitation)
+            # and can be sitting inside the blocking MessageBox() call long
+            # after `loop` has closed. Same fix, same reason.
             try:
                 import win32api
                 import win32con
@@ -294,9 +318,9 @@ class DialogConfirmChannel:
                 flags = win32con.MB_YESNO | win32con.MB_ICONQUESTION | win32con.MB_SYSTEMMODAL | win32con.MB_TOPMOST
                 answer = win32api.MessageBox(0, prompt, title, flags)
             except Exception as exc:  # noqa: BLE001 — hand any failure (no pywin32, no desktop session) back to the awaiting side
-                loop.call_soon_threadsafe(_settle_exception, result, exc)
+                post_callback(loop, _settle_exception, result, exc)
                 return
-            loop.call_soon_threadsafe(_settle_result, result, answer)
+            post_callback(loop, _settle_result, result, answer)
 
         threading.Thread(target=_show_dialog, daemon=True, name="nova-confirm-dialog").start()
 

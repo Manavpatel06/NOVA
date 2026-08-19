@@ -74,6 +74,7 @@ from nova import WAKE_MODEL_DIR
 from nova.audio.vad import Vad
 from nova.bus import EventBus
 from nova.log import get_logger
+from nova.threadsafe import post_coroutine
 
 _log = get_logger(__name__)
 
@@ -492,7 +493,13 @@ class WakeWord:
         if self._loop is None:
             _log.warning("WakeWord has no event loop to publish %r on; dropping event", topic)
             return
+        # post_coroutine (F30) already turns "loop is closed" into a clean,
+        # DEBUG-logged no-op rather than a RuntimeError. The try/except here
+        # stays as a backstop for anything else scheduling could raise --
+        # _on_arm_timeout (the Timer-thread caller) has no outer guard of
+        # its own the way _on_event()'s hook-thread callers do, so this is
+        # still the only net under that specific path.
         try:
-            asyncio.run_coroutine_threadsafe(self._bus.publish(topic, payload), self._loop)
+            post_coroutine(self._loop, self._bus.publish(topic, payload))
         except Exception as exc:
             _log.warning("Failed to schedule bus publish for %r: %s", topic, exc)

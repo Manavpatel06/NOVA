@@ -73,6 +73,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Callable
 
 from nova.log import get_logger
+from nova.threadsafe import post_callback
 
 if TYPE_CHECKING:
     from nova.bus import EventBus
@@ -425,7 +426,12 @@ class Tray:
             return
         try:
             if self._loop is not None:
-                self._loop.call_soon_threadsafe(self._on_quit)
+                # post_callback (F30): if the loop already closed by the
+                # time the tray thread gets here (e.g. NovaApp.stop() ran
+                # ahead of Tray.stop() finishing its own teardown), this
+                # drops the call at DEBUG instead of raising RuntimeError on
+                # a thread with nothing to catch it.
+                post_callback(self._loop, self._on_quit)
             else:
                 self._on_quit()
         except Exception as exc:

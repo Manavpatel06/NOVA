@@ -179,9 +179,11 @@ class NovaApp:
 
     def _request_stop(self) -> None:
         """Wired as the tray's on_quit callback. Tray already marshals this
-        onto the asyncio loop via call_soon_threadsafe before calling it
-        (see Tray._invoke_on_quit), so by the time this runs it is safe to
-        touch asyncio state directly."""
+        onto the asyncio loop via nova.threadsafe.post_callback before
+        calling it (see Tray._invoke_on_quit), so by the time this runs it
+        is safe to touch asyncio state directly -- and if the loop had
+        already closed by then, post_callback would have dropped the call
+        before this method ever ran (F30)."""
         _log.info("Stop requested (tray Quit)")
         self._stop_event.set()
 

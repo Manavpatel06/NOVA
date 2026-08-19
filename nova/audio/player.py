@@ -10,6 +10,7 @@ import numpy as np
 import sounddevice as sd
 
 from nova.log import get_logger
+from nova.threadsafe import post_callback
 
 _log = get_logger(__name__)
 
@@ -99,8 +100,13 @@ class Player:
                 raise sd.CallbackStop
 
         def _finished_callback():
+            # sounddevice invokes this from its own audio thread, which can
+            # outlive `loop` (e.g. NovaApp.stop() closing the loop while a
+            # stream is still tearing down) -- post_callback (F30) drops
+            # that case at DEBUG instead of raising RuntimeError on a
+            # thread with nothing to catch it.
             if not done.done():
-                loop.call_soon_threadsafe(done.set_result, None)
+                post_callback(loop, done.set_result, None)
 
         with self._lock:
             self._stream = sd.OutputStream(

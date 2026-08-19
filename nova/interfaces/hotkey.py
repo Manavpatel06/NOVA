@@ -46,6 +46,7 @@ from enum import Enum
 
 from nova.bus import EventBus
 from nova.log import get_logger
+from nova.threadsafe import post_coroutine
 
 _log = get_logger(__name__)
 
@@ -388,7 +389,13 @@ class Hotkey:
         if self._loop is None:
             _log.warning("Hotkey has no event loop to publish %r on; dropping event", topic)
             return
+        # post_coroutine (F30) turns "loop is closed" into a clean,
+        # DEBUG-logged no-op rather than a RuntimeError -- the try/except
+        # here is now just a backstop for anything else scheduling could
+        # raise (_on_event already has its own outer guard too, but this
+        # keeps _publish's own behavior self-contained rather than relying
+        # on that).
         try:
-            asyncio.run_coroutine_threadsafe(self._bus.publish(topic, payload), self._loop)
+            post_coroutine(self._loop, self._bus.publish(topic, payload))
         except Exception as exc:
             _log.warning("Failed to schedule bus publish for %r: %s", topic, exc)
