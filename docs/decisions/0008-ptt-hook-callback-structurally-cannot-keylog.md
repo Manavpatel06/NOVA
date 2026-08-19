@@ -1,6 +1,6 @@
 # ADR 0008: The PTT hook callback is split so raw keystrokes structurally cannot leak, not just by policy
 
-**Status:** decided, implemented in `nova/interfaces/hotkey.py` (`_extract_combo_event`, `_on_event`). Closes findings F9 and F10 in `docs/TASKS.md` (as read directly in code — that document's F9/F10 rows still show "queued" as of this writing, which looks stale; flagged separately).
+**Status:** decided, implemented in `nova/interfaces/hotkey.py` (`_extract_combo_event`, `_on_event`). Closes findings F9 and F10 in `docs/TASKS.md`, both now marked **FIXED** (`4da6851`, AST-guarded and tested by `ff1a87d`).
 
 ## Context
 
