@@ -92,6 +92,21 @@ class _FakeVad:
         return 0.0
 
 
+class _FakeGate:
+    """Stands in for nova.audio.duplex.DuplexGate. `open_` is a plain bool
+    the test flips directly, so these tests pin WakeWord's own use of the
+    gate (T1.7/F26) without depending on DuplexGate's real hangover
+    timing, which is covered separately in test_audio_duplex.py."""
+
+    def __init__(self, open_: bool = True):
+        self.open_ = open_
+        self.mic_open_calls = 0
+
+    def mic_open(self) -> bool:
+        self.mic_open_calls += 1
+        return self.open_
+
+
 class _FakeInput:
     def __init__(self, name, shape):
         self.name = name
@@ -443,13 +458,77 @@ async def test_a_single_mel_step_after_start_can_already_score_and_arm(wake_mode
 # ---------------------------------------------------------------------------
 
 
-def test_module_source_contains_no_file_write_calls():
+def _find_disk_write_calls(source: str) -> list[str]:
+    """F42: AST-based replacement for the original substring scan. Flags
+    two shapes: any reference to the builtin name `open` (as a Name node in
+    Load context -- catches both a direct `open(...)` call and an alias
+    like `o = open; o(...)`, which a substring scan cannot see at all) and
+    any `.write_text`/`.write_bytes` attribute access (catches a Path
+    write call regardless of what the receiver expression looks like).
+    Returns a list of "line N: description" strings, one per hit.
+
+    Deliberately does NOT match on the attribute name `mic_open` (or any
+    other identifier that merely *contains* "open") -- an ast.Attribute
+    node's `.attr` is compared for exact equality against "write_text"/
+    "write_bytes", and a builtin-`open` reference is an ast.Name node,
+    which is a completely different node shape from an ast.Attribute named
+    "mic_open". A substring scan over raw text cannot make that
+    distinction; an AST walk does so for free. This is what let
+    self._gate.mic_open() go back to a plain dotted call in wake.py (F42)
+    instead of routing through getattr() to dodge the old scan.
+    """
+    hits: list[str] = []
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Name) and node.id == "open" and isinstance(node.ctx, ast.Load):
+            hits.append(f"line {node.lineno}: reference to builtin open")
+        if isinstance(node, ast.Attribute) and node.attr in ("write_text", "write_bytes"):
+            hits.append(f"line {node.lineno}: .{node.attr}() call")
+    return hits
+
+
+def test_wake_module_source_contains_no_file_write_calls():
     """The ring buffer's whole justification (module docstring PRIVACY
     section) is that it is never persisted. Structural guard: this file
-    must contain no filesystem-write call at all."""
+    must contain no filesystem-write call at all -- AST-based (F42), not a
+    substring scan, specifically so a legitimately-named method like
+    self._gate.mic_open() doesn't collide with it by coincidence of
+    spelling (it did, under the old substring scan, and wake.py had to
+    route that call through getattr() to dodge it)."""
     source = Path(wake_mod.__file__).read_text(encoding="utf-8")
-    for banned in ("write_text(", "write_bytes(", "open("):
-        assert banned not in source, f"wake.py must never write to disk (found {banned!r})"
+    hits = _find_disk_write_calls(source)
+    assert not hits, f"wake.py must never write to disk: {hits}"
+
+
+def test_the_disk_write_scanner_actually_detects_a_planted_violation():
+    """Guards the guard, same shape as test_source_hygiene.py's own
+    zero-files check: a scanner that silently found nothing because it was
+    broken (wrong node type, typo'd attr name, etc.) would 'pass' having
+    checked nothing. Feeds the same scanning function a synthetic source
+    string with a real violation and confirms it's caught."""
+    planted = "def f():\n    open('secret_ring_buffer.raw', 'wb')\n"
+    hits = _find_disk_write_calls(planted)
+    assert hits, "the scanner did not detect a planted call to builtin open()"
+
+    planted_alias = "def f():\n    o = open\n    o('x', 'wb')\n"
+    hits_alias = _find_disk_write_calls(planted_alias)
+    assert hits_alias, "the scanner did not detect an aliased reference to builtin open"
+
+    planted_write_text = "def f(p):\n    p.write_text('data')\n"
+    hits_write_text = _find_disk_write_calls(planted_write_text)
+    assert hits_write_text, "the scanner did not detect a planted .write_text() call"
+
+
+def test_the_disk_write_scanner_does_not_false_positive_on_mic_open():
+    """The exact collision that forced wake.py's getattr() workaround under
+    the old substring scan: 'mic_open(' contains 'open(' as a substring.
+    An AST walk comparing exact node shapes (Attribute.attr == 'mic_open'
+    is not Name.id == 'open') doesn't have that problem -- this is what
+    makes reverting the getattr() workaround back to a plain dotted call
+    safe."""
+    source = "def f(self):\n    if self._gate.mic_open():\n        pass\n"
+    hits = _find_disk_write_calls(source)
+    assert hits == [], f"false positive on a mic_open() call: {hits}"
 
 
 def test_no_log_call_anywhere_in_the_module_references_an_audio_holding_variable():
@@ -945,6 +1024,85 @@ async def test_stop_resets_ring_backend_and_cancels_any_pending_timer(wake_model
     assert len(wake._ring) == 0
     assert armed_timer.cancelled is True
     assert wake._state.value == "idle"
+
+
+# ---------------------------------------------------------------------------
+# T1.7 (F26): DuplexGate integration -- process() must be genuinely inert
+# while muted, not just "doesn't publish a wake event." nova.audio.duplex
+# has its own dedicated test file (test_audio_duplex.py) for the gate's own
+# hangover/fail-closed logic; these tests pin WakeWord's *use* of a gate.
+# ---------------------------------------------------------------------------
+
+
+async def test_process_is_genuinely_inert_while_the_gate_reports_mic_closed(wake_model_dir, fake_ort):
+    """Ring untouched, embeddings untouched, classifier untouched -- as if
+    process() were never called at all. Checked by array/state equality,
+    not just "no wake event published", per the module's own process()
+    docstring: 'the frame is not pushed to the ring, not scored, not fed
+    to the VAD.'"""
+    _touch(wake_model_dir, "melspectrogram.onnx")
+    _touch(wake_model_dir, "embedding_model.onnx")
+    _touch(wake_model_dir, "clf.onnx")
+    fake_ort(classifier_run_fn=lambda feeds: [np.array(0.9, dtype=np.float32)])
+    fake_vad = _FakeVad()
+    closed_gate = _FakeGate(open_=False)
+    wake = _make_wake(
+        wake_model_dir, loop=asyncio.get_running_loop(), vad=fake_vad, gate=closed_gate,
+    )
+    wake.start()
+
+    ring_before = wake._ring.copy()
+    embeddings_before = list(wake._embeddings)
+    classifier_calls_before = len(wake._classifier_session.run_calls)
+
+    wake.process(_frame(MEL_STEP_SAMPLES, value=0.3))  # real, non-trivial audio content
+
+    assert closed_gate.mic_open_calls >= 1, "process() never even consulted the gate"
+    assert np.array_equal(wake._ring, ring_before), "the ring was mutated while the mic should be closed"
+    assert list(wake._embeddings) == embeddings_before
+    assert len(wake._classifier_session.run_calls) == classifier_calls_before
+    assert len(fake_vad.process_calls) == 0, "VAD was fed a frame while the mic should be closed"
+
+
+async def test_process_behaves_normally_when_the_gate_reports_mic_open(wake_model_dir, fake_ort):
+    """Positive control: a gate that exists and says 'open' must not
+    silently break ordinary detection -- distinct from both 'no gate at
+    all' and 'gate present but closed'."""
+    _touch(wake_model_dir, "melspectrogram.onnx")
+    _touch(wake_model_dir, "embedding_model.onnx")
+    _touch(wake_model_dir, "clf.onnx")
+    fake_ort(classifier_run_fn=lambda feeds: [np.array(0.9, dtype=np.float32)])
+    open_gate = _FakeGate(open_=True)
+    bus = _FakeBus()
+    wake = _make_wake(
+        wake_model_dir, bus=bus, loop=asyncio.get_running_loop(), threshold=0.55, gate=open_gate,
+    )
+    wake.start()
+
+    wake.process(_frame(MEL_STEP_SAMPLES))
+    await _wait_until(lambda: len(bus.published) == 1)
+
+    assert open_gate.mic_open_calls >= 1
+    assert bus.published[0][0] == TOPIC_WAKE_START
+
+
+def test_no_gate_at_all_is_a_distinct_case_from_a_gate_that_is_closed(wake_model_dir, fake_ort):
+    """__init__'s own docstring: omitting a gate entirely is a deliberate,
+    distinct case from a gate that exists but fails closed -- an offline
+    scoring harness with no live Player/speaking-state concept to gate
+    against still needs to run undisturbed. Default construction (no
+    gate= kwarg) must leave _gate as None, and process() must not attempt
+    to consult anything when it is."""
+    _touch(wake_model_dir, "melspectrogram.onnx")
+    _touch(wake_model_dir, "embedding_model.onnx")
+    _touch(wake_model_dir, "clf.onnx")
+    fake_ort()
+    wake = _make_wake(wake_model_dir, loop=asyncio.new_event_loop())
+
+    assert wake._gate is None
+
+    wake.start()
+    wake.process(_frame(MEL_STEP_SAMPLES))  # must not raise, must not touch a gate that doesn't exist
 
 
 # ---------------------------------------------------------------------------
