@@ -20,6 +20,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from nova.config import Config
 from nova.security.tiers import Tier
+from nova.security.untrusted import Untrusted
 
 if TYPE_CHECKING:
     # Deferred to break the registry.py <-> ladder.py import cycle: SkillCtx
@@ -28,6 +29,15 @@ if TYPE_CHECKING:
     # and `from __future__ import annotations` above makes every annotation
     # a string at runtime, so a real import here is never needed. Mirrors
     # the same move on ladder.py's side (nova-dev-sec, c1ea631).
+    #
+    # `Untrusted` is NOT deferred the same way, on purpose: layer 2 below
+    # needs a real runtime isinstance() check, and a TYPE_CHECKING-only
+    # import would make that check silently unreachable (NameError, or a
+    # string-annotation no-op) rather than enforced. nova.security.untrusted
+    # imports nothing from nova.skills or nova.security.ladder/registry (its
+    # only in-package import, AuditLog, is itself TYPE_CHECKING-only), so
+    # this import does not reintroduce the cycle the ladder.py move exists
+    # to avoid.
     from nova.security.ladder import Ladder
 
 Handler = Callable[..., Awaitable["Reply"]]
@@ -36,6 +46,37 @@ Handler = Callable[..., Awaitable["Reply"]]
 class SkillError(ValueError):
     """Raised for a skill registration conflict (duplicate name, missing
     examples, wrong tier type) — always at import time, never at call time."""
+
+
+def _find_untrusted(value: Any, path: str) -> str | None:
+    """Recursively search `value` for an `Untrusted` instance, returning a
+    human-readable path to the first one found ("opts.app", "items[2]") or
+    None if `value` is clean.
+
+    Recurses through dict/list/tuple/set/frozenset — the container shapes a
+    skill's `params` realistically take — rather than only checking the
+    top-level value. A shallow check would pass `params={"app": Untrusted(...)}`
+    straight through review while missing `params={"opts": {"app":
+    Untrusted(...)}}` or an `Untrusted` sitting inside a list. That is not a
+    hypothetical: the `Untrusted.asdict()` bypass (F12) was serious
+    specifically because it was recursive through nested dataclasses/lists,
+    so the same container shapes are worth checking here on the way in.
+    """
+    if isinstance(value, Untrusted):
+        return path
+    if isinstance(value, dict):
+        for key, item in value.items():
+            hit = _find_untrusted(item, f"{path}.{key}" if path else str(key))
+            if hit:
+                return hit
+        return None
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for index, item in enumerate(value):
+            hit = _find_untrusted(item, f"{path}[{index}]")
+            if hit:
+                return hit
+        return None
+    return None
 
 
 @dataclass(frozen=True)
@@ -71,6 +112,26 @@ class SkillSpec:
     handler: Handler
 
     async def invoke(self, ctx: SkillCtx, **params: Any) -> Reply:
+        # Layer 2 of docs/SECURITY_SPEC.md §1.3: the skill-parameter binder's
+        # own runtime guard, independent of whatever guard the caller (today,
+        # only the router) may or may not have already run. This must be the
+        # very first thing that happens — before ladder authorization and
+        # long before the handler — because both of those are exactly where
+        # an Untrusted value would become a tool-call parameter, which is the
+        # one thing the constitution forbids absolutely. Do not move this
+        # below `ctx.ladder.authorize()`: authorize() itself records `params`
+        # into the audit log (see Ladder._record), so even reaching the
+        # ladder with an Untrusted value still in `params` would be a leak.
+        for name, value in params.items():
+            hit = _find_untrusted(value, name)
+            if hit is not None:
+                raise TypeError(
+                    f"skill '{self.name}': parameter {hit!r} is Untrusted content — "
+                    "reveal() it explicitly inside a trusts_input=True handler, or do "
+                    "not bind it as a tool-call parameter at all "
+                    "(docs/SECURITY_SPEC.md section 1.3, layer 2)"
+                )
+
         # Every caller of a skill goes through here, so this is the one place
         # that enforces the permission ladder and produces an audit record
         # for every invocation, including READ ("free" means no confirmation
