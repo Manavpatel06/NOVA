@@ -27,6 +27,73 @@ class ConfigError(ValueError):
     """Raised for a missing, malformed, or unknown-key config/nova.yaml."""
 
 
+@dataclass(frozen=True)
+class Bounds:
+    """Declarative numeric range for one config field (T1.5, F7/F27).
+    Attached via `dataclasses.field(metadata={"bounds": Bounds(...)})` on a
+    `float`/`int` field; `_build_section` reads it and `_check_bounds`
+    enforces it after the existing type check.
+
+    `lo`/`hi` are None for "no bound on this side" — most numeric fields
+    only need one side constrained, not both. `lo_exclusive`/`hi_exclusive`
+    default to inclusive (`>=`/`<=`), matching the rest of this module's
+    comparison style; a field where the boundary value itself is degenerate
+    (see `WakeConfig.threshold` below) sets the relevant one to True.
+
+    `lo_note`/`hi_note` are an optional extra clause appended to the
+    `ConfigError` for that specific side — for a field whose bound is a
+    security or product decision rather than a pure sanity check, this is
+    where that gets said, at the point someone actually hits it, not only
+    in a comment above the field a casual editor may not read.
+    """
+
+    lo: float | None = None
+    hi: float | None = None
+    lo_exclusive: bool = False
+    hi_exclusive: bool = False
+    lo_note: str | None = None
+    hi_note: str | None = None
+
+
+def _check_bounds(section: str, key: str, value: float, bounds: Bounds) -> None:
+    """Reject `value` outside `bounds`, including NaN, by construction.
+
+    Written as a chained comparison (`effective_lo <= value <= effective_hi`,
+    inverted) rather than `value < lo or value > hi`: NaN fails *every*
+    ordinary comparison, so the chained form evaluates to False for a NaN
+    operand on either side (rejected, correctly) while the split-OR form
+    would pass a NaN straight through both branches (each individually
+    False) and accept it. `float` fields already reject NaN/Inf earlier in
+    `_check_value`'s own finite-number check, so this is defense in depth
+    for the float case specifically — but this function doesn't assume a
+    caller already filtered them, and int fields never even hit that
+    earlier check, so the shape has to be correct standing alone.
+    """
+    effective_lo = bounds.lo if bounds.lo is not None else float("-inf")
+    effective_hi = bounds.hi if bounds.hi is not None else float("inf")
+    lo_ok = (value > effective_lo) if bounds.lo_exclusive else (value >= effective_lo)
+    hi_ok = (value < effective_hi) if bounds.hi_exclusive else (value <= effective_hi)
+    if lo_ok and hi_ok:
+        return
+
+    if bounds.lo is not None and bounds.hi is not None:
+        lo_sym = ">" if bounds.lo_exclusive else ">="
+        hi_sym = "<" if bounds.hi_exclusive else "<="
+        range_desc = f"{lo_sym} {bounds.lo} and {hi_sym} {bounds.hi}"
+    elif bounds.lo is not None:
+        range_desc = f"{'>' if bounds.lo_exclusive else '>='} {bounds.lo}"
+    elif bounds.hi is not None:
+        range_desc = f"{'<' if bounds.hi_exclusive else '<='} {bounds.hi}"
+    else:
+        return  # a Bounds() with neither side set constrains nothing
+
+    msg = f"nova.yaml: '{section}.{key}' must be {range_desc}, got {value!r}"
+    note = (bounds.lo_note if not lo_ok else None) or (bounds.hi_note if not hi_ok else None)
+    if note:
+        msg += f" -- {note}"
+    raise ConfigError(msg)
+
+
 # ---------------------------------------------------------------------------
 # Sections — one per consuming module.
 # ---------------------------------------------------------------------------
@@ -54,7 +121,16 @@ class TtsConfig:
     """Consumed by nova.tts (Synthesizer)."""
 
     voice: str = "af_heart"  # Kokoro voice id
-    speed: float = 1.0
+    #: F7: bounded 0.25-4.0, matching the speaking-rate range public TTS APIs
+    #: (e.g. Google Cloud TTS's speakingRate) document as their own sane
+    #: multiplier range -- not independently tuned against Kokoro's own
+    #: intelligibility limits here, borrowed as a reasonable off-the-shelf
+    #: sanity bound rather than an unbounded float. 0 and negative are
+    #: physically meaningless for a rate multiplier, which is the actual
+    #: bug F7 reported (`.inf`/`.nan` also loaded successfully before this;
+    #: those are now caught earlier too, by _check_value's own finite-number
+    #: check for every float field, not just this one).
+    speed: float = field(default=1.0, metadata={"bounds": Bounds(lo=0.25, hi=4.0)})
 
 
 @dataclass(frozen=True)
@@ -97,7 +173,45 @@ class WakeConfig:
     #: filename resolved against models/wake/ (nova.WAKE_MODEL_DIR) -- swap
     #: in hey_nova.onnx later with zero code changes.
     model_path: str = "hey_jarvis_v0.1.onnx"
-    threshold: float = 0.55  # the one knob Manav will actually tune
+    #: The one knob Manav will actually tune -- and, until acoustic arming
+    #: is tier-capped (F28), the entire access-control surface for hands-
+    #: free arming (docs/THREAT_MODEL_ALWAYS_ON.md §4). Lowering it to catch
+    #: a missed detection also widens who/what can arm NOVA; that tradeoff
+    #: belongs in this comment, not just in the threat model, because this
+    #: is the file Manav actually edits.
+    #:
+    #: Bounds enforced (F27, T1.5): `> 0.0` and `<= 1.0`. `<= 1.0` because
+    #: the classifier's score is a probability-like value bounded in [0, 1]
+    #: (standard for this architecture's sigmoid output head; the one
+    #: measured true-positive, 0.997, is consistent with that but this
+    #: wasn't independently re-derived here) -- above 1.0 the gate can never
+    #: be satisfied, silently disabling hands-free wake entirely. `> 0.0`
+    #: because at or below zero the gate is trivially always-open: every
+    #: non-negative score satisfies `score >= threshold`, which is not a
+    #: "low but valid" setting, it's no gate at all.
+    #:
+    #: Deliberately NOT setting a real security floor above that. The
+    #: measured false-accept numbers (0.997 true-positive, 0.00005 on one
+    #: control phrase, zero detections across ~15s of noise) describe
+    #: behavior *at the current default*, not the shape of the false-accept
+    #: curve between 0.00005 and 0.55 -- there is no hard-negative/near-miss
+    #: data (phonetically similar phrases, other wake words, other voices)
+    #: anywhere in that huge unmeasured range. nova-security's own threat
+    #: model reached the same conclusion and declined to invent a number for
+    #: the same reason (docs/THREAT_MODEL_ALWAYS_ON.md §4: "not something to
+    #: invent in a threat model... a measurement task for whoever owns the
+    #: false-accept curve"). Picking any specific value in that gap would be
+    #: false precision dressed as derived-from-data. Tracked as F27, open,
+    #: pending a real false-accept measurement across hard negatives.
+    threshold: float = field(default=0.55, metadata={"bounds": Bounds(
+        lo=0.0, hi=1.0, lo_exclusive=True,
+        lo_note=(
+            "this is the access-control gate for hands-free arming, not a comfort "
+            "setting -- a value at or below zero cannot reject anything, so every "
+            "sound would satisfy it (no higher floor is enforced yet: see F27)"
+        ),
+        hi_note="the detector's score is bounded in [0, 1]; above that it can never trigger, silently disabling hands-free wake",
+    )})
     preroll_ms: int = 1000  # audio kept before detection so the first syllables of the command aren't lost
     arm_timeout_ms: int = 15000  # hard ceiling if VAD never detects end-of-speech
     vad_silence_ms: int = 800  # consecutive trailing silence (VAD) that ends an armed turn once speech has started
@@ -169,7 +283,7 @@ _SECTIONS: dict[str, type] = {
 # ---------------------------------------------------------------------------
 
 
-def _check_value(section: str, key: str, value: Any, expected: Any) -> Any:
+def _check_value(section: str, key: str, value: Any, expected: Any, *, bounds: "Bounds | None" = None) -> Any:
     origin = typing.get_origin(expected)
     if origin is list:
         (elem_type,) = typing.get_args(expected)
@@ -206,6 +320,8 @@ def _check_value(section: str, key: str, value: Any, expected: Any) -> Any:
             raise ConfigError(
                 f"nova.yaml: '{section}.{key}' must be a finite number, got {value!r}"
             )
+        if bounds is not None:
+            _check_bounds(section, key, result, bounds)
         return result
 
     if expected is int:
@@ -214,6 +330,8 @@ def _check_value(section: str, key: str, value: Any, expected: Any) -> Any:
                 f"nova.yaml: '{section}.{key}' must be an int, got "
                 f"{type(value).__name__} ({value!r})"
             )
+        if bounds is not None:
+            _check_bounds(section, key, value, bounds)
         return value
 
     if expected is str:
@@ -245,17 +363,18 @@ def _build_section(section_name: str, section_type: type, raw: Any) -> Any:
         )
 
     hints = typing.get_type_hints(section_type)
-    known = {f.name for f in dataclasses.fields(section_type)}
-    unknown = set(raw) - known
+    fields_by_name = {f.name: f for f in dataclasses.fields(section_type)}
+    unknown = set(raw) - set(fields_by_name)
     if unknown:
         raise ConfigError(
             f"nova.yaml: unknown key(s) in '{section_name}': {sorted(unknown)}. "
-            f"Expected one of: {sorted(known)}"
+            f"Expected one of: {sorted(fields_by_name)}"
         )
 
     kwargs: dict[str, Any] = {}
     for key, value in raw.items():
-        kwargs[key] = _check_value(section_name, key, value, hints[key])
+        bounds = fields_by_name[key].metadata.get("bounds")
+        kwargs[key] = _check_value(section_name, key, value, hints[key], bounds=bounds)
     return section_type(**kwargs)
 
 
