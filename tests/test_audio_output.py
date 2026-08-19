@@ -35,7 +35,14 @@ import numpy as np
 import pytest
 
 import nova.audio.output as output_mod
-from nova.audio.output import DISPLAY_ENDPOINT_MARKERS, OutputProfile, is_display_endpoint, probe_output_device
+from nova.audio.output import (
+    DISPLAY_ENDPOINT_MARKERS,
+    INDIRECTION_ENDPOINT_MARKERS,
+    OutputProfile,
+    is_display_endpoint,
+    is_indirection_endpoint,
+    probe_output_device,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -93,6 +100,53 @@ def test_display_endpoint_markers_are_all_31_characters_or_shorter():
     back toward F20."""
     for marker in DISPLAY_ENDPOINT_MARKERS:
         assert len(marker) <= 31, f"marker {marker!r} is too long to survive MME truncation"
+
+
+# ---------------------------------------------------------------------------
+# is_indirection_endpoint(): F36 -- endpoints that are not devices at all,
+# they resolve to "whatever Windows' default is" at stream-open time. The
+# real trigger: this machine's first non-display candidate is
+# "Microsoft Sound Mapper - Output" -- selecting it when the OS default is
+# a display endpoint (exactly the case F18 exists for) resolves straight
+# back to the display endpoint being avoided, a fix that undoes itself.
+# ---------------------------------------------------------------------------
+
+
+def test_f36_the_real_sound_mapper_name_is_detected():
+    assert is_indirection_endpoint("Microsoft Sound Mapper - Output") is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Primary Sound Driver",
+        "Primary Sound Capture Driver",
+        "microsoft sound mapper - input",  # lower-case, and the input-side sibling
+    ],
+)
+def test_is_indirection_endpoint_matches_known_indirection_layers(name):
+    assert is_indirection_endpoint(name) is True
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "Speakers (Realtek(R) Audio)",
+        "Headphones (Realtek(R) Audio)",
+        "USB Headset",
+        "",
+    ],
+)
+def test_is_indirection_endpoint_does_not_match_concrete_devices(name):
+    assert is_indirection_endpoint(name) is False
+
+
+def test_indirection_endpoint_markers_list_is_never_empty():
+    """Same shape as the display-marker length guard above: someone
+    'tidying' this list away (or a refactor that forgets to port it)
+    would silently restore F36 -- the exact case F18 exists to fix
+    resolving straight back to the endpoint it was meant to avoid."""
+    assert len(INDIRECTION_ENDPOINT_MARKERS) > 0
 
 
 # ---------------------------------------------------------------------------
@@ -232,6 +286,47 @@ def test_f20_regression_the_truncated_tv_name_is_rejected_in_favor_of_a_local_sp
 
     assert profile.index == 1
     assert profile.name == "Speakers (Realtek(R) Audio)"
+
+
+def test_f36_regression_an_indirection_layer_is_skipped_in_favor_of_a_concrete_local_device(probe):
+    """The real F36 shape on this machine: the OS default is a display
+    endpoint (the F18 case), and the FIRST non-display candidate
+    enumerated is "Microsoft Sound Mapper - Output" -- an indirection
+    layer that resolves to the OS default at stream-open time, not at
+    probe time. Selecting it here would silently resolve straight back to
+    the display endpoint being avoided. A concrete local device (ranked
+    second) must win instead."""
+    devices = [
+        _device("NVIDIA High Definition Audio (HDMI)", 0),  # default, display
+        _device("Microsoft Sound Mapper - Output", 0),       # indirection layer, enumerated first
+        _device("Speakers (Realtek(R) Audio)", 0),           # concrete local device
+    ]
+    probe.configure(devices, default_index=0)
+
+    profile = probe_output_device(force=True)
+
+    assert profile.index == 2
+    assert profile.name == "Speakers (Realtek(R) Audio)"
+
+
+def test_indirection_layer_with_no_concrete_local_device_falls_back_to_the_display_endpoint(probe, caplog):
+    """If Sound Mapper is the ONLY non-display candidate, it must not be
+    silently accepted as though it were a real local device -- the module
+    falls back the same way it does when no local endpoint exists at all
+    (test_display_default_with_no_local_endpoint_falls_back_to_the_display_
+    endpoint_itself above), rather than picking an indirection layer that
+    would just resolve back to the display endpoint."""
+    devices = [
+        _device("NVIDIA High Definition Audio (HDMI)", 0),
+        _device("Microsoft Sound Mapper - Output", 0),
+    ]
+    probe.configure(devices, default_index=0)
+
+    with caplog.at_level("WARNING"):
+        profile = probe_output_device(force=True)
+
+    assert profile.index == 0
+    assert profile.is_display_endpoint is True
 
 
 def test_prefers_a_local_candidate_on_the_same_hostapi_as_the_default(probe):
