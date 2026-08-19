@@ -39,6 +39,11 @@ Legend: TODO · CLAIMED · IN REVIEW · **DONE**
 | Fact | Value | How |
 |---|---|---|
 | STT device | cuda, float16, verified | probe re-run cold by lead |
+| Wake word, true positive | 0.99224 (claimed 0.997) | independently re-measured, real speakers -> real mic |
+| Wake word, control phrase | 0.00004 (claimed 0.00005) | independent phrase, not the original |
+| Wake word, ~15 s ambient noise | peak 0.01003 — **55x below** the 0.55 threshold | "zero detections" confirmed |
+| Tray RSS delta | +2.66 MB (claimed ~2.6) | independent script |
+| Confirm channel, 50 requests | threads flat at 1, RSS -1.0 MB | no per-request accumulation |
 | Mic selected | WDM-KS idx 22; RMS 0.048 at first probe, 0.0663 on re-probe | real capture (RMS varies with ambient noise; the device choice is the stable fact, not the number) |
 | Lying endpoint | WDM-KS idx 17, exactly 0.0, 3/3 trials | real capture |
 | Same mic via WASAPI/MME | ~1e-4, AGC-suppressed, non-zero but useless | real capture |
