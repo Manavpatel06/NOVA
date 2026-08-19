@@ -151,8 +151,13 @@ and onnxruntime here is CPU-only — so Kokoro is no part of the VRAM story.
 
 ### Still open
 
-- **VRAM creeps ~7-8 MiB per cycle** (367 → 439 MiB over 10 cycles) and has not
-  visibly plateaued. Needs a 30-50 cycle recheck before M1 exits.
+- **RESOLVED, and it is a real leak.** A 3-condition, 20-cycle experiment settled
+  it: VRAM grows ~8 MiB per **reload** (linear, +158 MiB over 20 cycles, identical
+  whether each cycle transcribes once or five times), while 40 transcriptions with
+  **no** reload grow it not at all. The leak tracks reloading, not inference. Host
+  RSS is flat in every condition. See finding F21 — this makes the governor's
+  unload/reload the thing that exhausts the GPU, which is the opposite of its
+  purpose.
 - **All VRAM numbers in this project are total-GPU deltas, not per-process.**
   `nvidia-smi --query-compute-apps` returns `[N/A]` on this driver, so no
   per-process figure is available at all. A transient 4556 MiB reading was
