@@ -11,11 +11,15 @@ replaced with a fake for every fetch() test.
 """
 from __future__ import annotations
 
+import socket
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
+
 import pytest
 
 import nova.security.egress as egress_mod
 from nova.config import ConfigError
-from nova.security.egress import Egress, EgressError, normalize_host
+from nova.security.egress import Egress, EgressError, EgressRedirectBlocked, normalize_host
 
 
 class _FakeAudit:
@@ -257,3 +261,173 @@ def test_release_for_process_propagates_audit_write_failure():
 
     with pytest.raises(RuntimeError):
         eg.release_for_process("purpose_ok", "some text to release")
+
+
+# ---------------------------------------------------------------------------
+# F35 — the F13 open-redirect fix, end to end, unmocked.
+#
+# Every fetch() test above replaces urllib.request.urlopen with a fake, so
+# none of them ever runs install_opener()/_NoRedirectHandler.redirect_request
+# at all -- a refactor that drops the install_opener() call, or stops
+# fetch() using the module-installed opener, would leave every test above
+# green while reopening a live security bypass. This section is the only
+# thing in the suite that would catch that: two real
+# http.server.HTTPServer instances, a real urlopen, a real install_opener()
+# call, nothing mocked except DNS resolution.
+#
+# normalize_host() correctly rejects "localhost" (no dot -- see _HOST_RE)
+# and any IP literal, so a real server needs a real DOTTED hostname to
+# fetch() against. loopback_dns below fakes socket.getaddrinfo() so any
+# hostname resolves to 127.0.0.1 -- that's the ONLY thing faked; the HTTP
+# client, the redirect, and Egress's own opener are all completely real.
+# ".test" is the IANA/RFC 2606-reserved TLD for exactly this purpose.
+#
+# Framing, precisely: the fix blocks ALL redirects, host-agnostic -- it
+# never re-validates a redirect target at all, allowlisted or not. So the
+# two tests below assert the general claim ("a 302 is refused and
+# audited"), not the narrower one ("a redirect to a non-allowlisted host is
+# refused") -- the second test specifically proves the fix doesn't
+# secretly get narrower than that by pointing the redirect at a host that
+# IS on the allowlist and confirming it's refused too.
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def loopback_dns(monkeypatch):
+    """Any hostname resolves to 127.0.0.1. The only fake in this section --
+    everything downstream (TCP connect, HTTP, the redirect, Egress's real
+    installed opener) is completely real."""
+    real_getaddrinfo = socket.getaddrinfo
+
+    def fake_getaddrinfo(host, port, *args, **kwargs):
+        return real_getaddrinfo("127.0.0.1", port, *args, **kwargs)
+
+    monkeypatch.setattr(socket, "getaddrinfo", fake_getaddrinfo)
+
+
+@pytest.fixture
+def http_server():
+    """Starts real http.server.HTTPServer instances on their own daemon
+    threads (127.0.0.1, OS-assigned port) and shuts them all down cleanly
+    at teardown -- this is the fixture, not per-test boilerplate, because
+    every test below needs at least one and some need two."""
+    started: list[HTTPServer] = []
+
+    def _start(server: HTTPServer) -> HTTPServer:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        started.append(server)
+        return server
+
+    yield _start
+
+    for server in started:
+        server.shutdown()
+        server.server_close()
+
+
+@pytest.fixture
+def restore_urllib_opener():
+    """Egress.__init__ calls urllib.request.install_opener() -- a real,
+    process-wide global. Save and restore it so a real-network test here
+    can't leak a redirect-blocking opener into whatever test runs next in
+    the same process."""
+    original = egress_mod.urllib.request._opener
+    yield
+    egress_mod.urllib.request._opener = original
+
+
+class _RedirectToOtherHostHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.send_response(302)
+        self.send_header("Location", self.server.redirect_target)  # type: ignore[attr-defined]
+        self.end_headers()
+
+    def log_message(self, format, *args):  # noqa: A002 -- BaseHTTPRequestHandler's own name
+        pass  # silence default request logging to stderr
+
+
+class _RedirectToOtherHostServer(HTTPServer):
+    def __init__(self, addr, redirect_target: str):
+        self.redirect_target = redirect_target
+        super().__init__(addr, _RedirectToOtherHostHandler)
+
+
+class _CountingTargetHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        self.server.request_count += 1  # type: ignore[attr-defined]
+        self.send_response(200)
+        self.end_headers()
+        self.wfile.write(b"this must never be reached")
+
+    def log_message(self, format, *args):  # noqa: A002
+        pass
+
+
+class _CountingTargetServer(HTTPServer):
+    def __init__(self, addr):
+        self.request_count = 0
+        super().__init__(addr, _CountingTargetHandler)
+
+
+class _SelfRedirectHandler(BaseHTTPRequestHandler):
+    """Redirects "/" to "/target" on the SAME host:port -- lands on an
+    ALLOWLISTED host by construction, for the host-agnostic test below."""
+
+    def do_GET(self):
+        if self.path == "/":
+            self.send_response(302)
+            self.send_header("Location", f"http://allowlisted.test:{self.server.server_port}/target")
+            self.end_headers()
+        else:
+            self.server.request_count += 1  # type: ignore[attr-defined]
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"this must never be reached")
+
+    def log_message(self, format, *args):  # noqa: A002
+        pass
+
+
+class _SelfRedirectServer(HTTPServer):
+    def __init__(self, addr):
+        self.request_count = 0
+        super().__init__(addr, _SelfRedirectHandler)
+
+
+def test_fetch_blocks_a_real_redirect_to_a_non_allowlisted_host_end_to_end(
+    audit, http_server, loopback_dns, restore_urllib_opener
+):
+    target = http_server(_CountingTargetServer(("127.0.0.1", 0)))
+    origin = http_server(
+        _RedirectToOtherHostServer(("127.0.0.1", 0), f"http://evil.test:{target.server_port}/exfil")
+    )
+
+    eg = Egress(["allowlisted.test"], audit=audit)  # real install_opener() runs here
+
+    with pytest.raises(EgressRedirectBlocked):
+        eg.fetch(f"http://allowlisted.test:{origin.server_port}/")
+
+    assert target.request_count == 0, "the redirect target was actually reached -- the block failed"
+    assert audit.records[0] == {"kind": "egress.fetch", "host": "allowlisted.test", "allowed": True}
+    assert audit.records[1]["kind"] == "egress.fetch_redirect_blocked"
+    assert audit.records[1]["redirect_target_host"] == "evil.test"
+    assert audit.records[1]["status"] == 302
+
+
+def test_fetch_blocks_a_real_redirect_even_when_it_lands_on_an_allowlisted_host(
+    audit, http_server, loopback_dns, restore_urllib_opener
+):
+    """The sharper, more precise claim: the fix is host-agnostic. A version
+    that only re-validated the redirect target against the allowlist
+    (rather than refusing every redirect outright) would pass the test
+    above but incorrectly follow this one."""
+    server = http_server(_SelfRedirectServer(("127.0.0.1", 0)))
+
+    eg = Egress(["allowlisted.test"], audit=audit)
+
+    with pytest.raises(EgressRedirectBlocked):
+        eg.fetch(f"http://allowlisted.test:{server.server_port}/")
+
+    assert server.request_count == 0, "the redirect landed on an allowlisted host and was followed anyway"
+    assert audit.records[-1]["kind"] == "egress.fetch_redirect_blocked"
+    assert audit.records[-1]["redirect_target_host"] == "allowlisted.test"
