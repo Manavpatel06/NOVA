@@ -80,7 +80,13 @@ class _FakePlayer:
 
 @pytest.fixture
 def app(tmp_path, monkeypatch):
-    monkeypatch.setattr(app_mod, "AuditLog", lambda: AuditLog(path=tmp_path / "audit.log"))
+    # nova/app.py now threads config.security.redact_terms into AuditLog
+    # (F22 — see nova/app.py's own comment on why omitting it is dangerous),
+    # so this stand-in must accept and forward it too, not just `path`.
+    monkeypatch.setattr(
+        app_mod, "AuditLog",
+        lambda **kw: AuditLog(path=tmp_path / "audit.log", redact_terms=kw.get("redact_terms", ())),
+    )
     application = app_mod.NovaApp(config=Config())
     application.transcriber = _FakeTranscriber()
     application.synth = _FakeSynth()
