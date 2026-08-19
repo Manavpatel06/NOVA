@@ -372,22 +372,8 @@ class WakeWord:
         if not self.backend_available:
             return
         try:
-            # Called via getattr, not a direct dotted call: this module's
-            # own test suite (test_module_source_contains_no_file_write_
-            # calls) scans wake.py's raw source text for the 5-character
-            # sequence this gate method's name happens to end with, plus an
-            # open-paren, as a guard against a stray filesystem write
-            # (module PRIVACY note: the ring buffer must never be
-            # persisted). A literal dotted call to that method collides
-            # with that scan purely by coincidence of naming -- this line
-            # touches no file. Do not "simplify" this back to a direct
-            # call, and do not spell the method name immediately followed
-            # by "(" anywhere else in this file, comments included.
-            if self._gate is not None:
-                gate_attr_name = "mic_" + "open"
-                mic_is_ready = getattr(self._gate, gate_attr_name)
-                if not mic_is_ready():
-                    return
+            if self._gate is not None and not self._gate.mic_open():
+                return
 
             frame = np.asarray(frame, dtype=np.float32).reshape(-1)
             if frame.size == 0:
