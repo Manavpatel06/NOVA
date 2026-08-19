@@ -353,6 +353,34 @@ def test_invoke_on_quit_routes_through_post_callback_when_a_loop_is_present(monk
     assert calls[0][1] is tray._on_quit
 
 
+def test_invoke_on_quit_actually_delivers_through_the_real_post_callback():
+    """The test above only proves _invoke_on_quit *delegates* to
+    post_callback with the right arguments -- it replaces post_callback
+    entirely, so it says nothing about whether a real call would actually
+    reach on_quit. This one uses the real nova.threadsafe.post_callback and
+    a real loop running on its own background thread (the actual shape:
+    _invoke_on_quit runs on the tray's Win32 message-loop thread, calling
+    into the asyncio loop owned by a different thread), and proves delivery
+    by having on_quit itself signal a threading.Event -- not by the mere
+    absence of an exception (see this file's module docstring / the header
+    note in test_security_confirm.py on why that distinction matters)."""
+    loop = asyncio.new_event_loop()
+    thread = threading.Thread(target=loop.run_forever, daemon=True)
+    thread.start()
+    try:
+        delivered = threading.Event()
+        tray = Tray(bus=None, on_quit=delivered.set)
+        tray._loop = loop
+
+        tray._invoke_on_quit()
+
+        assert delivered.wait(timeout=2), "on_quit was never actually delivered through the real post_callback"
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        thread.join(timeout=2)
+        loop.close()
+
+
 def test_invoke_on_quit_calls_directly_when_no_loop_is_known(monkeypatch):
     monkeypatch.setattr(
         tray_mod, "post_callback",

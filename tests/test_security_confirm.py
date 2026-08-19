@@ -6,6 +6,39 @@ near the loop" — this file is that use, plus direct coverage of the
 prompt-redaction promise (docs/THREAT_MODEL.md §2.2.6: consent must be to
 the actual redacted disclosure, not a generic toggle) and
 ConsoleConfirmChannel's real timeout behavior.
+
+## The swallowed-exception trap (read this before adding a test here)
+
+An assertion that depends on an exception crossing a scheduled callback may
+never see it. `post_callback`/`post_coroutine` (nova/threadsafe.py) hand a
+result from a background thread to the asyncio loop via
+`call_soon_threadsafe`/`run_coroutine_threadsafe`. If the scheduled callback
+itself raises once it actually runs, that exception is caught and logged by
+asyncio's own default handler — it does NOT propagate back to whatever
+`await`ed the surrounding coroutine. A test that spies on such a callback by
+recording "it was called" (or even "it was called with the right value") and
+stops there can pass regardless of whether the callback's own body raised.
+
+This bit an early version of
+test_dialog_channel_end_to_end_a_late_click_after_timeout_is_silently_dropped
+below: the spy appended to a list before calling through to the real
+_settle_result, so removing the done-guard entirely still left the test
+green — the resulting InvalidStateError was silently absorbed by asyncio,
+never seen by `pytest.raises`/an assertion. Caught only by this file's own
+rule (below), not by the test passing.
+
+**The rule, applied to every test in this file:** assert *delivery*, not
+merely the *absence* of a raised exception. Prefer an independent completion
+signal (a `threading.Event` set from inside the real callback, a real
+`asyncio.Future`/`concurrent.futures.Future` awaited or `.result(timeout=...)`ed,
+or — if spying on a shared helper like `_settle_result` — explicitly
+try/except around the passthrough call and assert on the captured exception,
+not just that the spy was reached). And where a test's timeout value isn't
+the thing under test, pin it short and explicit: three ConsoleConfirmChannel
+tests here used to rely on the 60s *default* `timeout_s`, which meant a real
+regression in delivery would still fail the test — just 60 seconds later
+instead of near-instantly, which is nearly as bad as not failing at all for
+anyone trying to notice quickly.
 """
 from __future__ import annotations
 
@@ -174,8 +207,15 @@ def test_prompt_applies_configured_redact_terms():
 
 @pytest.mark.parametrize("answer", ["y\n", "Y\n", "yes\n", "YES\n", " y \n"])
 async def test_console_channel_approves_on_recognized_affirmative_input(answer):
+    # timeout_s pinned short (not the 60s default): this test isn't
+    # exercising the timeout path, it's exercising real delivery through
+    # the reader thread -> post_callback -> asyncio.Future handoff. A
+    # regression that silently breaks that delivery must fail this test in
+    # under a second, not after a genuine 60-second wait -- see this file's
+    # header note on the swallowed-exception trap for why "eventually
+    # fails" isn't good enough on its own.
     out = io.StringIO()
-    channel = ConsoleConfirmChannel(stream_in=io.StringIO(answer), stream_out=out)
+    channel = ConsoleConfirmChannel(timeout_s=5.0, stream_in=io.StringIO(answer), stream_out=out)
     approved = await channel.request(CONFIRM_SKILL, {"app": "notepad"})
     assert approved is True
     assert "approved" in out.getvalue()
@@ -184,7 +224,7 @@ async def test_console_channel_approves_on_recognized_affirmative_input(answer):
 @pytest.mark.parametrize("answer", ["n\n", "no\n", "\n", "maybe\n", "yesno\n"])
 async def test_console_channel_declines_on_anything_else(answer):
     out = io.StringIO()
-    channel = ConsoleConfirmChannel(stream_in=io.StringIO(answer), stream_out=out)
+    channel = ConsoleConfirmChannel(timeout_s=5.0, stream_in=io.StringIO(answer), stream_out=out)
     approved = await channel.request(CONFIRM_SKILL, {})
     assert approved is False
     assert "declined" in out.getvalue()
@@ -193,7 +233,7 @@ async def test_console_channel_declines_on_anything_else(answer):
 def test_console_channel_shows_the_redacted_prompt_before_reading():
     out = io.StringIO()
     channel = ConsoleConfirmChannel(
-        stream_in=io.StringIO("n\n"), stream_out=out,
+        timeout_s=5.0, stream_in=io.StringIO("n\n"), stream_out=out,
     )
     import asyncio
 
