@@ -48,8 +48,10 @@ from nova.brain.router import Router
 from nova.config import Config, load_config
 from nova.governor import TOPIC_TURN_END, TOPIC_TURN_START, Governor
 from nova.interfaces.hotkey import TOPIC_PTT_END, TOPIC_PTT_START, Hotkey, PTTEvent
+from nova.interfaces.tray import TOPIC_SPEAK_END, TOPIC_SPEAK_START, Tray
 from nova.log import get_logger
 from nova.security.audit import AuditLog
+from nova.security.confirm import DialogConfirmChannel
 from nova.security.ladder import Ladder
 from nova.security.untrusted import bind_audit
 from nova.skills.registry import Reply, SkillCtx
@@ -90,7 +92,18 @@ class NovaApp:
         # record. Found by nova-security (F22).
         self.audit = AuditLog(redact_terms=self.config.security.redact_terms)
         bind_audit(self.audit)
-        self.ladder = Ladder(self.audit)
+        # T1.4: DialogConfirmChannel is what makes CONFIRM-tier skills
+        # actually approvable -- before this, Ladder.authorize() failed
+        # closed for every CONFIRM skill by design (no channel registered),
+        # which was correct for M0 (zero CONFIRM skills) but would have
+        # silently stayed that way forever if nothing ever attached a real
+        # channel. M0 still ships zero CONFIRM skills, so this wiring is
+        # exercised today only by the ladder's own dormant-but-ready branch,
+        # not by any live skill yet.
+        self.ladder = Ladder(
+            self.audit,
+            confirm_channel=DialogConfirmChannel(redact_terms=self.config.security.redact_terms),
+        )
 
         # --- brain: router reads the live skill registry, populated by the
         # `import nova.skills` above.
@@ -106,6 +119,14 @@ class NovaApp:
         self.synth = Synthesizer()
         self.player = Player()
         self.hotkey = Hotkey(self.bus)
+
+        # --- tray icon (T1.4): subscribes itself to ptt/turn/speak topics
+        # in its own __init__ (see nova.interfaces.tray's module docstring
+        # for why TOPIC_SPEAK_* are owned there rather than here). Quit from
+        # the tray menu requests a graceful shutdown via self._stop_event,
+        # the same seam a future signal handler / CLI Ctrl+C could use.
+        self._stop_event = asyncio.Event()
+        self.tray = Tray(self.bus, on_quit=self._request_stop)
 
         # --- governor (T1.2): drives existing load()/unload() lifecycle,
         # never calls load() itself. typical_rss_mb hints are measured, not
@@ -140,15 +161,34 @@ class NovaApp:
             )
         else:
             _log.info("NovaApp ready: hold %r to talk", self.hotkey.combo)
+        # Degrades loudly on its own (see nova.interfaces.tray) -- a missing
+        # tray icon must never mean a missing assistant, so its failure is
+        # not checked here the way the hotkey's is; the hotkey is NOVA's
+        # only input path, the tray is not.
+        self.tray.start(loop=asyncio.get_running_loop())
         await self.governor.start()
 
     async def stop(self) -> None:
-        """Tear down cleanly: stop the hotkey, the governor, release loaded
-        models."""
+        """Tear down cleanly: stop the hotkey, the tray, the governor,
+        release loaded models."""
         self.hotkey.stop()
+        self.tray.stop()
         await self.governor.stop()
         self.transcriber.unload()
         self.synth.unload()
+
+    def _request_stop(self) -> None:
+        """Wired as the tray's on_quit callback. Tray already marshals this
+        onto the asyncio loop via call_soon_threadsafe before calling it
+        (see Tray._invoke_on_quit), so by the time this runs it is safe to
+        touch asyncio state directly."""
+        _log.info("Stop requested (tray Quit)")
+        self._stop_event.set()
+
+    async def wait_until_stopped(self) -> None:
+        """Blocks until something (currently: the tray's Quit menu item)
+        requests a graceful shutdown."""
+        await self._stop_event.wait()
 
     # -- bus handlers ---------------------------------------------------
 
@@ -292,19 +332,30 @@ class NovaApp:
     async def _speak(self, text: str) -> None:
         """Synthesize and play `text`. NOVA must never go silently mute:
         Synthesizer already falls back to Windows SAPI if Kokoro fails, so
-        the only way this logs an error is if *both* engines failed."""
+        the only way this logs an error is if *both* engines failed.
+
+        Brackets its whole body with TOPIC_SPEAK_START/TOPIC_SPEAK_END
+        (try/finally, so a synth or playback failure still ends the
+        "speaking" state) -- the one place NOVA's tray icon (T1.4) can
+        observe "speaking" distinctly from "thinking", mirroring how
+        run_turn() already brackets itself with TOPIC_TURN_START/END for the
+        governor."""
+        await self.bus.publish(TOPIC_SPEAK_START, None)
         try:
-            pcm, samplerate = await asyncio.to_thread(self.synth.say, text)
-        except Exception as exc:
-            _log.error(
-                "Synthesizer.say(%r) failed even with its SAPI fallback (%s); "
-                "NOVA cannot speak this turn", text, exc,
-            )
-            return
-        try:
-            await self.player.play(pcm, samplerate)
-        except Exception as exc:
-            _log.error("Player.play() failed (%s); the reply was %r", exc, text)
+            try:
+                pcm, samplerate = await asyncio.to_thread(self.synth.say, text)
+            except Exception as exc:
+                _log.error(
+                    "Synthesizer.say(%r) failed even with its SAPI fallback (%s); "
+                    "NOVA cannot speak this turn", text, exc,
+                )
+                return
+            try:
+                await self.player.play(pcm, samplerate)
+            except Exception as exc:
+                _log.error("Player.play() failed (%s); the reply was %r", exc, text)
+        finally:
+            await self.bus.publish(TOPIC_SPEAK_END, None)
 
     @staticmethod
     def _log_timings(source: str, timings: dict[str, float], t_start: float) -> None:
@@ -316,13 +367,28 @@ async def _run() -> None:
     app = NovaApp()
     await app.start()
     try:
-        await asyncio.Event().wait()  # run until interrupted
+        await app.wait_until_stopped()  # runs until interrupted or tray Quit
     finally:
         await app.stop()
 
 
 def run() -> None:
-    """Entry point for `python -m nova`."""
+    """Entry point for `python -m nova`.
+
+    Claims the single-instance lock (T1.4) before anything else -- in
+    particular, before NovaApp() is ever constructed, since construction is
+    what wires the hotkey/capture path that would contend for the
+    microphone. Refuses to start a second instance rather than logging a
+    warning and continuing: two NOVAs is exactly the bug
+    nova.interfaces.tray.acquire_single_instance_lock exists to make
+    impossible, not just unlikely.
+    """
+    from nova.interfaces.tray import acquire_single_instance_lock
+
+    if not acquire_single_instance_lock():
+        _log.error("NOVA is already running (or the single-instance check failed) -- exiting.")
+        return
+
     try:
         asyncio.run(_run())
     except KeyboardInterrupt:

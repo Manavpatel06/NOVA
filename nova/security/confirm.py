@@ -11,18 +11,31 @@ fails closed with no channel registered (`nova/security/ladder.py`); this
 module is what M1 plugs into that seam so CONFIRM becomes *usable*, not
 just safely inert.
 
-Two implementations:
+Three implementations:
 
 - `ScriptedConfirmChannel` — deterministic, no terminal, no clock. What
   nova-tester drives to prove the ladder's CONFIRM branches (approve,
   decline, timeout, broken-channel) without a human anywhere near the loop.
 - `ConsoleConfirmChannel` — the honest starting point that actually runs on
   this machine today: prints what's being asked, reads a real line from
-  stdin with a real wall-clock timeout. A tray/dialog channel arrives with
-  M1's tray work and drops in beside this one without the ladder changing
-  at all — both are just objects with an async `request(skill, params)`
-  method (`nova.security.ladder.ConfirmChannel`, a `Protocol` — no
-  inheritance required, structural typing only).
+  stdin with a real wall-clock timeout.
+- `DialogConfirmChannel` (T1.4) — a real Win32 message box, for when NOVA is
+  running headless-from-a-terminal's-perspective (no console attached, or a
+  human who isn't watching a terminal at all but is at the machine). Drops
+  in beside the other two without the ladder changing at all — all three are
+  just objects with an async `request(skill, params)` method
+  (`nova.security.ladder.ConfirmChannel`, a `Protocol` — no inheritance
+  required, structural typing only).
+
+  This is the piece the retired build got most wrong: its CONFIRM tier was
+  quietly unapprovable for most of the project's life because nobody ever
+  verified a dialog implementation against a human actually clicking (the
+  dev box had no display). `nova/interfaces/tray.py`'s module docstring
+  makes the same point about the tray icon; the fix here is the same shape —
+  every synthetic check this module's own report can produce (message-box
+  creation/dismissal, the daemon-thread handoff, the timeout path) *and* a
+  `scripts/probe_confirm_dialog.py` a human runs and clicks, because no
+  agent can verify a human clicked anything.
 
 **What the prompt shows** (docs/THREAT_MODEL.md §2.2.6, nova-security's
 recommendation, adopted by the lead): consent has to be to a specific
@@ -214,7 +227,101 @@ class ConsoleConfirmChannel:
         return approved
 
 
-def _settle_result(fut: "asyncio.Future[str]", value: str) -> None:
+# ---------------------------------------------------------------------------
+# DialogConfirmChannel — real Win32 message box, for when the human isn't
+# watching a terminal.
+# ---------------------------------------------------------------------------
+
+
+class DialogConfirmChannel:
+    """A real `MessageBox` (Yes/No), shown via `win32api.MessageBox`. Same
+    contract as `ConsoleConfirmChannel`: shows the shared
+    `format_confirm_prompt()` text, raises `ConfirmTimeout` rather than
+    returning `False` on an unclear outcome, and never lets a stuck dialog
+    block process exit.
+
+    **Approval is explicit-Yes-only, exactly like the console channel's
+    "anything but y/yes is a decline" rule.** `MB_YESNO` on Windows has no
+    Cancel button, and — verified directly, not assumed — a plain `MB_YESNO`
+    box does not respond to a programmatically-posted `WM_CLOSE` at all (no
+    Cancel button means no close affordance; confirmed by posting WM_CLOSE
+    at a live box and observing `MessageBox()` never returns). So there is
+    no reliable third outcome to distinguish "explicit No" from "closed some
+    other way" — anything that isn't `IDYES` is treated as a decline, same
+    as the console channel's stray-keypress rule. This is a deliberately
+    narrower UI than a Yes/No/Cancel box on purpose: fewer ways to produce
+    an ambiguous answer, not more.
+
+    **The "must not block process exit" hazard the lead specifically asked
+    to learn from**: `MessageBox()` is a blocking Win32 call. Exactly like
+    `ConsoleConfirmChannel`'s blocking `readline()`, it runs on a dedicated
+    `daemon=True` thread with a manual `asyncio.Future` handoff — never
+    `loop.run_in_executor(None, ...)`'s default `ThreadPoolExecutor`, whose
+    `atexit` hook joins every worker before the interpreter exits (that is
+    the exact hang `ConsoleConfirmChannel`'s docstring documents; verified
+    the daemon-thread fix holds for a stuck `MessageBox()` too, not just a
+    stuck `readline()` — a thread abandoned mid-`MessageBox()` does not
+    prevent the process from exiting, checked directly on this machine).
+
+    **Known limitation, documented rather than hidden, the mirror image of
+    `ConsoleConfirmChannel`'s "stray input is silently dropped"**: on
+    timeout, the dialog thread is abandoned with the box still on-screen —
+    there is no reliable way to force-dismiss a `MB_YESNO` box from another
+    thread (see the WM_CLOSE finding above). A human clicking it *after* the
+    ladder has already denied the request on timeout does nothing: the
+    `asyncio.Future` this channel awaited is already done, so
+    `_settle_result`/`_settle_exception` (shared with `ConsoleConfirmChannel`)
+    silently drop the late answer rather than retroactively approving
+    something the ladder already audited as denied.
+    """
+
+    def __init__(self, *, timeout_s: float = 60.0, redact_terms: tuple[str, ...] = ()) -> None:
+        self._timeout_s = timeout_s
+        self._redact_terms = redact_terms
+
+    async def request(self, skill: "SkillSpec", params: dict[str, Any]) -> bool:
+        prompt = format_confirm_prompt(skill, params, redact_terms=self._redact_terms)
+        title = f"NOVA — approve {skill.name}?"
+
+        loop = asyncio.get_running_loop()
+        result: asyncio.Future[int] = loop.create_future()
+
+        def _show_dialog() -> None:
+            try:
+                import win32api
+                import win32con
+
+                flags = win32con.MB_YESNO | win32con.MB_ICONQUESTION | win32con.MB_SYSTEMMODAL | win32con.MB_TOPMOST
+                answer = win32api.MessageBox(0, prompt, title, flags)
+            except Exception as exc:  # noqa: BLE001 — hand any failure (no pywin32, no desktop session) back to the awaiting side
+                loop.call_soon_threadsafe(_settle_exception, result, exc)
+                return
+            loop.call_soon_threadsafe(_settle_result, result, answer)
+
+        threading.Thread(target=_show_dialog, daemon=True, name="nova-confirm-dialog").start()
+
+        try:
+            answer = await asyncio.wait_for(result, timeout=self._timeout_s)
+        except asyncio.TimeoutError as exc:
+            raise ConfirmTimeout(
+                f"DialogConfirmChannel: no answer for skill '{skill.name}' within {self._timeout_s:.0f}s "
+                f"(the dialog box may still be on-screen — see class docstring)"
+            ) from exc
+
+        # A missing/failing pywin32 import would already have surfaced above,
+        # via _settle_exception -- reaching here means _show_dialog's own
+        # `import win32con` already succeeded once on the dialog thread.
+        import win32con
+
+        return answer == win32con.IDYES
+
+
+#: Shared by ConsoleConfirmChannel (Future[str], one readline) and
+#: DialogConfirmChannel (Future[int], one MessageBox return code) -- both
+#: are "one blocking call on a daemon thread, handed off to the event loop
+#: exactly once" with the same done-guard, so one pair of helpers covers
+#: both rather than each channel writing its own.
+def _settle_result(fut: "asyncio.Future[Any]", value: Any) -> None:
     # The event-loop thread's side of the handoff. `wait_for`'s timeout may
     # already have cancelled `fut` by the time the reader thread finishes —
     # guard against "InvalidStateError: invalid state" on a done future.
@@ -222,6 +329,6 @@ def _settle_result(fut: "asyncio.Future[str]", value: str) -> None:
         fut.set_result(value)
 
 
-def _settle_exception(fut: "asyncio.Future[str]", exc: BaseException) -> None:
+def _settle_exception(fut: "asyncio.Future[Any]", exc: BaseException) -> None:
     if not fut.done():
         fut.set_exception(exc)
