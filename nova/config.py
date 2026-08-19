@@ -247,6 +247,23 @@ class WakeConfig:
 
 
 @dataclass(frozen=True)
+class DuplexConfig:
+    """Consumed by nova.audio.duplex.DuplexGate (T1.7, finding F26)."""
+
+    #: How long after NOVA stops speaking the wake-word detector stays
+    #: muted, on top of the mute-while-speaking itself. Inherited from the
+    #: retired build's 180ms (speaker decay + WASAPI output buffering
+    #: reasoning), rounded up slightly for margin -- NOT independently
+    #: measured on this machine's speakers/room. An untuned starting point,
+    #: labelled as one; see nova/audio/duplex.py's module docstring.
+    #: Bounded `>= 0` only (a negative hangover is nonsensical, not a
+    #: security concern like WakeConfig.threshold's floor -- no upper bound
+    #: needed for the same reason none of the other timing knobs in this
+    #: file have one).
+    hangover_ms: int = field(default=200, metadata={"bounds": Bounds(lo=0)})
+
+
+@dataclass(frozen=True)
 class BrainConfig:
     """Consumed by nova.brain.router.Router. See its module docstring for how
     these two numbers were chosen (calibrated against a labelled phrase set,
@@ -291,6 +308,7 @@ class Config:
     security: SecurityConfig = field(default_factory=SecurityConfig)
     hotkey: HotkeyConfig = field(default_factory=HotkeyConfig)
     wake: WakeConfig = field(default_factory=WakeConfig)
+    duplex: DuplexConfig = field(default_factory=DuplexConfig)
     brain: BrainConfig = field(default_factory=BrainConfig)
     governor: GovernorConfig = field(default_factory=GovernorConfig)
 
@@ -302,6 +320,7 @@ _SECTIONS: dict[str, type] = {
     "security": SecurityConfig,
     "hotkey": HotkeyConfig,
     "wake": WakeConfig,
+    "duplex": DuplexConfig,
     "brain": BrainConfig,
     "governor": GovernorConfig,
 }

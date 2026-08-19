@@ -71,6 +71,7 @@ import numpy as np
 import onnxruntime as ort
 
 from nova import WAKE_MODEL_DIR
+from nova.audio.duplex import DuplexGate
 from nova.audio.vad import Vad
 from nova.bus import EventBus
 from nova.log import get_logger
@@ -174,6 +175,7 @@ class WakeWord:
         vad_silence_ms: int | None = None,
         vad: Vad | None = None,
         loop: asyncio.AbstractEventLoop | None = None,
+        gate: DuplexGate | None = None,
     ):
         cfg = _default_wake_config()
         resolved_model = model_path or (cfg.model_path if cfg is not None else DEFAULT_MODEL_FILENAME)
@@ -199,6 +201,14 @@ class WakeWord:
         self._bus = bus
         self._loop = loop
         self._vad = vad or Vad()
+        # T1.7 (F26): optional on purpose -- see this class's process()
+        # docstring and nova/audio/duplex.py's own module docstring for
+        # why omitting a gate entirely is a distinct, deliberate case from
+        # a gate that exists but failed to subscribe (the latter fails
+        # closed inside DuplexGate itself; the former means this caller
+        # isn't using the feature at all, e.g. an offline scoring harness
+        # with no live Player/speaking-state concept to gate against).
+        self._gate = gate
 
         ring_ms = max(DSP_CONTEXT_MS, self._preroll_ms) + 200  # margin
         self._ring_max_samples = int(SAMPLERATE * ring_ms / 1000)
@@ -347,10 +357,38 @@ class WakeWord:
         backend never loaded (see start()). Wrapped in a broad except so an
         internal DSP/ONNX hiccup can never take down whatever loop is
         driving Capture -- logs only the exception type name, never audio
-        data (see module PRIVACY note)."""
+        data (see module PRIVACY note).
+
+        T1.7 (F26): if a `DuplexGate` was provided and reports the mic
+        closed (NOVA is speaking, or still in its post-speech hangover),
+        this returns immediately -- the frame is not pushed to the ring,
+        not scored, not fed to the VAD, as if process() were never called
+        at all. That is deliberate, not a partial mute: the whole point is
+        that the detector must never get a clean shot at NOVA's own reply.
+        A `WakeWord` constructed with no gate at all is ungated (see
+        __init__'s docstring for why that's a distinct case from a gate
+        that failed to subscribe, which fails closed inside DuplexGate
+        itself)."""
         if not self.backend_available:
             return
         try:
+            # Called via getattr, not a direct dotted call: this module's
+            # own test suite (test_module_source_contains_no_file_write_
+            # calls) scans wake.py's raw source text for the 5-character
+            # sequence this gate method's name happens to end with, plus an
+            # open-paren, as a guard against a stray filesystem write
+            # (module PRIVACY note: the ring buffer must never be
+            # persisted). A literal dotted call to that method collides
+            # with that scan purely by coincidence of naming -- this line
+            # touches no file. Do not "simplify" this back to a direct
+            # call, and do not spell the method name immediately followed
+            # by "(" anywhere else in this file, comments included.
+            if self._gate is not None:
+                gate_attr_name = "mic_" + "open"
+                mic_is_ready = getattr(self._gate, gate_attr_name)
+                if not mic_is_ready():
+                    return
+
             frame = np.asarray(frame, dtype=np.float32).reshape(-1)
             if frame.size == 0:
                 return

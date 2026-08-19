@@ -73,6 +73,13 @@ wake:
   arm_timeout_ms: 15000        # hard ceiling if VAD never detects end-of-speech
   vad_silence_ms: 800          # trailing silence that ends an armed turn once speech has started
 
+duplex:
+  # T1.7 (F26): half-duplex mute-while-NOVA-is-speaking gate for the wake
+  # word, plus a hangover after speech ends. Inherited from the retired
+  # build's 180ms (speaker decay + WASAPI output buffering), rounded up --
+  # NOT measured on this machine's speakers/room. See nova/audio/duplex.py.
+  hangover_ms: 200
+
 brain:
   # Calibrated against a labelled phrase set, not chosen decoratively --
   # see nova/brain/router.py's module docstring for the method and the
