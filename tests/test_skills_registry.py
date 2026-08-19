@@ -24,9 +24,12 @@ from pathlib import Path
 
 import pytest
 
+from nova.config import Config
 from nova.security.tiers import Tier
+from nova.security.untrusted import Untrusted
 from nova.skills.registry import (
     Reply,
+    SkillCtx,
     SkillError,
     SkillSpec,
     _reset_registry_for_tests,
@@ -180,3 +183,102 @@ def test_no_m0_skill_currently_declares_trusts_input_true():
 
     trusting = {name for name, spec in all_skills().items() if spec.trusts_input}
     assert trusting == set()
+
+
+# ---------------------------------------------------------------------------
+# F23: layer 2 of docs/SECURITY_SPEC.md §1.3 -- SkillSpec.invoke()'s own
+# runtime guard, independent of whatever guard the caller (today, only the
+# router) may or may not have already run. Landed at 953ebfd, previously
+# untested. The assertion that matters in every test below is not just
+# "raises TypeError" -- a guard that raised *after* dispatching to the
+# handler would still pass a test that only checks for the exception. Every
+# test here also asserts the handler never ran, and the ladder/audit-log
+# guard tests assert authorize() was never reached either, matching
+# registry.py's own comment that this must run before Ladder.authorize()
+# specifically because authorize() records params into the audit log.
+# ---------------------------------------------------------------------------
+
+
+class _NeverCalledLadder:
+    """Fails the test if authorize() is ever reached. The guard must run
+    BEFORE ladder authorization -- reaching the ladder with an Untrusted
+    value still in `params` would leak it into the audit log via
+    Ladder._record before the TypeError is ever raised."""
+
+    async def authorize(self, spec, params):
+        pytest.fail("ctx.ladder.authorize() was called -- the Untrusted guard did not run first")
+
+
+def _make_probe_spec(name: str, handler_ran: list) -> SkillSpec:
+    async def handler(ctx, **params):
+        handler_ran.append(params)
+        return Reply(text="ok")
+
+    return SkillSpec(name=name, tier=Tier.READ, examples=("probe",), trusts_input=False, handler=handler)
+
+
+async def test_invoke_rejects_a_top_level_untrusted_parameter_before_the_handler_runs(clean_registry):
+    handler_ran: list = []
+    spec = _make_probe_spec("untrusted_probe_top_level", handler_ran)
+    ctx = SkillCtx(config=Config(), ladder=_NeverCalledLadder())
+
+    with pytest.raises(TypeError):
+        await spec.invoke(ctx, text=Untrusted("attacker-controlled body", source="mail.body"))
+
+    assert handler_ran == [], "handler ran despite an Untrusted parameter -- layer 2 did not block dispatch"
+
+
+async def test_invoke_rejects_untrusted_nested_inside_a_dict_parameter(clean_registry):
+    """_find_untrusted's own docstring: a shallow check would pass
+    params={"opts": {"app": Untrusted(...)}} straight through -- the same
+    container shape that made the asdict() bypass (F12) serious."""
+    handler_ran: list = []
+    spec = _make_probe_spec("untrusted_probe_nested_dict", handler_ran)
+    ctx = SkillCtx(config=Config(), ladder=_NeverCalledLadder())
+
+    with pytest.raises(TypeError):
+        await spec.invoke(ctx, opts={"app": Untrusted("attacker body", source="mail.body")})
+
+    assert handler_ran == []
+
+
+async def test_invoke_rejects_untrusted_nested_inside_a_list_parameter(clean_registry):
+    handler_ran: list = []
+    spec = _make_probe_spec("untrusted_probe_nested_list", handler_ran)
+    ctx = SkillCtx(config=Config(), ladder=_NeverCalledLadder())
+
+    with pytest.raises(TypeError):
+        await spec.invoke(ctx, items=["clean", Untrusted("attacker body", source="mail.body")])
+
+    assert handler_ran == []
+
+
+async def test_invoke_rejects_untrusted_nested_several_containers_deep(clean_registry):
+    handler_ran: list = []
+    spec = _make_probe_spec("untrusted_probe_deep", handler_ran)
+    ctx = SkillCtx(config=Config(), ladder=_NeverCalledLadder())
+
+    with pytest.raises(TypeError):
+        await spec.invoke(ctx, opts={"items": [{"nested": Untrusted("deep attacker body", source="web.fetch")}]})
+
+    assert handler_ran == []
+
+
+async def test_invoke_allows_ordinary_trusted_parameters_through_to_the_handler(tmp_path, clean_registry):
+    """Negative control: the guard must not block ordinary parameters, or
+    every clean skill call would break, not just hostile ones. Uses a real
+    Ladder + AuditLog (not a stand-in) so this also proves the guard doesn't
+    interfere with the real authorize()-then-handler path."""
+    from nova.security.audit import AuditLog
+    from nova.security.ladder import Ladder
+
+    handler_ran: list = []
+    spec = _make_probe_spec("clean_probe", handler_ran)
+    audit = AuditLog(path=tmp_path / "audit.log")
+    ladder = Ladder(audit)
+    ctx = SkillCtx(config=Config(), ladder=ladder)
+
+    reply = await spec.invoke(ctx, text="an ordinary trusted string", count=3)
+
+    assert reply.success is True
+    assert handler_ran == [{"text": "an ordinary trusted string", "count": 3}]

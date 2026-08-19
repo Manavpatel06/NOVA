@@ -32,7 +32,7 @@ import numpy as np
 import pytest
 
 import nova.app as app_mod
-from nova.config import Config
+from nova.config import Config, SecurityConfig
 from nova.governor import TOPIC_TURN_END, TOPIC_TURN_START
 from nova.security.audit import AuditLog
 from nova.security.tiers import Tier
@@ -95,6 +95,33 @@ def app(tmp_path, monkeypatch):
     import nova.security.untrusted as untrusted_mod
 
     untrusted_mod._AUDIT = None  # don't leak this test's binding into others
+
+
+# ---------------------------------------------------------------------------
+# F22: boot wiring of config.security.redact_terms into the real AuditLog.
+#
+# Security's point, verbatim: with redact_terms empty by default, a
+# correctly-wired boot and a not-wired-at-all boot are INDISTINGUISHABLE --
+# an empty list threaded through looks identical to nothing threaded through
+# at all. So this deliberately configures a NON-empty redact_terms and
+# asserts it landed on the real AuditLog nova.app.NovaApp constructs, not on
+# a stand-in -- a regression back to a bare `AuditLog()` call at
+# nova/app.py's boot sequence would fail this test where an empty-vs-empty
+# comparison could not.
+# ---------------------------------------------------------------------------
+
+
+def test_boot_wires_configured_redact_terms_into_the_real_audit_log(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        app_mod, "AuditLog",
+        lambda **kw: AuditLog(path=tmp_path / "audit.log", **kw),
+    )
+    secret_term = "ManavsSecretProjectCodename"
+    config = Config(security=SecurityConfig(redact_terms=[secret_term]))
+
+    application = app_mod.NovaApp(config=config)
+
+    assert application.audit._redact_terms == (secret_term,)
 
 
 def _turn_events(app_instance):
