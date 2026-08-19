@@ -24,6 +24,8 @@ suite exists to catch, so nothing here is taken on the module's word.
 """
 from __future__ import annotations
 
+import pytest
+
 from nova.brain.router import Router
 from nova.security.tiers import Tier
 from nova.security.untrusted import Untrusted
@@ -315,3 +317,89 @@ def test_route_rejects_non_string_input():
     for bad in [None, 123, ["open", "notepad"], {"text": "open notepad"}]:
         with pytest.raises(TypeError):
             router.route(bad)  # type: ignore[arg-type]
+
+
+# ---------------------------------------------------------------------------
+# Against the REAL, live registry -- not the fixture above.
+#
+# nova-accuracy drove Router() (no skills= override, so it reads the real
+# nova.skills.all_skills()) rather than a fixture, specifically to confirm
+# these properties hold in production, not just against a stand-in built to
+# resemble it. Everything below uses the same real router for the same
+# reason: a fixture that happens to reproduce these numbers wouldn't prove
+# anything about what Manav's actual registry does.
+#
+# Every number pinned here (0.720, 0.487, the exact params dicts) was
+# reproduced directly against the real router before being written into an
+# assertion, same discipline as the rest of this file. They are current-
+# registry facts, not eternal ones: docs/TASKS.md F15 already records that
+# confidence_floor/ambiguity_margin (and, by the same logic, any specific
+# score here) need re-calibration the moment the registry grows past M0's
+# two skills -- a future skill addition changing these numbers is expected,
+# not a regression, and whoever hits that should update the pinned numbers
+# rather than treat this file as broken.
+# ---------------------------------------------------------------------------
+
+
+def _real_router() -> Router:
+    import nova.skills  # noqa: F401  (import triggers discover_skills())
+
+    return Router()
+
+
+# -- Adversarial/garbled input: the router must degrade to a clarification,
+# never guess and never raise. This is not a hypothetical input shape: it is
+# what a garbled Whisper transcription produces in real use -- background
+# noise, clipped audio, a cough mid-sentence, a door slamming -- so "the
+# router asks instead of crashing the turn loop or guessing" is a real
+# availability property, not defensive-programming theater.
+
+
+def test_adversarial_input_always_degrades_to_a_clarification_never_a_crash():
+    router = _real_router()
+    cases = {
+        "emoji": "\U0001F600\U0001F600\U0001F600",
+        "null_and_control_bytes": "\x00\x01\x02",
+        "single_5000_char_token": "a" * 5000,
+        "empty_string": "",
+        "whitespace_only": "   ",
+        "newline_tab_only": "\n\t\n\t",
+    }
+    for label, phrase in cases.items():
+        match = router.route(phrase)  # must not raise
+        assert match.spec is None, f"{label} unexpectedly selected a skill"
+        assert match.confidence < 0.42, f"{label} scored above the confidence floor: {match.confidence}"
+        assert match.clarification is not None, f"{label} produced no clarifying question"
+
+
+# -- Stacked trigger words: both of open_app's own trigger words in one
+# utterance, not just the first one the while loop strips.
+
+
+def test_stacked_trigger_words_are_both_stripped_not_just_the_first():
+    router = _real_router()
+    match = router.route("launch open notepad")
+    assert match.spec is not None and match.spec.name == "open_app"
+    assert match.params == {"app": "notepad"}
+    assert match.confidence == pytest.approx(0.720, abs=0.001)
+    assert match.clarification is None
+
+
+# -- The documented param-extraction leak (module docstring: "deliberately
+# crude, and says so"), reproduced against the live registry rather than the
+# fixture above, so this pins current production behavior specifically, not
+# a fixture artifact that merely happens to look the same.
+
+
+def test_documented_param_leak_is_real_against_the_live_registry_not_just_the_fixture():
+    router = _real_router()
+    match = router.route("please start notepad for me")
+    assert match.spec is not None and match.spec.name == "open_app"  # skill selection: correct
+    assert match.clarification is None  # confidently proceeds...
+    assert match.params == {"app": "start notepad"}  # ...with "start" leaked into the param
+    assert match.confidence == pytest.approx(0.487, abs=0.001)
+    assert match.params != {"app": "notepad"}, (
+        "if this now passes, the crude-extraction limitation the module's own "
+        "docstring documents has been fixed against production -- update this "
+        "test's framing, don't just relax the assertion"
+    )
