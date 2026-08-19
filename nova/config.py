@@ -180,35 +180,64 @@ class WakeConfig:
     #: belongs in this comment, not just in the threat model, because this
     #: is the file Manav actually edits.
     #:
-    #: Bounds enforced (F27, T1.5): `> 0.0` and `<= 1.0`. `<= 1.0` because
-    #: the classifier's score is a probability-like value bounded in [0, 1]
-    #: (standard for this architecture's sigmoid output head; the one
-    #: measured true-positive, 0.997, is consistent with that but this
-    #: wasn't independently re-derived here) -- above 1.0 the gate can never
-    #: be satisfied, silently disabling hands-free wake entirely. `> 0.0`
-    #: because at or below zero the gate is trivially always-open: every
-    #: non-negative score satisfies `score >= threshold`, which is not a
-    #: "low but valid" setting, it's no gate at all.
+    #: F27 (T1.6, scripts/measure_wake_false_accept.py,
+    #: docs/WAKE_FALSE_ACCEPT_MEASUREMENT.md): NOT closed by this value.
+    #: 0.75/0.70 are defence in depth, explicitly insufficient -- read the
+    #: rest of this comment before treating this constant as "the fix".
     #:
-    #: Deliberately NOT setting a real security floor above that. The
-    #: measured false-accept numbers (0.997 true-positive, 0.00005 on one
-    #: control phrase, zero detections across ~15s of noise) describe
-    #: behavior *at the current default*, not the shape of the false-accept
-    #: curve between 0.00005 and 0.55 -- there is no hard-negative/near-miss
-    #: data (phonetically similar phrases, other wake words, other voices)
-    #: anywhere in that huge unmeasured range. nova-security's own threat
-    #: model reached the same conclusion and declined to invent a number for
-    #: the same reason (docs/THREAT_MODEL_ALWAYS_ON.md §4: "not something to
-    #: invent in a threat model... a measurement task for whoever owns the
-    #: false-accept curve"). Picking any specific value in that gap would be
-    #: false precision dressed as derived-from-data. Tracked as F27, open,
-    #: pending a real false-accept measurement across hard negatives.
-    threshold: float = field(default=0.55, metadata={"bounds": Bounds(
-        lo=0.0, hi=1.0, lo_exclusive=True,
+    #: "hey jazz" -- an ordinary two-word English phrase, not an engineered
+    #: nonsense syllable -- was measured false-accepting three separate
+    #: times, after F36/F40's audio-path bugs were already fixed, and its
+    #: observed peak rose every single time anyone sampled more:
+    #:
+    #:     session 1 (T1.6, first clean run): peak 0.5125
+    #:     session 2 (lead's run):    [0.4377, 0.6449, 0.4759]  peak 0.6449
+    #:     session 3 (nova-dev-2, same day): [0.4920, 0.4071, 0.9321]  peak 0.9321
+    #:     session 3, 6 more trials of "hey jazz" alone:
+    #:         [0.4663, 0.4842, 0.7414, 0.9242, 0.8240, 0.4885]  peak 0.9242
+    #:
+    #: Three sessions, three ceilings, each refuting the last -- the
+    #: signature of a right tail this project cannot afford to bound by
+    #: sampling harder. A floor derived from an observed maximum will keep
+    #: being exceeded by the next run, and will look like a reasonable
+    #: number right up until it doesn't. Raising this constant further was
+    #: considered and rejected for that reason, not attempted and abandoned.
+    #:
+    #: A higher floor was also rejected for a second, independent reason
+    #: (F41): every true-positive score on this project, including every
+    #: number above, is Kokoro-synthetic -- a TTS voice through speakers
+    #: into a mic. No human has ever spoken to this detector. A floor
+    #: pushed toward the TP's measured 0.996-0.999 to try to clear "hey
+    #: jazz" risks a threshold Manav's own real voice can't reliably clear
+    #: either, and there is currently no way to measure that risk before he
+    #: tries -- raising a threshold aggressively against synthetic
+    #: true-positive data is a trade this project cannot currently price.
+    #:
+    #: So: 0.75/0.70 halve the exposure at the current default (of 6 fresh
+    #: "hey jazz" trials, 3 fire at 0.55, 2 still fire at 0.75) without
+    #: claiming to close it, and F28 -- capping acoustic-only arming below
+    #: ACT tier -- is the control this measurement is actually the strongest
+    #: argument for. If wake-armed actions can't reach ACT, a false accept
+    #: costs a spurious listening state, not a launched process: a
+    #: containable failure, unlike "a number that holds until it doesn't."
+    #: Put to Manav in those terms; not this dev's call to make alone.
+    #:
+    #: Bounds enforced: `>= 0.70` and `<= 1.0`. `<= 1.0` because the
+    #: classifier's score is a probability-like value bounded in [0, 1]
+    #: (standard for this architecture's sigmoid output head; the true
+    #: positive measurements above are consistent with that) -- above 1.0
+    #: the gate can never be satisfied, silently disabling hands-free wake
+    #: entirely.
+    threshold: float = field(default=0.75, metadata={"bounds": Bounds(
+        lo=0.70, hi=1.0,
         lo_note=(
             "this is the access-control gate for hands-free arming, not a comfort "
-            "setting -- a value at or below zero cannot reject anything, so every "
-            "sound would satisfy it (no higher floor is enforced yet: see F27)"
+            "setting -- 0.70 is defence in depth (F27, T1.6), explicitly NOT a "
+            "closed floor: \"hey jazz\" has been measured false-accepting up to "
+            "0.9321 across repeat trials, and the observed ceiling has risen every "
+            "time anyone sampled more. Lowering below 0.70 widens an already-"
+            "measured exposure further; raising it is not a fix either -- see "
+            "docs/WAKE_FALSE_ACCEPT_MEASUREMENT.md and F28/F41."
         ),
         hi_note="the detector's score is bounded in [0, 1]; above that it can never trigger, silently disabling hands-free wake",
     )})

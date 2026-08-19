@@ -55,7 +55,20 @@ hotkey:
 
 wake:
   model_path: hey_jarvis_v0.1.onnx   # resolved against models/wake/; swap for hey_nova.onnx later, zero code changes
-  threshold: 0.55             # the one knob Manav will actually tune
+  # The one knob Manav will actually tune -- this is the access-control gate
+  # for hands-free arming, not a comfort setting.
+  #
+  # 0.75 is DEFENCE IN DEPTH, NOT A SOLUTION. It halves the observed false-accept
+  # rate and closes nothing. "hey jazz" -- two ordinary English words -- has been
+  # measured at 0.5125, then 0.6449, then 0.9321 across three sessions, and a
+  # dedicated 6-trial run gave 0.466-0.924 with two of six above 0.75. The
+  # observed maximum has risen EVERY time anyone sampled more, which is a right
+  # tail nobody has bounded. Do not read this number as "false accepts are
+  # handled": raising it further is not known to help, and every true-positive
+  # figure we have (0.996-0.999) is Kokoro-synthetic -- no human has spoken to
+  # this detector, so a higher floor could reject "hey jazz" and also fail to
+  # hear Manav (F41). The real control is F28's tier cap, not this number.
+  threshold: 0.75
   preroll_ms: 1000             # audio kept before detection so the first syllables aren't lost
   arm_timeout_ms: 15000        # hard ceiling if VAD never detects end-of-speech
   vad_silence_ms: 800          # trailing silence that ends an armed turn once speech has started

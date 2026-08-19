@@ -84,11 +84,13 @@ TOPIC_WAKE_END = "wake.end"
 SAMPLERATE = 16000
 
 DEFAULT_MODEL_FILENAME = "hey_jarvis_v0.1.onnx"
-# The one knob Manav will actually tune. 0.55 is openWakeWord's own
-# documented ballpark for a usable false-accept/false-reject tradeoff on
-# their pretrained models; not independently measured against real usage
-# here yet (that needs a human saying the phrase repeatedly over time).
-DEFAULT_THRESHOLD = 0.55
+# The one knob Manav will actually tune -- kept in sync with
+# nova.config.WakeConfig.threshold's default, which is where the real
+# derivation and the measured false-accept numbers live (F27, T1.6). This
+# constant is only the fallback used when config/nova.yaml can't be loaded
+# at all; it must not silently regress to a value already known unsafe
+# (0.55 let a measured false accept, "hey jazz" peak 0.6449, through).
+DEFAULT_THRESHOLD = 0.75
 # Audio kept before the detection instant. The classifier's own receptive
 # field is ~760ms (76 mel-frames @ ~10ms hop), so detection is inherently a
 # little late relative to when the phrase started -- 1000ms covers that
