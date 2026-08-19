@@ -184,6 +184,74 @@ is the one thing the constitution forbids absolutely.
    calendar entry directly) — the binder doesn't need to know *how* untrusted
    content arrived, only that it must never become a bound parameter.
 
+   **The check must recurse through `dict`/`list`/`tuple`/`set`/`frozenset`,
+   not only inspect the top-level value** (amendment, 2026-08-18, landed as
+   `nova/skills/registry.py`'s `_find_untrusted`, F23). A shallow check would
+   pass `params={"app": Untrusted(...)}` straight through review while
+   missing `params={"opts": {"app": Untrusted(...)}}` or an `Untrusted`
+   sitting inside a list — and that is not a hypothetical shape to worry
+   about later: F12 (`Untrusted` unwrapped via `dataclasses.asdict()`/
+   `astuple()`) was serious *specifically* because it was recursive through
+   nested containers, so a shallow layer-2 check would silently fail to
+   close the equivalent gap one call site later. §1.1's ban on `Untrusted`
+   being a `dataclass` closes the `asdict()`/`astuple()` route structurally;
+   it says nothing about a skill's `params` dict containing an ordinary
+   nested `dict`/`list` with an `Untrusted` buried inside, which is the
+   shape this layer must catch instead. **Known, accepted scope limit:**
+   the recursion walks container types, not arbitrary objects — a skill
+   whose `params` holds a plain object or a dataclass *instance* with an
+   `Untrusted` attribute (e.g. a future structured `CalendarEvent`-shaped
+   param) is not walked into. Nothing in the M0/M1 registry produces params
+   shaped that way today (the router only ever extracts flat strings), so
+   this is latent, not live — but it should be revisited, and the container
+   list widened or a `__dict__`/`dataclasses.fields()` walk added, the day a
+   skill's params first take a structured-object shape rather than a flat
+   string. This is the "lazy bypass, not the deliberate one" scoping
+   already used elsewhere in this document (§3, `gc.get_referents`) — a
+   skill author who deliberately buries `Untrusted` inside a custom object
+   to dodge the scanner is a code-review problem, not one more container
+   type away from being a checked one.
+
+   **Second, narrower gap, demonstrated rather than theorized (nova-security,
+   2026-08-18):** the recursion checks dict *values* only —
+   `for key, item in value.items(): _find_untrusted(item, ...)` — never
+   `key` itself. `Untrusted` is hashable (§1's `__hash__`), so it is legal
+   to use as a dict key, and reproduced directly against the landed code:
+   `_find_untrusted({Untrusted("secret", source="mail.body"): "harmless"}, "")`
+   returns `None` — no hit. The top-level `params` dict is safe from this
+   specific shape by construction (`handler(ctx, **params)` requires
+   string keys, so `Untrusted` can never be a key Python's own call
+   mechanics would accept at that one level) but a *nested* dict inside a
+   `params` value has no such constraint — `params={"filters":
+   {Untrusted(...): "x"}}` reaches the handler with the key intact and
+   unflagged. Unlike the object/dataclass gap above, this is not a
+   deliberately out-of-scope shape; it is inside a container type the
+   function already claims to recurse through, just checking only half of
+   what that container holds. Fix is a one-line addition
+   (`_find_untrusted(key, ...)` alongside the existing `_find_untrusted(item, ...)`
+   in the dict branch) — flagged for nova-dev to patch, not fixed here.
+
+   **The guard must run before `ctx.ladder.authorize()`, not merely before
+   the handler** (amendment, 2026-08-18). `Ladder._record()` writes `params`
+   directly into the audit event (`nova/security/ladder.py`); a guard placed
+   after authorization, even if it still runs before the handler, would
+   already have handed an `Untrusted` value to `AuditLog.record()` before
+   raising — "before the handler" does not imply "before the value reaches
+   anything else." Checked empirically what that specific ordering mistake
+   would actually have cost, since the answer matters for how much margin
+   the ordering choice buys: `AuditLog._sanitize()` does not special-case
+   `Untrusted`, so an unwrapped instance passed through it unchanged and was
+   serialized by `_canonical()`'s `json.dumps(..., default=str)` fallback —
+   which calls `Untrusted.__str__`, the label-and-digest override from §1,
+   never the wrapped content. In practice this means an ordering mistake
+   here would have been caught by a second, independently-motivated design
+   property (§1's "no accidental unwrap via `__str__`") rather than
+   producing a raw-content leak or a crash. That is a reason to still get
+   the ordering right — a guard should not depend on a second class's
+   protocol override to save it, and a future change to either `_sanitize`
+   or `Untrusted.__str__` could remove that safety net without anyone
+   noticing — not a reason to treat the ordering requirement as academic.
+
 3. **AST test, mirroring the egress/process-spawn test's technique exactly.**
    Walk `nova/brain/router.py` (or wherever the router entrypoint lives once
    T0.1's brain layer exists) and every skill module where `trusts_input` is
