@@ -150,6 +150,11 @@ Command for the human demo: `.venv\Scripts\python.exe -m nova`
 "baseline" is Windows' own desktop with no NOVA running at all. Any VRAM figure
 taken while another GPU process is resident is contaminated — which is exactly
 how this file came to claim 566 MiB retained when the reproducible number is
-367 MiB. Take VRAM readings on a quiet machine, or read per-process usage.
+367 MiB. Take VRAM readings on a quiet machine and cross-check `nvidia-smi`'s process
+table for surprises. **Reading per-process usage is not an option on this box** —
+the GPU runs in WDDM driver mode, so `--query-compute-apps` returns `[N/A]` /
+`[Insufficient Permissions]` for *every* process including our own. Earlier
+guidance in this file said to read per-process usage instead; that was mine and
+it is impossible here. nova-accuracy established this by trying it.
 
 Host RSS via `psutil` does not have this problem: it is genuinely per-process.
