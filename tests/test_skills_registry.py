@@ -32,6 +32,7 @@ from nova.skills.registry import (
     SkillCtx,
     SkillError,
     SkillSpec,
+    _find_untrusted,
     _reset_registry_for_tests,
     all_skills,
     get_skill,
@@ -282,3 +283,56 @@ async def test_invoke_allows_ordinary_trusted_parameters_through_to_the_handler(
 
     assert reply.success is True
     assert handler_ran == [{"text": "an ordinary trusted string", "count": 3}]
+
+
+# ---------------------------------------------------------------------------
+# F29: _find_untrusted missed Untrusted values used as dict KEYS, not just
+# values. Untrusted defines __hash__, so it's perfectly legal as a dict key
+# -- params={"filters": {Untrusted(...): "x"}} reached the handler with the
+# key intact, unflagged and un-audited, because the original implementation
+# only ever recursed into value.items()'s second element. Found by
+# nova-security, reproduced independently before the fix landed (46e6be9)
+# and re-confirmed against the fixed code below, same non-vacuity discipline
+# as the F22/F23 pins.
+#
+# No test for an Untrusted key at the TOP level of `params`: handler(ctx,
+# **params) requires string keys, so Python itself rejects that shape before
+# any of our code runs. A test asserting that would pin CPython's behavior,
+# not ours -- exactly the kind of test that looks like coverage and isn't.
+# The real gap was always in a NESTED dict, which has no such protection.
+# ---------------------------------------------------------------------------
+
+
+def test_find_untrusted_detects_a_value_sitting_at_a_dict_key():
+    u = Untrusted("attacker body", source="mail.body")
+    assert _find_untrusted({"k": u}, "") == "k"
+
+
+def test_find_untrusted_detects_untrusted_used_as_a_dict_key():
+    """The exact bypass nova-security demonstrated: pre-fix, this returned
+    None -- the key was walked right past."""
+    u = Untrusted("attacker body", source="mail.body")
+    hit = _find_untrusted({u: "harmless"}, "")
+    assert hit is not None
+
+
+def test_find_untrusted_detects_untrusted_used_as_a_key_nested_inside_a_dict():
+    u = Untrusted("attacker body", source="mail.body")
+    hit = _find_untrusted({"filters": {u: "x"}}, "")
+    assert hit is not None
+
+
+async def test_invoke_rejects_untrusted_used_as_a_dict_key_nested_inside_a_parameter(clean_registry):
+    """The invoke()-level version of the same bypass: a skill-parameter
+    binder that only checked values would let this through to the handler,
+    unaudited, exactly like F12's asdict() bypass let content out through a
+    shape nobody had checked."""
+    handler_ran: list = []
+    spec = _make_probe_spec("untrusted_probe_dict_key", handler_ran)
+    ctx = SkillCtx(config=Config(), ladder=_NeverCalledLadder())
+    hostile = Untrusted("attacker-controlled filter", source="mail.body")
+
+    with pytest.raises(TypeError):
+        await spec.invoke(ctx, filters={hostile: "x"})
+
+    assert handler_ran == [], "handler ran with an Untrusted dict KEY still in params"
