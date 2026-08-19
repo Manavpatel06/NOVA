@@ -81,7 +81,14 @@ class NovaApp:
         # --- security kernel, constructed at boot per Ladder's/AuditLog's
         # own docstrings; see module docstring for why this app does not
         # call ladder.authorize() itself.
-        self.audit = AuditLog()
+        # redact_terms MUST be threaded from config here. Content-shape
+        # redaction (paths, secrets, emails) is pattern-based and works without
+        # it, which is exactly what makes omitting it dangerous: with the
+        # default empty list, a wired-correctly boot and a not-wired-at-all boot
+        # are indistinguishable, and the day Manav adds a private term to
+        # config/nova.yaml it would silently keep appearing in every audit
+        # record. Found by nova-security (F22).
+        self.audit = AuditLog(redact_terms=self.config.security.redact_terms)
         bind_audit(self.audit)
         self.ladder = Ladder(self.audit)
 
