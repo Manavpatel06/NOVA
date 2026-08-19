@@ -14,6 +14,28 @@ from nova.threadsafe import post_callback
 
 _log = get_logger(__name__)
 
+#: How many Player instances currently have an OutputStream open, across
+#: this whole process. Read by nova.audio.devices' input prober (F40): RMS-
+#: based device ranking is corrupted by definition while anything is
+#: playing (a loopback/monitor endpoint capturing system audio, or a
+#: legitimate mic sitting near a speaker, becomes the loudest candidate on
+#: pure loudness), so the prober treats a probe run during playback as
+#: suspect rather than trusting/caching it. A plain int + lock, not an
+#: asyncio primitive: play() runs its actual stream lifetime synchronously
+#: under sounddevice's own callback thread, and is_playback_active() needs
+#: to be callable from devices.py's synchronous probe code, possibly off
+#: the asyncio loop entirely (e.g. a standalone probe script).
+_active_playback_count = 0
+_active_playback_lock = threading.Lock()
+
+
+def is_playback_active() -> bool:
+    """True while at least one Player anywhere in this process has an
+    audio stream open. See the module-level counter's own comment for why
+    this exists and who reads it."""
+    with _active_playback_lock:
+        return _active_playback_count > 0
+
 
 class Player:
     """Plays PCM audio through the default output device. cancel() may be
@@ -108,6 +130,7 @@ class Player:
             if not done.done():
                 post_callback(loop, done.set_result, None)
 
+        global _active_playback_count
         with self._lock:
             self._stream = sd.OutputStream(
                 samplerate=samplerate,
@@ -118,10 +141,14 @@ class Player:
                 finished_callback=_finished_callback,
             )
             self._stream.start()
+        with _active_playback_lock:
+            _active_playback_count += 1
 
         try:
             await done
         finally:
+            with _active_playback_lock:
+                _active_playback_count -= 1
             with self._lock:
                 if self._stream is not None:
                     self._stream.close()

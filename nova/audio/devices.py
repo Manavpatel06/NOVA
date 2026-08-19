@@ -24,6 +24,7 @@ import numpy as np
 import sounddevice as sd
 
 from nova import DATA_DIR, AUDIO_PROFILE_PATH
+from nova.audio.player import is_playback_active
 from nova.log import get_logger
 
 _log = get_logger(__name__)
@@ -42,6 +43,74 @@ HOSTAPI_PRIORITY: dict[str, int] = {
     "Windows DirectSound": 2,
     "Windows WASAPI": 3,
 }
+
+#: Substrings identifying an input device that is not a microphone at all —
+#: it captures whatever the machine is currently *playing*, not what's in
+#: the room. Matched case-insensitively against the device name, same shape
+#: as `nova.audio.output.DISPLAY_ENDPOINT_MARKERS`/`is_display_endpoint`.
+#:
+#: F40 (nova-dev-2, chasing the false-accept measurement's all-zero acoustic
+#: run): the cached profile had drifted to device "PC Speaker (Realtek HD
+#: Audio 2nd output with SST)", a loopback-style capture endpoint, rms=0.235
+#: verified=True. Windows exposes several of these ("Stereo Mix", "PC
+#: Speaker (...2nd output...)", "What U Hear") as ordinary-looking input
+#: devices with real input channels — structurally indistinguishable from a
+#: microphone in the device-info dict (`max_output_channels` is 0 on their
+#: own entry, same as a real mic; see the report for why the two structural
+#: signals considered instead of name-matching don't work on this hardware:
+#: neither "also has output channels" nor "also has a WASAPI/MME/
+#: DirectSound capture entry" holds — the second one actively contradicts
+#: this module's own settled WDM-KS-first finding above, since these
+#: loopback devices AND this machine's genuine mic are both WDM-KS-only).
+#: This is a *design* flaw, not bad luck: `_rank` sorts by RMS after
+#: hostapi priority, and a loopback endpoint capturing system audio is
+#: overwhelmingly the loudest thing available whenever anything is playing
+#: — an acoustic measurement (which plays audio to test the mic) is
+#: precisely the program most likely to trigger this.
+#:
+#: Why this matters more than "NOVA goes deaf": had the loopback endpoint
+#: returned *usable* audio instead of the nan/garbage it happened to return
+#: here, NOVA would have been listening to its own output — manufacturing
+#: the self-echo loop the wake-word duplex gate (F26) exists to prevent,
+#: from the input side, with no wake word or duplex logic involved at all.
+#:
+#: Truncation note (same lesson as output.py's DISPLAY_ENDPOINT_MARKERS,
+#: re-learned here): MME truncates device names to 31 characters. A marker
+#: only protects a name if it's near the start of the string — "pc speaker"
+#: and "stereo mix" and "what u hear" all survive a 31-char truncation
+#: (verified against this machine's real names). "2nd output" does NOT: "PC
+#: Speaker (Realtek HD Audio 2nd output with SST)" truncates to "...HD
+#: Audio 2n" at 31 chars, losing the marker entirely — it is kept in this
+#: list only as a defense-in-depth net for hostapis that don't truncate
+#: (WDM-KS/DirectSound/WASAPI show full names) or for a future device where
+#: an earlier marker doesn't already catch it. Do not treat its presence
+#: here as proof it protects MME the way the earlier markers do.
+#:
+#: Ceiling, stated plainly rather than left implicit: name-matching can only
+#: exclude loopback devices whose names look like these. A loopback
+#: endpoint under an unfamiliar name — a different vendor's driver, a
+#: virtual-cable app, a future Windows build — will not match any marker
+#: here and will still be ranked purely on RMS, which is exactly the
+#: property that made this whole class of device dangerous in the first
+#: place. This list closes the *known* instances, not the underlying
+#: "ranked by loudness during playback" vulnerability — see
+#: `probe_input_devices`'s playback-guard for the mitigation that targets
+#: the underlying property instead of the names.
+LOOPBACK_ENDPOINT_MARKERS: tuple[str, ...] = (
+    "stereo mix",
+    "pc speaker",
+    "what u hear",
+    "wave speaker",
+    "mirroring",
+    "loopback",
+    "2nd output",
+)
+
+
+def is_loopback_endpoint(name: str) -> bool:
+    lowered = name.lower()
+    return any(marker in lowered for marker in LOOPBACK_ENDPOINT_MARKERS)
+
 
 PROBE_SECONDS = 1.0
 
@@ -134,6 +203,22 @@ def enumerate_and_measure(
         if info.get("max_input_channels", 0) <= 0:
             continue
         hostapi_name = hostapis[info["hostapi"]]["name"]
+        # F40: excluded BEFORE measurement, not after ranking -- a loopback
+        # endpoint must never even become a candidate _rank() can compare,
+        # since RMS ranking is exactly the property that makes these
+        # dangerous (loudest-wins, and a loopback capturing system audio is
+        # overwhelmingly the loudest thing available whenever anything is
+        # playing). Loud, not silent: named explicitly so a human reading
+        # the log can see what was excluded and why, same as
+        # nova.audio.output's display-endpoint exclusion.
+        if is_loopback_endpoint(info["name"]):
+            _log.warning(
+                "Excluding input device %d (%r, %s) — matches a known loopback/"
+                "monitor-capture name pattern (F40); it would capture system "
+                "audio, not the room.",
+                idx, info["name"], hostapi_name,
+            )
+            continue
         results.append(_measure_device(idx, info, hostapi_name))
     return results
 
@@ -236,26 +321,65 @@ def probe_input_devices(force: bool = False) -> DeviceProfile:
         cached = _load_cache()
         if cached and cached.get("fingerprint") == fingerprint and cached.get("profile"):
             p = cached["profile"]
-            current_index = _resolve_current_index(p["name"], p["hostapi"], devices, hostapis)
-            if current_index is not None:
-                if current_index != p["index"]:
-                    _log.info(
-                        "Device index drifted from %d to %d for %r on %r "
-                        "(same device, different position) -- resolved fresh, "
-                        "self-healing the cache.",
-                        p["index"], current_index, p["name"], p["hostapi"],
-                    )
-                    _patch_cached_index(cached, current_index)
-                return DeviceProfile(**{**p, "index": current_index})
-            _log.warning(
-                "Cached device %r on %r not found at any index despite a "
-                "matching fingerprint; re-probing instead of trusting a "
-                "stale cached index.",
-                p["name"], p["hostapi"],
-            )
-            # fall through to a full re-probe
+            if is_loopback_endpoint(p["name"]):
+                # F40 self-heal: a cache written before this fix landed (or
+                # by a build that hasn't picked it up yet) can already hold
+                # a poisoned loopback winner. A matching fingerprint is not
+                # permission to keep trusting it -- treat this like the
+                # "cached device not found" case below and re-probe for
+                # real, so the fix applies to an existing bad cache, not
+                # only to future ones.
+                _log.warning(
+                    "Cached input device %r on %r matches a known loopback/"
+                    "monitor-capture name pattern (F40) -- this cache predates "
+                    "the fix or was written by one without it. Re-probing "
+                    "instead of trusting it.",
+                    p["name"], p["hostapi"],
+                )
+                # fall through to a full re-probe
+            else:
+                current_index = _resolve_current_index(p["name"], p["hostapi"], devices, hostapis)
+                if current_index is not None:
+                    if current_index != p["index"]:
+                        _log.info(
+                            "Device index drifted from %d to %d for %r on %r "
+                            "(same device, different position) -- resolved fresh, "
+                            "self-healing the cache.",
+                            p["index"], current_index, p["name"], p["hostapi"],
+                        )
+                        _patch_cached_index(cached, current_index)
+                    return DeviceProfile(**{**p, "index": current_index})
+                _log.warning(
+                    "Cached device %r on %r not found at any index despite a "
+                    "matching fingerprint; re-probing instead of trusting a "
+                    "stale cached index.",
+                    p["name"], p["hostapi"],
+                )
+                # fall through to a full re-probe
 
     _log.info("Probing input devices (fingerprint changed, cache miss, or force=True)...")
+
+    # F40, mitigation for the underlying property (not just the known
+    # names): RMS ranking is corrupted by definition while anything is
+    # playing through this process's own Player -- a loopback/monitor
+    # endpoint under a name not in LOOPBACK_ENDPOINT_MARKERS, or even a
+    # legitimate mic sitting near a speaker, becomes the loudest candidate
+    # purely because something is audibly playing. Markers close the known
+    # instances; this closes the underlying vulnerability for the unknown
+    # ones -- by refusing to let a probe taken under those conditions
+    # poison the persistent cache, not by blocking or delaying the probe
+    # itself (a probe that hangs waiting for silence is its own failure
+    # mode, and the immediate caller still needs *an* answer now).
+    probed_during_playback = is_playback_active()
+    if probed_during_playback:
+        _log.warning(
+            "Input device probe is running while this process's own Player has "
+            "an audio stream open (F40) -- RMS-based ranking is not trustworthy "
+            "under these conditions. This probe's result will be returned but "
+            "NOT cached, so it cannot poison future calls; the next probe that "
+            "runs while nothing is playing will get the real answer."
+        )
+
     # winner.index below comes directly from enumerating this exact
     # `devices` snapshot (enumerate_and_measure loops `enumerate(devices)`),
     # the same one just fingerprinted above -- it cannot be stale, no
@@ -270,7 +394,8 @@ def probe_input_devices(force: bool = False) -> DeviceProfile:
         )
         profile = DeviceProfile(index=-1, name="<none>", hostapi="<none>", samplerate=16000,
                                  verified=False, rms=0.0)
-        _save_cache(fingerprint, profile, measurements)
+        if not probed_during_playback:
+            _save_cache(fingerprint, profile, measurements)
         return profile
 
     if not winner.verified:
@@ -289,10 +414,18 @@ def probe_input_devices(force: bool = False) -> DeviceProfile:
         verified=winner.verified,
         rms=winner.rms,
     )
-    _save_cache(fingerprint, profile, measurements)
+    if probed_during_playback:
+        _log.warning(
+            "Not caching device %d (%s) — selected while playback was active "
+            "(F40); treat this result as this call's best effort only.",
+            profile.index, profile.name,
+        )
+    else:
+        _save_cache(fingerprint, profile, measurements)
     _log.info(
-        "Selected input device %d (%s) hostapi=%s sr=%d verified=%s rms=%.8f",
+        "Selected input device %d (%s) hostapi=%s sr=%d verified=%s rms=%.8f%s",
         profile.index, profile.name, profile.hostapi, profile.samplerate,
         profile.verified, profile.rms,
+        " [NOT CACHED -- probed during playback, see WARNING above]" if probed_during_playback else "",
     )
     return profile
