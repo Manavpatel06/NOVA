@@ -9,16 +9,20 @@ ConsoleConfirmChannel's real timeout behavior.
 """
 from __future__ import annotations
 
+import asyncio
 import io
 import subprocess
 import sys
+import threading
 import time
 
 import pytest
 
+import nova.security.confirm as confirm_mod
 from nova.security.confirm import (
     ConfirmCall,
     ConsoleConfirmChannel,
+    DialogConfirmChannel,
     ScriptedConfirmChannel,
     format_confirm_prompt,
 )
@@ -273,6 +277,329 @@ def test_a_timed_out_confirm_does_not_prevent_process_exit():
         "\n"
         "async def main():\n"
         "    channel = ConsoleConfirmChannel(timeout_s=0.1, stream_in=NeverAnswers(), stream_out=io.StringIO())\n"
+        "    try:\n"
+        "        await channel.request(skill, {})\n"
+        "    except ConfirmTimeout:\n"
+        "        pass\n"
+        "\n"
+        "asyncio.run(main())\n"
+        "print('EXITED_CLEANLY')\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", script],
+        capture_output=True, text=True, timeout=10,
+    )
+    assert "EXITED_CLEANLY" in result.stdout, (
+        f"process did not print its exit marker; stdout={result.stdout!r} stderr={result.stderr!r}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# DialogConfirmChannel — a real Win32 MessageBox, for when the human isn't
+# watching a terminal. Zero coverage before this section despite being the
+# live production confirm channel NovaApp constructs at boot (T1.4).
+#
+# `win32api`/`win32con` are imported locally inside DialogConfirmChannel's
+# methods (never at module top-level), so every mocked test here injects
+# fakes via sys.modules -- same technique test_interfaces_hotkey.py and
+# test_interfaces_tray.py use, and no real MessageBox ever appears on
+# screen during the default suite.
+# ---------------------------------------------------------------------------
+
+
+class _FakeWin32ConForDialog:
+    MB_YESNO = 0x4
+    MB_ICONQUESTION = 0x20
+    MB_SYSTEMMODAL = 0x1000
+    MB_TOPMOST = 0x40000
+    IDOK = 1
+    IDCANCEL = 2
+    IDNO = 7
+    IDYES = 6
+
+
+class _FakeWin32ApiForDialog:
+    def __init__(self, message_box_fn):
+        self._message_box_fn = message_box_fn
+        self.message_box_calls: list[tuple] = []
+
+    def MessageBox(self, hwnd, prompt, title, flags):
+        self.message_box_calls.append((hwnd, prompt, title, flags))
+        return self._message_box_fn(prompt, title, flags)
+
+
+@pytest.fixture
+def fake_win32_dialog(monkeypatch):
+    def _install(message_box_fn):
+        win32con = _FakeWin32ConForDialog()
+        win32api = _FakeWin32ApiForDialog(message_box_fn)
+        monkeypatch.setitem(sys.modules, "win32con", win32con)
+        monkeypatch.setitem(sys.modules, "win32api", win32api)
+        return win32con, win32api
+
+    return _install
+
+
+async def _wait_until(predicate, timeout=2.0):
+    start = time.monotonic()
+    while not predicate():
+        if time.monotonic() - start > timeout:
+            raise TimeoutError("condition never became true")
+        await asyncio.sleep(0.01)
+
+
+# ---------------------------------------------------------------------------
+# Explicit-Yes-only: anything that isn't IDYES is a decline.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "answer_attr,expected",
+    [("IDYES", True), ("IDNO", False), ("IDCANCEL", False), ("IDOK", False)],
+)
+async def test_dialog_channel_treats_only_explicit_yes_as_approval(fake_win32_dialog, answer_attr, expected):
+    def message_box(prompt, title, flags):
+        return getattr(_FakeWin32ConForDialog, answer_attr)
+
+    fake_win32_dialog(message_box)
+    channel = DialogConfirmChannel(timeout_s=5.0)
+
+    result = await channel.request(CONFIRM_SKILL, {})
+
+    assert result is expected
+
+
+async def test_dialog_channel_uses_yesno_iconquestion_systemmodal_topmost_flags(fake_win32_dialog):
+    """No Cancel button on purpose (class docstring): fewer ways to produce
+    an ambiguous answer, not more."""
+    captured_flags = []
+
+    def message_box(prompt, title, flags):
+        captured_flags.append(flags)
+        return _FakeWin32ConForDialog.IDYES
+
+    win32con, _ = fake_win32_dialog(message_box)
+    channel = DialogConfirmChannel(timeout_s=5.0)
+
+    await channel.request(CONFIRM_SKILL, {})
+
+    expected = win32con.MB_YESNO | win32con.MB_ICONQUESTION | win32con.MB_SYSTEMMODAL | win32con.MB_TOPMOST
+    assert captured_flags == [expected]
+
+
+async def test_dialog_channel_shows_the_redacted_prompt_and_titles_the_skill(fake_win32_dialog):
+    captured = []
+
+    def message_box(prompt, title, flags):
+        captured.append((prompt, title))
+        return _FakeWin32ConForDialog.IDYES
+
+    fake_win32_dialog(message_box)
+    channel = DialogConfirmChannel(timeout_s=5.0)
+
+    await channel.request(CONFIRM_SKILL, {"path": r"C:\Users\manav\x.txt"})
+
+    prompt, title = captured[0]
+    assert "manav" not in prompt
+    assert "[USER]" in prompt
+    assert CONFIRM_SKILL.name in title
+
+
+# ---------------------------------------------------------------------------
+# Timeout raises ConfirmTimeout distinctly, not a plain False.
+# ---------------------------------------------------------------------------
+
+
+async def test_dialog_channel_raises_confirm_timeout_when_nothing_is_answered_in_time(fake_win32_dialog):
+    block = threading.Event()
+
+    def message_box(prompt, title, flags):
+        block.wait(timeout=5)  # blocks well past the channel's own 0.1s timeout
+        return _FakeWin32ConForDialog.IDYES
+
+    fake_win32_dialog(message_box)
+    channel = DialogConfirmChannel(timeout_s=0.1)
+
+    start = time.monotonic()
+    with pytest.raises(ConfirmTimeout):
+        await channel.request(CONFIRM_SKILL, {})
+    elapsed = time.monotonic() - start
+
+    assert elapsed < 2.0, "timeout did not fire promptly -- waited for the abandoned dialog thread"
+    block.set()  # release the abandoned thread so it doesn't linger past the test
+
+
+async def test_dialog_channel_timeout_wired_through_the_real_ladder_denies(fake_win32_dialog):
+    block = threading.Event()
+
+    def message_box(prompt, title, flags):
+        block.wait(timeout=5)
+        return _FakeWin32ConForDialog.IDYES
+
+    fake_win32_dialog(message_box)
+    audit = _FakeAudit()
+    channel = DialogConfirmChannel(timeout_s=0.1)
+    ladder = Ladder(audit, confirm_channel=channel)
+
+    decision = await ladder.authorize(CONFIRM_SKILL, {})
+
+    assert decision.allowed is False
+    assert decision.reason == "confirm_timed_out"
+    assert audit.records[-1]["reason"] == "confirm_timed_out"
+    block.set()
+
+
+# ---------------------------------------------------------------------------
+# A missing/failing pywin32 surfaces the real exception, not ConfirmTimeout
+# -- class docstring: "A missing/failing pywin32 import would already have
+# surfaced above, via _settle_exception."
+# ---------------------------------------------------------------------------
+
+
+async def test_dialog_channel_propagates_the_real_exception_when_pywin32_is_unavailable(monkeypatch):
+    monkeypatch.setitem(sys.modules, "win32api", None)  # forces ImportError inside _show_dialog
+
+    channel = DialogConfirmChannel(timeout_s=5.0)
+
+    with pytest.raises(ImportError):
+        await channel.request(CONFIRM_SKILL, {})
+
+
+# ---------------------------------------------------------------------------
+# F30 (nova-tester): a late click after timeout cannot flip an already-
+# audited denial -- the done-guard in _settle_result/_settle_exception drops
+# it. This is the "known limitation, documented rather than hidden" the
+# class docstring names: on timeout the dialog thread is abandoned with the
+# box still on-screen, and a human clicking it after the ladder has already
+# denied the request must do nothing.
+# ---------------------------------------------------------------------------
+
+
+def test_settle_result_on_an_already_resolved_future_is_a_noop():
+    loop = asyncio.new_event_loop()
+    try:
+        fut = loop.create_future()
+        fut.set_result("first, real answer")
+
+        confirm_mod._settle_result(fut, "late answer")  # must not raise, must not change the outcome
+
+        assert fut.result() == "first, real answer"
+    finally:
+        loop.close()
+
+
+def test_settle_exception_on_an_already_resolved_future_is_a_noop():
+    loop = asyncio.new_event_loop()
+    try:
+        fut = loop.create_future()
+        fut.set_result("already resolved")
+
+        confirm_mod._settle_exception(fut, RuntimeError("late failure"))  # must not flip it into an exception
+
+        assert fut.result() == "already resolved"
+    finally:
+        loop.close()
+
+
+def test_settle_result_on_a_cancelled_future_is_a_noop():
+    """The real shape after a timeout: asyncio.wait_for cancels the future
+    on TimeoutError, which is also 'done' -- a late _settle_result must not
+    un-cancel it or otherwise resurrect it."""
+    loop = asyncio.new_event_loop()
+    try:
+        fut = loop.create_future()
+        fut.cancel()
+
+        confirm_mod._settle_result(fut, "late yes")
+
+        assert fut.cancelled() is True
+    finally:
+        loop.close()
+
+
+async def test_dialog_channel_end_to_end_a_late_click_after_timeout_is_silently_dropped(
+    fake_win32_dialog, monkeypatch
+):
+    """Full path through DialogConfirmChannel.request(): a real timeout
+    fires first, THEN the abandoned dialog thread's late click arrives.
+    Spies on the real _settle_result (passthrough, not replaced) to prove
+    two things about the SAME call: it really is the late click reaching
+    the done-guard (future already done at call time), and going through
+    the real guard doesn't raise or otherwise misbehave."""
+    block = threading.Event()
+
+    def message_box(prompt, title, flags):
+        block.wait(timeout=5)
+        return _FakeWin32ConForDialog.IDYES  # a real, late "Yes" click
+
+    fake_win32_dialog(message_box)
+
+    real_settle_result = confirm_mod._settle_result
+    observed: list[tuple] = []
+
+    def spy_settle_result(fut, value):
+        # Capture whether the real guard raises, not just whether it was
+        # called: a callback scheduled via call_soon_threadsafe that raises
+        # gets caught and logged by asyncio's own default callback
+        # exception handler, never propagated back to this test's await --
+        # so a passthrough that let the InvalidStateError of a missing
+        # done-guard escape would otherwise go unnoticed here.
+        was_done = fut.done()
+        try:
+            real_settle_result(fut, value)
+            error = None
+        except Exception as exc:  # noqa: BLE001 -- deliberately broad, this IS the assertion
+            error = exc
+        observed.append((value, was_done, error))
+
+    monkeypatch.setattr(confirm_mod, "_settle_result", spy_settle_result)
+
+    channel = DialogConfirmChannel(timeout_s=0.1)
+    with pytest.raises(ConfirmTimeout):
+        await channel.request(CONFIRM_SKILL, {})
+
+    block.set()  # release the late click now that the timeout has already denied it
+    await _wait_until(lambda: len(observed) == 1)
+
+    late_value, was_already_done, error = observed[0]
+    assert was_already_done is True, "test setup issue -- the future was not yet done when the late click arrived"
+    assert late_value == _FakeWin32ConForDialog.IDYES  # the real late click, correctly dropped by the guard
+    assert error is None, f"the done-guard let the late click raise instead of dropping it: {error!r}"
+
+
+# ---------------------------------------------------------------------------
+# Regression, mirroring the ConsoleConfirmChannel test above: a timed-out
+# dialog must not prevent process exit either. Same daemon-thread design,
+# same class of hazard, same real-subprocess proof -- an in-process test
+# cannot observe interpreter-shutdown behavior at all.
+# ---------------------------------------------------------------------------
+
+
+def test_a_timed_out_dialog_does_not_prevent_process_exit():
+    script = (
+        "import asyncio, sys, time, types\n"
+        "fake_win32con = types.SimpleNamespace(\n"
+        "    MB_YESNO=4, MB_ICONQUESTION=0x20, MB_SYSTEMMODAL=0x1000, MB_TOPMOST=0x40000, IDYES=6,\n"
+        ")\n"
+        "class FakeWin32Api:\n"
+        "    def MessageBox(self, hwnd, prompt, title, flags):\n"
+        "        time.sleep(30)\n"
+        "        return 6\n"
+        "sys.modules['win32con'] = fake_win32con\n"
+        "sys.modules['win32api'] = FakeWin32Api()\n"
+        "\n"
+        "from nova.security.confirm import DialogConfirmChannel\n"
+        "from nova.security.ladder import ConfirmTimeout\n"
+        "from nova.security.tiers import Tier\n"
+        "from nova.skills.registry import Reply, SkillSpec\n"
+        "\n"
+        "async def handler(ctx):\n"
+        "    return Reply(text='ok')\n"
+        "\n"
+        "skill = SkillSpec(name='x', tier=Tier.CONFIRM, examples=('x',), trusts_input=False, handler=handler)\n"
+        "\n"
+        "async def main():\n"
+        "    channel = DialogConfirmChannel(timeout_s=0.1)\n"
         "    try:\n"
         "        await channel.request(skill, {})\n"
         "    except ConfirmTimeout:\n"
