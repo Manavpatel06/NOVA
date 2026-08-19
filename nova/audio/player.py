@@ -38,21 +38,37 @@ class Player:
         # sound card, and the OS default moves between them -- landing on the
         # screen makes NOVA inaudible while synthesis succeeds perfectly.
         # `device=None` means "ask the prober", not "trust the default".
-        self._device = device
-        if device is None:
-            try:
-                from nova.audio.output import probe_output_device
+        # Resolved lazily on first play(), NOT here. Probing opens a real output
+        # stream and writes a real buffer, and doing that in a constructor means
+        # merely *constructing* a Player touches hardware -- which made
+        # tests/test_audio_capture_player.py's own "no real audio device is
+        # opened anywhere in this file" claim false on a cold cache, without
+        # anything failing to say so. Found by nova-tester while testing
+        # output.py; the constructor-does-I/O smell was mine.
+        self._device_explicit = device
+        self._device_resolved = False
+        self._device: int | None = device
 
-                self._device = probe_output_device().index
-            except Exception as exc:  # never let device selection stop NOVA speaking
-                _log.warning(
-                    "Output device probe failed (%s); falling back to the OS default. "
-                    "If NOVA is silent, run scripts/probe_output.py.",
-                    exc,
-                )
-                self._device = None
+    def _resolve_device(self) -> None:
+        """Pick an output endpoint once, on first use rather than at construction."""
+        if self._device_resolved or self._device_explicit is not None:
+            self._device_resolved = True
+            return
+        try:
+            from nova.audio.output import probe_output_device
+
+            self._device = probe_output_device().index
+        except Exception as exc:  # never let device selection stop NOVA speaking
+            _log.warning(
+                "Output device probe failed (%s); falling back to the OS default. "
+                "If NOVA is silent, run scripts/probe_output.py.",
+                exc,
+            )
+            self._device = None
+        self._device_resolved = True
 
     async def play(self, pcm: np.ndarray, samplerate: int) -> None:
+        self._resolve_device()
         pcm = np.asarray(pcm, dtype=np.float32)
         if pcm.ndim == 1:
             pcm = pcm.reshape(-1, 1)
