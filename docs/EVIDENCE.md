@@ -122,7 +122,13 @@ endpoint, says which NOVA will use and why, and plays a test tone. If you hear
 the tone, playback is good. Lead-verified: it selects `Headphones (Realtek(R)
 Audio)`, index 4, opened and accepted a buffer.
 
-Audibility itself still needs your ears — no probe can close that.
+**CLOSED 2026-08-19 by Manav, and against the failure case.** He ran
+`scripts/probe_output.py` and heard the tone **while the OS default output was
+the NVIDIA HDMI television** (`NS-39D400NA14`, confirmed by the lead at the same
+time). So this is not "audible because the default happened to be right" — it is
+the F18/F36 fix rejecting a display endpoint, selecting `Speakers (Realtek(R)
+Audio)`, and a human confirming sound came out. The fix is proven against the
+exact scenario it was written for, by ear, which no probe could have done.
 
 ### Remote control changes what the demo proves
 
