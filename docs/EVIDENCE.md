@@ -48,8 +48,10 @@ Command: `.venv/Scripts/python.exe scripts/probe_roundtrip.py`
 'open notepad'    -> 'Open Notepad.'       exact
 ```
 
-Command: `.venv/Scripts/python.exe -m pytest -q` → **495 passed, 0 failed, 4 skipped**
-(at commit `a8cc40e`. A passed-count is a timestamp, not a property — it rises as
+Command: `.venv/Scripts/python.exe -m pytest -q` → **669 passed, 0 failed, 10 skipped**
+With `NOVA_TEST_REAL_HARDWARE=1`: **678 passed, 1 skipped** — the 9 gated skips all pass for real against the real mic, real GPU with large-v3-turbo, real Kokoro and a real Win32 mutex. The 1 remaining skip is `test_source_hygiene.py`'s deliberate exemption for `nova/__init__.py` as the path source of truth.
+
+(at commit `2b0cf34`. A passed-count is a timestamp, not a property — it rises as
 coverage lands. The durable facts are 0 failed and a skip count you can account
 for. Quote a count only with the commit it was measured at.)
 
@@ -146,8 +148,12 @@ Command for the human demo: `.venv\Scripts\python.exe -m nova`
 
 ### Measurement caveat, learned the hard way
 
-`nvidia-smi` reports **machine-wide** VRAM, not per-process. The 264 MiB
-"baseline" is Windows' own desktop with no NOVA running at all. Any VRAM figure
+`nvidia-smi` reports **machine-wide** VRAM, not per-process. The "264 MiB
+baseline" was measured on a quiet machine and **is not reproducible with a
+browser open** — nova-accuracy-2 read 292 MiB on a run with Brave and WhatsApp
+GPU-resident. Treat it as a floor observed under specific conditions, not a
+constant. Deltas between load and post-stop readings stay internally consistent
+regardless, which is why the leak figures survive this. Any VRAM figure
 taken while another GPU process is resident is contaminated — which is exactly
 how this file came to claim 566 MiB retained when the reproducible number is
 367 MiB. Take VRAM readings on a quiet machine and cross-check `nvidia-smi`'s process
