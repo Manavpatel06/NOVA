@@ -25,6 +25,27 @@ Legend: TODO · CLAIMED · IN REVIEW · **DONE**
 | T0.A | Independent verification of every M0 claim | nova-accuracy | IN PROGRESS (nova-accuracy) |
 | T0.D | README + QUICKSTART reflecting what actually runs | nova-docs | **DONE** (128bf21) |
 
+## Milestone 2 — The Open Brain (approved by Manav 2026-08-20)
+
+Plan: `docs/M2_OPEN_BRAIN_PLAN.md`. Governing rule: **Claude proposes, NOVA
+disposes** — Claude never executes, it names an already-registered skill and that
+proposal goes through the same binder, ladder and audit log as a local route.
+
+| # | Task | Owner | State |
+|---|---|---|---|
+| T2.1 | Self-knowledge: `capabilities` skill answering from the live registry | nova-dev-2 | CLAIMED |
+| T2.2 | Latency: per-stage instrumentation, first-audio-out metric, pre-warm ADR | nova-dev-3 | CLAIMED |
+| T2.3a | App allowlist growth: resolve, CONFIRM, realpath-revalidated config write | unassigned | TODO |
+| T2.3b | Voice confirmation channel | unassigned | **BLOCKED on F28** — refused for acoustically-armed turns until settled |
+| T2.4t | Threat model for the Claude fallthrough, before implementation | nova-security-2 | CLAIMED |
+| T2.4 | Claude fallthrough via `Egress.release_for_process` | unassigned | TODO (after T2.4t) |
+
+**Latency budget under test:** first audio out within **1.5 s** of speech ending,
+steady state, READ skills. First-turn reported separately. Manav measured ~5-8 s
+on the live test and called it slow.
+
+**Tier rule:** Claude-proposed actions authorize at `max(declared_tier, CONFIRM)`.
+
 ## Decisions taken (do not re-litigate)
 
 - Model weights salvaged from the retired build and byte-verified. No downloads.
