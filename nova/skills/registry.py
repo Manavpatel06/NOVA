@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from nova.config import Config
 from nova.log import get_logger
-from nova.security.tiers import Tier
+from nova.security.tiers import ArmedBy, Tier
 from nova.security.untrusted import Untrusted
 
 logger = get_logger("skills.registry")
@@ -57,6 +57,22 @@ ResolveForConfirm = Callable[["SkillCtx", dict[str, Any]], Awaitable[dict[str, A
 class SkillError(ValueError):
     """Raised for a skill registration conflict (duplicate name, missing
     examples, wrong tier type) — always at import time, never at call time."""
+
+
+# F28: a denial's `reason` string is a machine-audit label first
+# ("presence_required", "no_confirm_channel", ...) — spoken verbatim, it
+# reads as a broken assistant rather than a deliberately limited one, and
+# nova-security specifically called this out for the ceiling: it is the
+# first control Manav will actually feel day to day, and a generic refusal
+# would make the wake word feel broken instead of intentional. A small
+# mapping, not a general "prettify every denial" pass — every OTHER
+# reason below still falls through to its raw string (`.get(reason,
+# reason)`), same as before F28 existed. That is a real, pre-existing gap
+# in how CONFIRM denials sound out loud, named here rather than silently
+# expanded past what this task actually asked for.
+_FRIENDLY_DENIAL_TEXT: dict[str, str] = {
+    "presence_required": "I can't do that unless you press the hotkey.",
+}
 
 
 def _find_untrusted(value: Any, path: str) -> str | None:
@@ -120,10 +136,22 @@ class SkillCtx:
     lets invoke() silently skip authorization is exactly the unaudited-
     action gap docs/THREAT_MODEL.md closes. Every real caller constructs one
     Ladder (with a real AuditLog) at boot and threads it through here.
+
+    `armed_by` (F28, T2.4's shared seam): how THIS turn was armed, honestly
+    threaded from `nova/app.py`'s bus handlers (`_on_ptt_end` / the wake
+    word's `_on_wake_end`, once wired) — never guessed or reconstructed
+    downstream. `invoke()` below turns it into `Ladder.authorize()`'s
+    `ceiling=` keyword; see `nova/security/tiers.py`'s `ArmedBy` and
+    `nova/security/ladder.py`'s module docstring for what it does and why
+    it is not the floor's inverse. Defaults to `ArmedBy.PTT` — the
+    unrestricted case — so every existing call site (every test fixture,
+    every skill invoked outside the real turn loop) is unaffected unless it
+    deliberately constructs a wake-armed context.
     """
 
     config: Config
     ladder: "Ladder"
+    armed_by: ArmedBy = ArmedBy.PTT
 
 
 @dataclass(frozen=True)
@@ -195,11 +223,12 @@ class SkillSpec:
         # (not just when this particular call is actually CONFIRM-tier):
         # SkillSpec.invoke() has no cheap way to know the ladder's eventual
         # effective tier ahead of calling it (that composition — declared
-        # tier vs. an F28/T2.4 floor — is Ladder.authorize()'s job, not
-        # this module's to duplicate), and a resolve hook is defined to be
-        # a cheap, side-effect-free lookup (open_app.py's is a path
-        # resolve+containment check), so the wasted call on an ACT/READ
-        # path costs nothing worth avoiding at this complexity.
+        # tier vs. an F45 floor and now F28's ceiling — is
+        # Ladder.authorize()'s job, not this module's to duplicate), and a
+        # resolve hook is defined to be a cheap, side-effect-free lookup
+        # (open_app.py's is a path resolve+containment check), so the
+        # wasted call on an ACT/READ path costs nothing worth avoiding at
+        # this complexity.
         pre_resolution: dict[str, Any] | None = None
         if self.resolve_for_confirm is not None:
             try:
@@ -212,13 +241,24 @@ class SkillSpec:
                 )
                 pre_resolution = None
 
+        # F28: the ceiling this call is subject to, derived honestly from
+        # how the turn was armed (ctx.armed_by, threaded from nova/app.py's
+        # bus handlers — see SkillCtx's own docstring) rather than guessed
+        # here. ArmedBy.PTT (a human pressed the hotkey) means no ceiling
+        # at all; ArmedBy.WAKE means Tier.READ, Manav's ruling. This module
+        # only translates the arming source into a ceiling value —
+        # Ladder.authorize() is the one place that actually enforces it,
+        # same separation of concerns as the floor/confirm_display above.
+        ceiling = Tier.READ if ctx.armed_by is ArmedBy.WAKE else None
+
         # Every caller of a skill goes through here, so this is the one place
         # that enforces the permission ladder and produces an audit record
         # for every invocation, including READ ("free" means no confirmation
         # friction, not unaudited — docs/THREAT_MODEL.md §4).
-        decision = await ctx.ladder.authorize(self, params, confirm_display=pre_resolution)
+        decision = await ctx.ladder.authorize(self, params, ceiling=ceiling, confirm_display=pre_resolution)
         if not decision.allowed:
-            return Reply(text=decision.reason, success=False)
+            spoken = _FRIENDLY_DENIAL_TEXT.get(decision.reason, decision.reason)
+            return Reply(text=spoken, success=False)
 
         # F46/T2.0: the TOCTOU close. A CONFIRM dialog can sit open for as
         # long as the channel's own timeout allows (up to 60s today,

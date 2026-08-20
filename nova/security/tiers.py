@@ -77,3 +77,30 @@ class Tier(Enum):
 # string. READ < ACT < CONFIRM is the entire ladder; a fourth tier would
 # need a rank assigned here deliberately, not inferred.
 _RANK: dict[Tier, int] = {Tier.READ: 0, Tier.ACT: 1, Tier.CONFIRM: 2}
+
+
+class ArmedBy(Enum):
+    """F28 (Manav's decision, 2026-08-20): how the turn currently running
+    was armed — the signal `nova/skills/registry.py`'s `SkillSpec.invoke()`
+    turns into `Ladder.authorize()`'s `ceiling=` keyword (see
+    `nova/security/ladder.py`'s own docstring for the ceiling mechanism
+    itself; this enum only names the source, it does not decide anything).
+
+    PTT  — a human pressed the hotkey. No ceiling: every tier the skill
+           itself declares (subject to floor/CONFIRM as normal) is reachable.
+    WAKE — the wake word armed the turn with no keypress at all. Ceiling of
+           READ: nobody proved a human is actually present and asking on
+           purpose (docs/THREAT_MODEL_ALWAYS_ON.md §4's whole concern, and
+           WakeConfig.threshold's own comment names this as the reason
+           lowering that number widens more than false-accept risk) — ACT
+           and CONFIRM require push-to-talk, unconditionally, until this
+           enum grows a third source with its own explicit ruling.
+
+    Co-located with `Tier` rather than in `nova/audio/wake.py` or `nova/
+    app.py`: this is a security primitive `Ladder.authorize()`'s docstring
+    references directly, the same reason `Tier` itself lives here rather
+    than in the module that first needed it.
+    """
+
+    PTT = "ptt"
+    WAKE = "wake"

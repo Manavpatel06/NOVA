@@ -60,6 +60,51 @@ skill said READ, a floor said CONFIRM" and "the skill said CONFIRM, no
 floor was involved" are different facts for whoever reads the log later,
 and collapsing them into a single `tier` field would erase exactly the
 distinction a floor exists to make visible.
+
+**F28 (Manav's decision, 2026-08-20): a `ceiling` keyword, and it is NOT
+the floor's inverse.** The floor composes as `max(declared, floor)` — it
+can only raise what a call is allowed to do, never lower it, because
+lowering a skill's own declared tier would let injected content or a
+confused caller talk a dangerous action down into looking safe. A ceiling
+does the opposite job on purpose: it REFUSES outright — `Decision.deny`,
+reason `"presence_required"` — the moment the effective tier (declared,
+after any floor) exceeds what the situation is allowed to reach at all,
+rather than silently reshaping what runs. Manav's ruling: a turn armed by
+the wake word (no human confirmed present by a keypress) may reach READ
+only; ACT and CONFIRM require push-to-talk. `presence_required` is a
+distinct reason from every CONFIRM-path denial above — a human declining,
+a channel timing out, and "nobody proved they're here" are three different
+facts, and collapsing "presence_required" into "no_confirm_channel" or a
+bare "denied" would make the log unable to tell a security control from an
+outage.
+
+Checked against the EFFECTIVE tier (post-floor), not the bare declared
+one: F47 exempts READ from any floor, so a READ-declared skill can never
+be floor-raised in the first place and a ceiling of READ always permits it
+by construction (`Tier.READ > Tier.READ` is `False`) — the exemption and
+the ceiling compose without either needing to know about the other. For
+an ACT/CONFIRM-declared skill, checking the ceiling against the
+post-floor tier (rather than the bare declaration) means a future
+provenance floor (T2.4) can never let a call slip under a presence
+ceiling that was supposed to catch it — floor and ceiling are answering
+different questions ("how much scrutiny does this deserve" vs. "what is
+this turn even allowed to reach"), and when they conflict the ceiling
+wins, because "nobody verified is here" is a more fundamental limit than
+"this needs extra scrutiny". Like `floor`, `ceiling` is threaded through
+every helper (`_allow_with_required_audit`, `_deny_audited`, `_record`,
+...) and appears in the audit record whenever a caller passes one, whether
+or not it ended up refusing anything — same reasoning as `floor`'s own
+always-present-when-passed fields.
+
+**Where the ceiling itself comes from is `SkillCtx.armed_by`
+(nova/skills/registry.py), threaded from `nova/app.py`'s `_on_ptt_end` /
+(new) `_on_wake_end` bus handlers** — the same seam T2.4's provenance
+floor needs (arming source and dispatch provenance are different signals,
+but both have to reach `authorize()` honestly from where the turn actually
+started, not be reconstructed or guessed downstream). `SkillSpec.invoke()`
+computes `ceiling = Tier.READ if ctx.armed_by is ArmedBy.WAKE else None`
+and passes it through — this module never inspects `armed_by` itself, the
+same separation of concerns `floor`/`confirm_display` already use.
 """
 
 from __future__ import annotations
@@ -149,6 +194,7 @@ class Ladder:
         params: dict[str, Any],
         *,
         floor: Tier | None = None,
+        ceiling: Tier | None = None,
         confirm_display: dict[str, Any] | None = None,
     ) -> Decision:
         declared_tier = skill.tier
@@ -170,9 +216,22 @@ class Ladder:
         if floor is not None and isinstance(declared_tier, Tier) and declared_tier is not Tier.READ:
             tier = max(declared_tier, floor)
 
+        # F28: the ceiling, checked against the EFFECTIVE (post-floor) tier
+        # — see module docstring for why this is not the floor's inverse
+        # (a refusal, not a reshaping) and why it has to compose against
+        # `tier` rather than `declared_tier` alone. Checked before any
+        # tier-specific branch below: a ceiling violation must never reach
+        # the CONFIRM branch and pop a dialog, request an audit-required
+        # allow, or do anything else that branch does — it is refused here,
+        # once, the same way an unknown-tier value never reaches a branch
+        # either. `isinstance(tier, Tier)` guards the same unknown-tier
+        # path the floor check above guards, for the same reason.
+        if ceiling is not None and isinstance(tier, Tier) and tier > ceiling:
+            return self._deny_audited(skill, params, declared_tier, tier, floor, "presence_required", ceiling=ceiling)
+
         if tier is Tier.CONFIRM:
             if self._confirm_channel is None:
-                return self._deny_audited(skill, params, declared_tier, tier, floor, "no_confirm_channel")
+                return self._deny_audited(skill, params, declared_tier, tier, floor, "no_confirm_channel", ceiling=ceiling)
             # F46/T2.0: what the human actually SEES is `params` overlaid
             # with `confirm_display` (a skill's `resolve_for_confirm`
             # result, threaded in by SkillSpec.invoke() — computed before
@@ -193,29 +252,30 @@ class Ladder:
                 approved = bool(await self._confirm_channel.request(skill, shown_params))
             except ConfirmTimeout as exc:
                 logger.warning("confirm channel timed out for skill '%s': %s", skill.name, exc)
-                return self._deny_audited(skill, params, declared_tier, tier, floor, "confirm_timed_out")
+                return self._deny_audited(skill, params, declared_tier, tier, floor, "confirm_timed_out", ceiling=ceiling)
             except Exception as exc:  # noqa: BLE001 — any other broken-channel failure must deny, never crash the ladder or hang
                 logger.error("confirm channel raised during authorize(skill=%s): %s", skill.name, exc)
-                return self._deny_audited(skill, params, declared_tier, tier, floor, "confirm_channel_error")
+                return self._deny_audited(skill, params, declared_tier, tier, floor, "confirm_channel_error", ceiling=ceiling)
             if not approved:
-                return self._deny_audited(skill, params, declared_tier, tier, floor, "confirm_declined")
-            return self._allow_with_required_audit(skill, params, declared_tier, tier, floor)
+                return self._deny_audited(skill, params, declared_tier, tier, floor, "confirm_declined", ceiling=ceiling)
+            return self._allow_with_required_audit(skill, params, declared_tier, tier, floor, ceiling=ceiling)
 
         if tier is Tier.ACT:
-            return self._allow_with_required_audit(skill, params, declared_tier, tier, floor)
+            return self._allow_with_required_audit(skill, params, declared_tier, tier, floor, ceiling=ceiling)
 
         if tier is Tier.READ:
-            return self._allow_with_degrading_audit(skill, params, declared_tier, tier, floor)
+            return self._allow_with_degrading_audit(skill, params, declared_tier, tier, floor, ceiling=ceiling)
 
         raise TypeError(f"Ladder.authorize(): unknown tier {tier!r} for skill {skill.name!r}")
 
     def _allow_with_required_audit(
         self, skill: SkillSpec, params: dict[str, Any], declared_tier: Tier, tier: Tier, floor: Tier | None,
+        *, ceiling: Tier | None = None,
     ) -> Decision:
         """ACT/CONFIRM path: an audit-write failure here is a deny, not a
         swallowed error and not a proceed-anyway."""
         try:
-            self._record(skill, params, declared_tier, tier, floor, "allow")
+            self._record(skill, params, declared_tier, tier, floor, "allow", ceiling=ceiling)
         except AuditWriteError as exc:
             logger.error(
                 "audit write failed for %s-tier skill '%s' — denying rather than proceeding on an unrecorded action: %s",
@@ -226,12 +286,13 @@ class Ladder:
 
     def _allow_with_degrading_audit(
         self, skill: SkillSpec, params: dict[str, Any], declared_tier: Tier, tier: Tier, floor: Tier | None,
+        *, ceiling: Tier | None = None,
     ) -> Decision:
         """READ path: still audited every time ("free" means UX cost, not
         unaudited), but a write failure degrades — logs a WARNING naming the
         gap and proceeds — because READ is defined as free/reversible."""
         try:
-            self._record(skill, params, declared_tier, tier, floor, "allow")
+            self._record(skill, params, declared_tier, tier, floor, "allow", ceiling=ceiling)
         except AuditWriteError as exc:
             logger.warning(
                 "audit write failed for READ-tier skill '%s' — proceeding anyway (READ degrades, it does not deny): %s",
@@ -241,6 +302,7 @@ class Ladder:
 
     def _deny_audited(
         self, skill: SkillSpec, params: dict[str, Any], declared_tier: Tier, tier: Tier, floor: Tier | None, reason: str,
+        *, ceiling: Tier | None = None,
     ) -> Decision:
         """A denial must itself be audited and loud — a denied CONFIRM with
         no audit trail is invisible to the one person who could notice the
@@ -248,7 +310,7 @@ class Ladder:
         decision is still a deny (it already was one); we can only log the
         gap, not retry into a rule that just proved it can't write."""
         try:
-            self._record(skill, params, declared_tier, tier, floor, "deny", reason=reason)
+            self._record(skill, params, declared_tier, tier, floor, "deny", reason=reason, ceiling=ceiling)
         except AuditWriteError as exc:
             logger.error(
                 "audit write failed while recording a '%s' denial for skill '%s': %s",
@@ -319,6 +381,7 @@ class Ladder:
         decision: str,
         *,
         reason: str | None = None,
+        ceiling: Tier | None = None,
     ) -> None:
         event: dict[str, Any] = {
             "kind": "ladder.authorize",
@@ -334,6 +397,13 @@ class Ladder:
         if floor is not None:
             event["floor"] = floor.value
             event["tier_raised_by_floor"] = tier != declared_tier
+        # Same rule, F28's ceiling: present only when a caller passes one,
+        # whether or not it ended up refusing anything -- "a ceiling of
+        # CONFIRM was checked and satisfied" and "no ceiling was involved"
+        # are different facts, same reasoning as floor's own fields above.
+        if ceiling is not None:
+            event["ceiling"] = ceiling.value
+            event["ceiling_exceeded"] = tier > ceiling
         if reason is not None:
             event["reason"] = reason
         self._audit.record(event)  # raises AuditWriteError on failure — propagates to the caller above

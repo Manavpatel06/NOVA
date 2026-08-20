@@ -61,6 +61,7 @@ from nova.log import get_logger
 from nova.security.audit import AuditLog
 from nova.security.confirm import DialogConfirmChannel
 from nova.security.ladder import Ladder
+from nova.security.tiers import ArmedBy
 from nova.security.untrusted import bind_audit
 from nova.skills.registry import Reply, SkillCtx
 from nova.stt.transcriber import Transcriber
@@ -285,7 +286,7 @@ class NovaApp:
         pcm = np.concatenate(frames)
         duration_s = len(pcm) / 16000
         _log.info("ptt.end (mode=%s): captured %.2fs of audio", event.mode, duration_s)
-        await self.run_turn(pcm, source=f"ptt:{event.mode}", turn_id=turn_id)
+        await self.run_turn(pcm, source=f"ptt:{event.mode}", armed_by=ArmedBy.PTT, turn_id=turn_id)
 
     def _next_turn_id(self) -> str:
         """Mint the next turn_id -- see the T2.2 comment in __init__ for why
@@ -333,7 +334,12 @@ class NovaApp:
     # -- the turn ---------------------------------------------------------
 
     async def run_turn(
-        self, pcm: np.ndarray, *, source: str = "capture", turn_id: str | None = None
+        self,
+        pcm: np.ndarray,
+        *,
+        source: str = "capture",
+        armed_by: ArmedBy = ArmedBy.PTT,
+        turn_id: str | None = None,
     ) -> Reply | None:
         """Run one full turn: STT -> router -> ladder-gated skill -> TTS.
         Returns the skill's Reply, or None if the turn ended in a spoken
@@ -346,6 +352,17 @@ class NovaApp:
         directly -- `scripts/probe_turn.py`, the test suite -- without going
         through `_on_ptt_end` at all; a fresh id is minted rather than
         leaving marks unpublishable.
+
+        `armed_by` (F28) is threaded into `SkillCtx` below, honestly --
+        `source` stays a free-text log label (`"ptt:tap"`, `"wake"`, ...)
+        and is deliberately NOT parsed to derive this; a security-relevant
+        signal must come from a real typed value the caller passes on
+        purpose, not from string-matching a label meant for humans reading
+        a log line. `_on_ptt_end` passes `ArmedBy.PTT` explicitly (the
+        default here matches it, since every non-turn-loop caller --
+        scripts, tests -- is implicitly "as if a human pressed the
+        hotkey", the unrestricted case); the wake word's handler passes
+        `ArmedBy.WAKE`.
         """
         if turn_id is None:
             turn_id = self._next_turn_id()
@@ -402,7 +419,7 @@ class NovaApp:
 
                 # --- skill, through the ladder's one entry point ----------
                 assert match.spec is not None
-                ctx = SkillCtx(config=self.config, ladder=self.ladder)
+                ctx = SkillCtx(config=self.config, ladder=self.ladder, armed_by=armed_by)
                 try:
                     reply = await match.spec.invoke(ctx, **match.params)
                 except Exception as exc:
