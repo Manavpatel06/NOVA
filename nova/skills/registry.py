@@ -21,7 +21,7 @@ from typing import TYPE_CHECKING, Any, Awaitable, Callable
 
 from nova.config import Config
 from nova.log import get_logger
-from nova.security.tiers import ArmedBy, Tier
+from nova.security.tiers import ArmedBy, Origin, Tier
 from nova.security.untrusted import Untrusted
 
 logger = get_logger("skills.registry")
@@ -174,20 +174,33 @@ class SkillCtx:
     Ladder (with a real AuditLog) at boot and threads it through here.
 
     `armed_by` (F28, T2.4's shared seam): how THIS turn was armed, honestly
-    threaded from `nova/app.py`'s bus handlers (`_on_ptt_end` / the wake
-    word's `_on_wake_end`, once wired) — never guessed or reconstructed
-    downstream. `invoke()` below turns it into `Ladder.authorize()`'s
-    `ceiling=` keyword; see `nova/security/tiers.py`'s `ArmedBy` and
-    `nova/security/ladder.py`'s module docstring for what it does and why
-    it is not the floor's inverse. Defaults to `ArmedBy.PTT` — the
-    unrestricted case — so every existing call site (every test fixture,
-    every skill invoked outside the real turn loop) is unaffected unless it
-    deliberately constructs a wake-armed context.
+    threaded from `nova/app.py`'s bus handlers (`_on_ptt_end` /
+    `_on_wake_end`) — never guessed or reconstructed downstream. `invoke()`
+    below turns it into `Ladder.authorize()`'s `ceiling=` keyword; see
+    `nova/security/tiers.py`'s `ArmedBy` and `nova/security/ladder.py`'s
+    module docstring for what it does and why it is not the floor's
+    inverse. Defaults to `ArmedBy.PTT` — the unrestricted case — so every
+    existing call site (every test fixture, every skill invoked outside
+    the real turn loop) is unaffected unless it deliberately constructs a
+    wake-armed context.
+
+    `origin` (T2.4, docs/THREAT_MODEL_CLAUDE_FALLTHROUGH.md finding 2):
+    who proposed this call, threaded from `nova/app.py`'s `run_turn()` —
+    `Origin.ROUTER` for a local match, `Origin.CLAUDE` for a
+    `nova.brain.claude_arm.ClaudeProposal` invoked after the router missed.
+    `invoke()` below turns it into `authorize()`'s `floor=` keyword,
+    computed the same way and right alongside `ceiling` above — see
+    `nova/security/tiers.py`'s `Origin` and `ladder.py`'s module docstring
+    for why a Claude-proposed action in a wake-armed turn carries both at
+    once, and why the ceiling wins rather than either canceling the other.
+    Defaults to `Origin.ROUTER` for the same backward-compatibility reason
+    `armed_by` defaults to `ArmedBy.PTT`.
     """
 
     config: Config
     ladder: "Ladder"
     armed_by: ArmedBy = ArmedBy.PTT
+    origin: Origin = Origin.ROUTER
 
 
 @dataclass(frozen=True)
@@ -195,6 +208,22 @@ class SkillSpec:
     name: str
     tier: Tier
     examples: tuple[str, ...]
+    # T2.4 (docs/THREAT_MODEL_CLAUDE_FALLTHROUGH.md): a short, one-line
+    # summary written for an external model reading it cold, deciding
+    # between answering directly and proposing this skill -- NOT
+    # `handler.__doc__`, checked and rejected deliberately, not by default.
+    # The four real docstrings that existed when this field was added are
+    # written for a developer maintaining the file: multi-paragraph, cross-
+    # referencing "see module docstring," one ending mid-thought if
+    # truncated to a single line. That's the right shape for its actual
+    # audience and the wrong shape for Claude's system prompt. This is a
+    # second necessary artifact for a second real audience, not a second
+    # source of truth for the same fact -- the same reasoning `Reply.text`
+    # (spoken to Manav) is deliberately not the log line describing the
+    # same event. Required, enforced at import time exactly like `examples`
+    # below (SkillError on empty) -- a skill Claude can't meaningfully
+    # choose between is a registration bug, not a runtime surprise.
+    description: str
     trusts_input: bool
     handler: Handler
     # F46/T2.0: optional. Given `(ctx, params)`, returns a dict of
@@ -287,11 +316,28 @@ class SkillSpec:
         # same separation of concerns as the floor/confirm_display above.
         ceiling = Tier.READ if ctx.armed_by is ArmedBy.WAKE else None
 
+        # T2.4: the floor this call is subject to, derived the identical
+        # way from ctx.origin — Origin.ROUTER (a local match) means no
+        # floor; Origin.CLAUDE means Tier.CONFIRM, the provenance rule
+        # (docs/THREAT_MODEL_CLAUDE_FALLTHROUGH.md finding 2/4: the same
+        # action Manav asked for by voice and one a model inferred are
+        # different events, and READ is exempt regardless — Ladder.
+        # authorize() already carries that exemption, nothing to duplicate
+        # here). Computed right alongside `ceiling` on purpose: a Claude-
+        # proposed action in a wake-armed turn sets BOTH on the same call,
+        # which is exactly the composition authorize() resolves (ceiling
+        # wins) — this is where that becomes reachable from a real
+        # proposal, not just a direct authorize() call.
+        floor = Tier.CONFIRM if ctx.origin is Origin.CLAUDE else None
+        origin = ctx.origin.value if ctx.origin is Origin.CLAUDE else None
+
         # Every caller of a skill goes through here, so this is the one place
         # that enforces the permission ladder and produces an audit record
         # for every invocation, including READ ("free" means no confirmation
         # friction, not unaudited — docs/THREAT_MODEL.md §4).
-        decision = await ctx.ladder.authorize(self, params, ceiling=ceiling, confirm_display=pre_resolution)
+        decision = await ctx.ladder.authorize(
+            self, params, floor=floor, ceiling=ceiling, origin=origin, confirm_display=pre_resolution,
+        )
         if not decision.allowed:
             spoken = _spoken_denial_text(decision.reason)
             return Reply(text=spoken, success=False)
@@ -344,12 +390,19 @@ def skill(
     name: str,
     tier: Tier,
     examples: list[str],
+    description: str,
     trusts_input: bool,
     resolve_for_confirm: ResolveForConfirm | None = None,
 ) -> Callable[[Handler], Handler]:
     """Decorator: registers `name` in the module-level registry at import
-    time. Raises SkillError on a duplicate name, an empty examples list, or
-    a `tier` that isn't a Tier member — all import-time, all loud.
+    time. Raises SkillError on a duplicate name, an empty examples list, an
+    empty description, or a `tier` that isn't a Tier member — all
+    import-time, all loud.
+
+    `description` (T2.4) is a short, one-line summary written for an
+    external model (`nova.brain.claude_arm`) reading it cold — see
+    `SkillSpec.description`'s own comment for why this is deliberately not
+    `handler.__doc__`.
 
     `resolve_for_confirm` (F46/T2.0) is optional and almost always omitted —
     only worth declaring for a skill whose params are a free-text name that
@@ -364,6 +417,8 @@ def skill(
             )
         if not examples:
             raise SkillError(f"skill '{name}': must declare at least one example")
+        if not description or not description.strip():
+            raise SkillError(f"skill '{name}': must declare a non-empty description")
         if name in _REGISTRY:
             existing = _REGISTRY[name]
             raise SkillError(
@@ -375,6 +430,7 @@ def skill(
             name=name,
             tier=tier,
             examples=tuple(examples),
+            description=description,
             trusts_input=trusts_input,
             handler=handler,
             resolve_for_confirm=resolve_for_confirm,

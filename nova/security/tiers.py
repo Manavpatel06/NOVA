@@ -104,3 +104,38 @@ class ArmedBy(Enum):
 
     PTT = "ptt"
     WAKE = "wake"
+
+
+class Origin(Enum):
+    """T2.4 (nova-security's threat model, docs/THREAT_MODEL_CLAUDE_
+    FALLTHROUGH.md finding 2): who proposed this call — the signal
+    `nova/skills/registry.py`'s `SkillSpec.invoke()` turns into `Ladder.
+    authorize()`'s `floor=` keyword, mirroring exactly how `ArmedBy` above
+    becomes `ceiling=`. This enum only names the source; it does not decide
+    anything, same separation of concerns as `ArmedBy`.
+
+    ROUTER  — the local `Router` matched this call directly against a
+              skill's own declared examples. No floor: Manav asked for
+              this by voice and the router understood him with enough
+              confidence to act — that's what ACT/CONFIRM's "logged, not
+              confirmed" calibration was already priced against.
+    CLAUDE  — `nova.brain.claude_arm.ask()` proposed this call after the
+              router missed or scored below its confidence floor. Floor of
+              CONFIRM: the same action Manav asked for by voice and one a
+              model *inferred* from that voice are different events (the
+              lead's framing) — "Claude proposes, NOVA disposes" is only
+              true if a proposal costs strictly more scrutiny than a
+              direct match, never the same amount. F47 (READ exempt from
+              any floor) applies here exactly as it does to `ArmedBy` — a
+              Claude-proposed `time` call is not gated behind a dialog,
+              because nothing about *who* asked changes what the world
+              looks like afterward.
+
+    Co-located with `Tier`/`ArmedBy` for the same reason both live here:
+    a security primitive `Ladder.authorize()`'s docstring references
+    directly belongs where the ladder is defined, not in whichever module
+    first needed it.
+    """
+
+    ROUTER = "router"
+    CLAUDE = "claude"

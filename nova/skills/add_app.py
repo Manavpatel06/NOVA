@@ -295,6 +295,11 @@ def _remove_learned_app(name: str) -> None:
         "add obs",
         "add postman",
     ],
+    description=(
+        "Find an app by name in the Windows Start Menu, ask for approval, then add it "
+        "to the allowed-apps list and launch it. One parameter: app (str) -- the app's "
+        "name. Only for an app NOT already on the allowed-apps list; use open_app for one that is."
+    ),
     trusts_input=False,
     resolve_for_confirm=_resolve_for_confirm,
 )

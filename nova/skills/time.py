@@ -17,6 +17,7 @@ from nova.skills.registry import Reply, SkillCtx, skill
         "tell me the time",
         "current time",
     ],
+    description="Report the current local time. No parameters.",
     trusts_input=False,
 )
 async def time_skill(ctx: SkillCtx) -> Reply:

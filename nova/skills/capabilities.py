@@ -81,6 +81,7 @@ def _build_reply() -> str:
         "list your skills",
         "what commands do you understand",
     ],
+    description="Report what NOVA can currently do, read live from the skill registry. No parameters.",
     trusts_input=False,
 )
 async def capabilities(ctx: SkillCtx) -> Reply:

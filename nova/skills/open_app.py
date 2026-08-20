@@ -124,6 +124,11 @@ async def _resolve_for_confirm(ctx: SkillCtx, params: dict) -> dict:
         "open task manager",
         "open control panel",
     ],
+    description=(
+        "Launch an application already on the allowed-apps list by name, e.g. "
+        "'notepad', 'calculator', 'file explorer'. One parameter: app (str) -- "
+        "the app's name. An app not already on the list will be refused, not launched."
+    ),
     trusts_input=False,
     resolve_for_confirm=_resolve_for_confirm,
 )
