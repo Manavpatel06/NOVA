@@ -131,6 +131,39 @@ def _content_tokens(text: str) -> set[str]:
 def _similarity(text: str, example: str) -> float:
     text_tokens = _content_tokens(text)
     example_tokens = _content_tokens(example)
+
+    # F43 (nova-security, HIGH): if BOTH sides reduce to zero content
+    # tokens, there are no content words to compare -- e.g. "what can you
+    # do" (T2.1's capabilities skill; "what"/"can"/"you"/"do" are all
+    # stopwords) against emoji, an empty transcript, or whitespace/control-
+    # byte noise, all of which are things a real STT pipeline hands the
+    # router on garbled audio, not hypothetical inputs. Falling through to
+    # the normal jaccard/char_ratio math below is wrong two different ways
+    # here: jaccard's 0/0 always resolves to its 0.0 fallback regardless of
+    # whether the two phrases are related, and char_ratio would run
+    # `difflib.SequenceMatcher(None, "", "").ratio()`, which returns 1.0 --
+    # two empty sequences count as "equal" by difflib's convention -- so
+    # *every* zero-content-token pair, matching or not, blended to a flat
+    # 0.5 and cleared the confidence floor (0.42). Caught by
+    # test_adversarial_input_always_degrades_to_a_clarification_never_a_crash
+    # (emoji case) the moment T2.1 added the first all-stopword example
+    # this registry has ever had.
+    #
+    # The fix is not a flat 0.0 either: "what can you do" must still match
+    # itself (it's one of capabilities' mandated examples), and a flat 0.0
+    # would refuse that as readily as it refuses emoji, throwing away the
+    # one case where an all-stopword phrase genuinely is the signal. So
+    # when there are no content words on either side, the function words
+    # themselves are the only signal left -- compare *those*, honestly,
+    # instead of pretending there's none (0.0) or that absence-of-signal
+    # is agreement (the difflib-on-two-empty-strings behavior above).
+    # Sorted the same way the content-token path sorts its tokens, for the
+    # same word-order-robustness reason.
+    if not text_tokens and not example_tokens:
+        text_raw = " ".join(sorted(_tokenize(text)))
+        example_raw = " ".join(sorted(_tokenize(example)))
+        return difflib.SequenceMatcher(None, text_raw, example_raw).ratio()
+
     union = text_tokens | example_tokens
     jaccard = len(text_tokens & example_tokens) / len(union) if union else 0.0
     # Char-level ratio runs over the stopword-stripped, sorted-and-rejoined
