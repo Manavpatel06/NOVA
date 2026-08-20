@@ -87,6 +87,32 @@ def _resolve_and_verify(name: str, ctx: SkillCtx) -> tuple[Path, str] | tuple[No
     return resolved, ""
 
 
+async def _resolve_for_confirm(ctx: SkillCtx, params: dict) -> dict:
+    """F46/T2.0: what a CONFIRM prompt shows for this skill, in place of the
+    raw free-text `app` name — open_app is ACT-tier today, so nothing calls
+    this yet in production, but a floor (F28/T2.4) can raise ACT to CONFIRM,
+    and when that happens consent must be to the resolved executable path,
+    not to the word a human said. Reuses the exact same
+    `_is_url_or_unc_shaped` / `_resolve_and_verify` checks `open_app()`
+    itself runs — display-only, and deliberately NOT cached or reused by
+    the handler below: `open_app()` still calls `_resolve_and_verify` again,
+    itself, at actual launch time, exactly as it did before this existed
+    (constitution rule 3 — a resolution is never trusted to still mean the
+    same thing later, including a resolution this very function produced
+    moments earlier for display).
+    """
+    app = params.get("app")
+    if not isinstance(app, str) or not app.strip():
+        return {"app": "(no app name given)"}
+    if _is_url_or_unc_shaped(app):
+        return {"app": f"{app!r} (would be refused: looks like a URL or network path)"}
+
+    resolved, reason = _resolve_and_verify(app.strip().lower(), ctx)
+    if resolved is None:
+        return {"app": f"{app!r} (would be refused: {reason})"}
+    return {"app": str(resolved)}
+
+
 @skill(
     name="open_app",
     tier=Tier.ACT,
@@ -98,6 +124,7 @@ def _resolve_and_verify(name: str, ctx: SkillCtx) -> tuple[Path, str] | tuple[No
         "open control panel",
     ],
     trusts_input=False,
+    resolve_for_confirm=_resolve_for_confirm,
 )
 async def open_app(ctx: SkillCtx, app: str) -> Reply:
     """Launch a known Windows application by name. `app` is resolved only

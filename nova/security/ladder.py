@@ -143,7 +143,14 @@ class Ladder:
         self._audit = audit
         self._confirm_channel = confirm_channel
 
-    async def authorize(self, skill: SkillSpec, params: dict[str, Any], *, floor: Tier | None = None) -> Decision:
+    async def authorize(
+        self,
+        skill: SkillSpec,
+        params: dict[str, Any],
+        *,
+        floor: Tier | None = None,
+        confirm_display: dict[str, Any] | None = None,
+    ) -> Decision:
         declared_tier = skill.tier
         tier = declared_tier
 
@@ -166,13 +173,24 @@ class Ladder:
         if tier is Tier.CONFIRM:
             if self._confirm_channel is None:
                 return self._deny_audited(skill, params, declared_tier, tier, floor, "no_confirm_channel")
+            # F46/T2.0: what the human actually SEES is `params` overlaid
+            # with `confirm_display` (a skill's `resolve_for_confirm`
+            # result, threaded in by SkillSpec.invoke() — computed before
+            # this call, since it must reflect the state of the world at
+            # the moment the ladder is about to ask, not after). Only the
+            # display copy is overlaid; `params` itself — what's audited
+            # and, once approved, what the handler actually receives —
+            # is untouched. A skill with no resolve_for_confirm passes
+            # confirm_display=None and this is a no-op, same behavior as
+            # before F46.
+            shown_params = {**params, **confirm_display} if confirm_display else params
             # Three distinct causes, three distinct audited reasons — a
             # human declining and a channel that never asked anyone are not
             # the same fact, and collapsing them would put a false
             # statement in the log (docs/THREAT_MODEL.md §1.4 amendment,
             # lead's ruling 2026-08-18).
             try:
-                approved = bool(await self._confirm_channel.request(skill, params))
+                approved = bool(await self._confirm_channel.request(skill, shown_params))
             except ConfirmTimeout as exc:
                 logger.warning("confirm channel timed out for skill '%s': %s", skill.name, exc)
                 return self._deny_audited(skill, params, declared_tier, tier, floor, "confirm_timed_out")
@@ -237,6 +255,31 @@ class Ladder:
                 reason, skill.name, exc,
             )
         return Decision.deny(reason)
+
+    def record_denial(self, skill: SkillSpec, params: dict[str, Any], reason: str) -> None:
+        """Audit a refusal decided OUTSIDE authorize() itself — today, only
+        SkillSpec.invoke()'s post-authorize resolve_for_confirm consistency
+        check (F46/T2.0): a skill's own resolved detail disagreeing with
+        itself between what a CONFIRM prompt showed and the moment the
+        ladder actually returned is refused before the handler ever runs,
+        and that refusal deserves exactly the audit trail a Decision.deny
+        gets (docs/THREAT_MODEL.md §4: "free" or "already decided" never
+        means "unaudited"). Deliberately public: this is the seam a caller
+        reaches for when IT is the one refusing, not the ladder's own
+        `authorize()` decision — the ladder still owns the audit record's
+        shape (`_record`), the caller does not get to invent its own.
+
+        Best-effort like `_deny_audited`: the refusal already happened and
+        cannot be retroactively changed by a write failure here, so a
+        failure is logged, not raised or escalated.
+        """
+        try:
+            self._record(skill, params, skill.tier, skill.tier, None, "deny", reason=reason)
+        except AuditWriteError as exc:
+            logger.error(
+                "audit write failed while recording a '%s' refusal for skill '%s': %s",
+                reason, skill.name, exc,
+            )
 
     def _record(
         self,
