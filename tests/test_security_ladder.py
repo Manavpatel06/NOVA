@@ -426,3 +426,134 @@ async def test_a_non_tier_declared_tier_with_a_floor_still_raises_type_error_not
     ladder = Ladder(audit)
     with pytest.raises(TypeError):
         await ladder.authorize(bogus, {}, floor=Tier.CONFIRM)
+
+
+# ---------------------------------------------------------------------------
+# F28: the `ceiling=` keyword -- unit coverage for the mechanism itself, in
+# isolation from any real caller. tests/test_app_wake_arming.py separately
+# proves nova/app.py actually FEEDS this the right value from a real
+# wake.end event; these tests prove the mechanism does the right thing once
+# fed one, which that end-to-end suite builds on top of rather than
+# re-proving from scratch.
+# ---------------------------------------------------------------------------
+
+
+async def test_a_ceiling_refuses_a_higher_effective_tier():
+    audit = _FakeAudit()
+    ladder = Ladder(audit)
+    decision = await ladder.authorize(_make_skill(Tier.ACT), {}, ceiling=Tier.READ)
+
+    assert decision.allowed is False
+    assert decision.reason == "presence_required"
+
+
+async def test_a_ceiling_equal_to_the_effective_tier_does_not_refuse():
+    """Tier.READ > Tier.READ is False -- a ceiling equal to the effective
+    tier permits it, exactly the F47-composes-with-F28 case
+    (docs/THREAT_MODEL_ALWAYS_ON.md: a wake-armed READ skill must succeed,
+    not be refused)."""
+    audit = _FakeAudit()
+    ladder = Ladder(audit)
+    decision = await ladder.authorize(_make_skill(Tier.READ), {}, ceiling=Tier.READ)
+
+    assert decision == Decision.allow()
+
+
+async def test_a_ceiling_higher_than_the_effective_tier_does_not_refuse():
+    audit = _FakeAudit()
+    ladder = Ladder(audit)
+    decision = await ladder.authorize(_make_skill(Tier.READ), {}, ceiling=Tier.CONFIRM)
+
+    assert decision == Decision.allow()
+
+
+async def test_ceiling_is_checked_against_the_post_floor_tier_not_the_bare_declaration():
+    """The module docstring's specific claim: checked against the EFFECTIVE
+    (post-floor) tier, not the declared one -- so a future provenance floor
+    can never let a call slip under a presence ceiling. An ACT-declared
+    skill raised to CONFIRM by a floor, under a ceiling of ACT, must be
+    refused -- checking against the bare declared ACT (<= ceiling ACT)
+    would have wrongly let it through."""
+    audit = _FakeAudit()
+    ladder = Ladder(audit)
+    decision = await ladder.authorize(_make_skill(Tier.ACT), {}, floor=Tier.CONFIRM, ceiling=Tier.ACT)
+
+    assert decision.allowed is False
+    assert decision.reason == "presence_required"
+
+
+async def test_ceiling_violation_is_audited_with_the_reason_and_ceiling_fields():
+    audit = _FakeAudit()
+    ladder = Ladder(audit)
+    await ladder.authorize(_make_skill(Tier.ACT), {}, ceiling=Tier.READ)
+
+    record = audit.records[-1]
+    assert record["decision"] == "deny"
+    assert record["reason"] == "presence_required"
+    assert record["ceiling"] == "read"
+    assert record["ceiling_exceeded"] is True
+
+
+async def test_ceiling_is_absent_from_the_audit_record_when_not_passed():
+    """Same 'presence only when actually passed' rule floor already
+    follows -- its absence means 'no ceiling was involved in this call',
+    not a third, ambiguous state alongside True/False."""
+    audit = _FakeAudit()
+    ladder = Ladder(audit)
+    await ladder.authorize(_make_skill(Tier.READ), {})
+
+    record = audit.records[-1]
+    assert "ceiling" not in record
+    assert "ceiling_exceeded" not in record
+
+
+async def test_ceiling_passed_but_not_exceeded_still_appears_in_the_audit_record():
+    """'Appears in the audit record whenever a caller passes one, whether
+    or not it ended up refusing anything' -- the module docstring's own
+    claim, pinned directly: a satisfied ceiling still shows up as
+    ceiling_exceeded=False, not omitted just because nothing was refused."""
+    audit = _FakeAudit()
+    ladder = Ladder(audit)
+    decision = await ladder.authorize(_make_skill(Tier.READ), {}, ceiling=Tier.CONFIRM)
+
+    assert decision == Decision.allow()
+    record = audit.records[-1]
+    assert record["decision"] == "allow"
+    assert record["ceiling"] == "confirm"
+    assert record["ceiling_exceeded"] is False
+
+
+async def test_ceiling_violation_is_checked_before_the_confirm_branch_never_pops_a_dialog():
+    """Structural guarantee the module docstring makes explicitly: a
+    ceiling violation must be refused BEFORE the CONFIRM branch runs at
+    all -- proven here by an approving channel that would grant the call
+    if it were ever asked, and confirming it never was."""
+    audit = _FakeAudit()
+
+    class _ChannelThatMustNeverBeAsked:
+        def __init__(self):
+            self.asked = False
+
+        async def request(self, skill, params):
+            self.asked = True
+            return True  # would approve -- must never get the chance to
+
+    channel = _ChannelThatMustNeverBeAsked()
+    ladder = Ladder(audit, confirm_channel=channel)
+
+    decision = await ladder.authorize(_make_skill(Tier.CONFIRM), {}, ceiling=Tier.READ)
+
+    assert decision.allowed is False
+    assert decision.reason == "presence_required"
+    assert channel.asked is False, "the confirm channel was asked despite the ceiling already refusing the call"
+
+
+async def test_a_non_tier_declared_tier_with_a_ceiling_still_raises_type_error_not_a_comparison_error():
+    bogus = SkillSpec(
+        name="bogus", tier="not-a-real-tier", examples=("x",), trusts_input=False,  # type: ignore[arg-type]
+        handler=_dummy_handler,
+    )
+    audit = _FakeAudit()
+    ladder = Ladder(audit)
+    with pytest.raises(TypeError):
+        await ladder.authorize(bogus, {}, ceiling=Tier.READ)
