@@ -228,6 +228,13 @@ class SttConfig:
 class TtsConfig:
     """Consumed by nova.tts (Synthesizer)."""
 
+    #: Set false to make NOVA print replies instead of speaking them.
+    #: Deliberate muting, NOT the "never go silently mute" failure case --
+    #: nova/app.py's _speak() returns early at INFO and prints, never logging
+    #: a warning and never reaching the SAPI fallback, because nothing has
+    #: gone wrong. Useful when Manav is working at the same desk NOVA is
+    #: talking at.
+    speak: bool = True
     voice: str = "af_heart"  # Kokoro voice id
     #: F7: bounded 0.25-4.0, matching the speaking-rate range public TTS APIs
     #: (e.g. Google Cloud TTS's speakingRate) document as their own sane

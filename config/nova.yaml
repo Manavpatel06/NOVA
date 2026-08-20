@@ -15,6 +15,11 @@ stt:
   language: en
 
 tts:
+  # false = NOVA prints its replies instead of speaking them.
+  # Deliberate muting, not a fault: nothing warns, and the SAPI
+  # fallback is never reached. Flip this when you're working at the
+  # same desk NOVA is talking at.
+  speak: true
   voice: af_heart      # Kokoro voice id
   speed: 1.0
 

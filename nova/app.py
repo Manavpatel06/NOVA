@@ -43,6 +43,27 @@ source (a TV, a person who isn't Manav) saying something wake-phrase-shaped
 can reach READ at most, never ACT/CONFIRM. Both were checked as landed,
 not assumed, before this wiring went in.
 
+**T2.4: when the router misses, Claude proposes and NOVA disposes**
+(docs/M2_OPEN_BRAIN_PLAN.md, docs/THREAT_MODEL_CLAUDE_FALLTHROUGH.md).
+Only the router's below-confidence-floor case falls through
+(`_run_claude_fallthrough`'s own docstring states, and argues, why an
+ambiguous match or a missing-param clarification stay local instead — both
+are cases NOVA can resolve by asking, faster and for free, where Claude
+would cost a multi-second round trip and a transcript egress to arrive at
+a guess). `nova.brain.claude_arm.ask()` returns a structured
+`ClaudeAnswer` (spoken, no action) or `ClaudeProposal` — bound and
+authorized through the *identical* `SkillSpec.invoke()` / `Ladder.
+authorize()` path a router match goes through, `SkillCtx.origin=
+Origin.CLAUDE` applying T2.4's provenance floor (`floor=Tier.CONFIRM`,
+READ exempt per F47) the same way `armed_by` applies F28's presence
+ceiling — there is no second path to a tool call, and Claude cannot
+invent a capability NOVA doesn't already have (an unrecognized
+`skill_name` is refused and audited, never attempted). An immediate
+spoken acknowledgment covers "say something immediately" (a multi-second
+silence reads as a hang, not thinking) — see `_run_claude_fallthrough`'s
+docstring for how that interacts honestly with T2.2's `first_audio_out`
+metric rather than gaming it.
+
 Every skill call goes through `SkillSpec.invoke()` — never a handler
 directly — because that is the seam `nova-dev-sec` wired `Ladder.authorize()`
 into (`SkillCtx.ladder`, required, not optional-with-a-None-default). This
@@ -76,6 +97,7 @@ instrumentation exists to price.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import queue
 import time
 from typing import Any
@@ -87,6 +109,8 @@ from nova.audio.capture import Capture
 from nova.audio.duplex import DuplexGate
 from nova.audio.player import Player
 from nova.audio.wake import TOPIC_WAKE_END, TOPIC_WAKE_START, WakeEvent, WakeWord
+from nova.brain import claude_arm
+from nova.brain.claude_arm import ClaudeAnswer, ClaudeFailure, ClaudeProposal
 from nova.brain.router import Router
 from nova.config import Config, load_config
 from nova.governor import TOPIC_TURN_END, TOPIC_TURN_START, Governor
@@ -95,10 +119,11 @@ from nova.interfaces.tray import TOPIC_SPEAK_END, TOPIC_SPEAK_START, Tray
 from nova.log import get_logger
 from nova.security.audit import AuditLog
 from nova.security.confirm import DialogConfirmChannel
+from nova.security.egress import Egress
 from nova.security.ladder import Ladder
-from nova.security.tiers import ArmedBy
+from nova.security.tiers import ArmedBy, Origin
 from nova.security.untrusted import bind_audit
-from nova.skills.registry import Reply, SkillCtx
+from nova.skills.registry import Reply, SkillCtx, get_skill
 from nova.stt.transcriber import Transcriber
 from nova.telemetry import TOPIC_LATENCY_MARK, LatencyLog, LatencyMark
 from nova.tts.synthesizer import Synthesizer
@@ -108,6 +133,45 @@ _log = get_logger(__name__)
 #: how often the capture reader thread re-checks the stop flag while
 #: waiting for the next audio frame (Capture.read()'s timeout= parameter)
 _CAPTURE_POLL_S = 0.2
+
+#: T2.4: wall-clock budget for one Claude fallthrough round trip. Lower
+#: than claude_arm.DEFAULT_TIMEOUT_S (30s) on purpose -- that default was
+#: picked for a different verification (claude_arm's own kill-on-timeout
+#: proof, docs/T2.4A_CLAUDE_ARM.md) and is explicitly labelled a
+#: placeholder there too. 30s here specifically means run_turn()'s
+#: _turn_lock -- held for this call's entire duration -- makes NOVA
+#: unresponsive to a fresh PTT press for up to 30s on a hang; there is no
+#: barge-in rescue for this window either, since barge-in cancels
+#: *playback* and NOVA is silent while waiting on Claude. 15s, same
+#: provisional-value-with-its-reasoning-attached style as DuplexGate's
+#: hangover_ms: a starting number, not a measured one, to be replaced once
+#: the claude_dispatched/claude_returned marks below produce a real
+#: distribution to tune it against.
+_CLAUDE_TIMEOUT_S = 15.0
+
+#: T2.4: spoken before awaiting claude_arm.ask() -- "say something
+#: immediately" (docs/M2_OPEN_BRAIN_PLAN.md T2.4), because a multi-second
+#: silence reads as a hang, not thinking. This IS the turn's real
+#: first_audio_out (see run_turn()'s Claude-fallthrough branch for why
+#: that's an honest, not a misleading, use of the mark).
+_CLAUDE_ACK_TEXT = "Let me think about that."
+
+#: T2.4: a plain spoken failure per reason (docs/THREAT_MODEL_CLAUDE_
+#: FALLTHROUGH.md finding 6 -- "never fail silently, not hang", and never
+#: partially/best-effort act on a failure either). `None` is the fallback
+#: for a reason string this dict doesn't recognize (defensive: claude_arm's
+#: own ClaudeFailure.reason is documented as one of a fixed set, but this
+#: app must not crash speaking about a failure just because that set grew
+#: without this dict being updated to match).
+_CLAUDE_FAILURE_TEXT: dict[str | None, str] = {
+    "cli_not_found": "I can't reach Claude right now.",
+    "spawn_failed": "I couldn't start that.",
+    "timeout": "That took too long, sorry.",
+    "process_error": "Something went wrong on my end.",
+    "model_error": "I got an error back, sorry.",
+    "unparseable_output": "I got a garbled response, sorry.",
+    None: "Sorry, I couldn't get an answer for that.",
+}
 
 
 class NovaApp:
@@ -148,6 +212,22 @@ class NovaApp:
         self.ladder = Ladder(
             self.audit,
             confirm_channel=DialogConfirmChannel(redact_terms=self.config.security.redact_terms),
+        )
+        # T2.4: the one sanctioned egress boundary, for claude_arm.ask()'s
+        # release_for_process() call. One instance, constructed here and
+        # reused for the app's lifetime -- Egress.__init__ has a real
+        # process-wide side effect (installs a urllib opener that refuses
+        # every redirect), so constructing it per-call would mean
+        # reinstalling that opener on every Claude fallthrough turn for no
+        # reason. allowlist is the real configured one (egress_allowlist),
+        # not an empty stand-in -- release_for_process() doesn't consult it
+        # today, but Egress is meant to be the one instance this app ever
+        # constructs, and a real caller should never hand it a fake
+        # allowlist "because this particular call doesn't need it".
+        self.egress = Egress(
+            self.config.security.egress_allowlist,
+            audit=self.audit,
+            redact_terms=self.config.security.redact_terms,
         )
 
         # --- brain: router reads the live skill registry, populated by the
@@ -605,10 +685,22 @@ class NovaApp:
                 await self._mark(turn_id, "route_decided")
 
                 if match.clarification is not None:
-                    # Constitutional requirement, not an error path: below
-                    # the confidence floor (or ambiguous), NOVA asks rather
-                    # than guesses -- it never acts on a low-confidence
-                    # match as if certain.
+                    # T2.4: below the router's OWN confidence floor (the
+                    # exact value it was constructed with) and no local
+                    # skill matched at all -- "the router finds no skill"
+                    # in docs/M2_OPEN_BRAIN_PLAN.md's own words. This is
+                    # the only clarification sub-case that falls through to
+                    # Claude; see _run_claude_fallthrough's own docstring
+                    # for why ambiguous / missing-param stay local instead.
+                    if match.confidence < self.config.brain.confidence_floor:
+                        return await self._run_claude_fallthrough(
+                            text, source=source, armed_by=armed_by, turn_id=turn_id,
+                        )
+                    # Constitutional requirement, not an error path: an
+                    # ambiguous match or a confidently-identified skill
+                    # missing a param -- NOVA asks rather than guesses (or
+                    # defers to a model that has no more insight into
+                    # Manav's own intent than NOVA already does).
                     _log.info(
                         "Turn (%s): confidence %.3f -- asking for clarification instead of acting",
                         source, match.confidence,
@@ -634,6 +726,136 @@ class NovaApp:
             finally:
                 await self.bus.publish(TOPIC_TURN_END, None)
 
+    def _compose_claude_prompt(self, text: str) -> str:
+        """T2.4's "minimal context" list (docs/M2_OPEN_BRAIN_PLAN.md),
+        literally: the transcript, plus the registered skill names and
+        descriptions -- nothing else. No file contents, no conversation
+        history (this method is stateless -- called fresh every turn, no
+        instance state carried across calls), no machine details.
+
+        Skill descriptions come from `SkillSpec.description` (T2.4, a
+        field written for exactly this -- see its own comment for why it's
+        deliberately not `handler.__doc__`). Parameter names are derived
+        live via `inspect.signature()`, excluding `ctx`, never hand-
+        maintained here -- the identical technique `Router._param_names()`
+        already uses privately; duplicated as three lines rather than
+        importing a private method across files.
+
+        The WHOLE returned string is what `claude_arm.ask()` passes to
+        `Egress.release_for_process()` -- one call, one redaction pass,
+        covering the transcript AND every skill description together
+        (docs/THREAT_MODEL_CLAUDE_FALLTHROUGH.md finding 8: route the
+        entire outbound payload through redact(), not just the
+        transcript). This function does not call release_for_process()
+        itself; composing the prompt and releasing it are different jobs,
+        and claude_arm.ask() already owns the second one.
+        """
+        from nova.skills.registry import all_skills
+
+        lines = [f'The user said: "{text}"', "", "Registered skills you may propose:"]
+        for spec in sorted(all_skills().values(), key=lambda s: s.name):
+            param_names = [p for p in inspect.signature(spec.handler).parameters if p != "ctx"]
+            params_desc = f"Params: {', '.join(param_names)}." if param_names else "No parameters."
+            lines.append(f"- {spec.name}: {spec.description} {params_desc}")
+        return "\n".join(lines)
+
+    async def _run_claude_fallthrough(
+        self, text: str, *, source: str, armed_by: ArmedBy, turn_id: str,
+    ) -> Reply | None:
+        """T2.4: the router found no skill it was confident enough to act
+        on. "Claude proposes, NOVA disposes" (docs/M2_OPEN_BRAIN_PLAN.md) --
+        `claude_arm.ask()` returns a structured `ClaudeAnswer` (spoken, no
+        action) or `ClaudeProposal` (bound and authorized through the
+        SAME `SkillSpec.invoke()` / `Ladder.authorize()` path a router
+        match goes through, `SkillCtx.origin=Origin.CLAUDE` applying the
+        provenance floor -- never a second path to a tool call).
+
+        Only called for the router's below-floor case (see run_turn()'s
+        call site) -- deliberately NOT for an ambiguous match (the router
+        already found two real local candidates with nothing about the
+        ambiguity a model can resolve better than just asking) or a
+        missing-param clarification (the router already identified the
+        right skill confidently; asking "which app?" is faster, free, and
+        certainly correct, where Claude would cost a multi-second round
+        trip, an egress of the transcript, and a model GUESSING the same
+        argument NOVA could ask for directly -- confidence-honesty in its
+        purest form: NOVA already knows exactly what it doesn't know).
+
+        Speaks `_CLAUDE_ACK_TEXT` immediately, via `_speak_and_mark` --
+        this turn's real `first_audio_out`, honestly: it IS the first
+        sound Manav hears (T2.2's whole point is time-to-first-sound, not
+        turn-complete). The eventual real reply plays via a plain
+        `_speak()` afterward with no second marks under this turn_id
+        (`LatencyLog._flush()` pops and logs on the first `first_audio_out`
+        -- a second one would misrepresent or double-log, neither right).
+        To keep the round trip itself from hiding behind a fast-looking
+        ack, its own duration gets its own PROMINENT, separately-labelled
+        log line (not folded into the mark-sorted breakdown as just one
+        more stage) -- same principle as F46's audit/display split: two
+        readers, two needs, neither served by collapsing them.
+        """
+        prompt = self._compose_claude_prompt(text)
+        await self._mark(turn_id, "claude_dispatched")
+        await self._speak_and_mark(_CLAUDE_ACK_TEXT, turn_id)
+
+        t0 = time.monotonic()
+        try:
+            result = await claude_arm.ask(
+                prompt, egress=self.egress, audit=self.audit, timeout_s=_CLAUDE_TIMEOUT_S,
+            )
+        except Exception as exc:
+            _log.error("Turn (%s): claude_arm.ask() raised (%s)", source, exc)
+            await self._mark(turn_id, "abort:claude")
+            await self._speak("Sorry, something went wrong reaching Claude.")
+            return None
+        elapsed = time.monotonic() - t0
+        await self._mark(turn_id, "claude_returned")
+        # The prominent line: always logged, whatever the outcome, so
+        # nobody skimming this turn's entry concludes it was fast because
+        # the ack's own first_audio_out was.
+        _log.info("Turn (%s): Claude round trip %.2fs -> %s", source, elapsed, type(result).__name__)
+
+        if isinstance(result, ClaudeFailure):
+            # docs/THREAT_MODEL_CLAUDE_FALLTHROUGH.md finding 6: a plain
+            # spoken failure, never a silent fallthrough to guessing
+            # locally with the router's second-best score -- that would be
+            # the same confidence-honesty violation with an unusual
+            # trigger. No retry; Manav can simply ask again.
+            _log.warning("Turn (%s): Claude fallthrough failed (%s: %s)", source, result.reason, result.detail)
+            await self._speak(_CLAUDE_FAILURE_TEXT.get(result.reason, _CLAUDE_FAILURE_TEXT[None]))
+            return None
+
+        if isinstance(result, ClaudeAnswer):
+            await self._speak(result.text)
+            return Reply(text=result.text, success=True)
+
+        assert isinstance(result, ClaudeProposal)
+        spec = get_skill(result.skill_name)
+        if spec is None:
+            # docs/THREAT_MODEL_CLAUDE_FALLTHROUGH.md finding 8: an
+            # unrecognized skill_name is a refusal, not an attempt --
+            # Claude cannot invent a capability NOVA doesn't have. Audited
+            # as its own distinct event kind (not an ordinary ladder
+            # denial, which requires a real SkillSpec this by definition
+            # isn't) so a pattern of repeated unknown-name proposals is
+            # visible to whoever reviews the log later.
+            _log.warning("Turn (%s): Claude proposed unknown skill_name=%r; refusing", source, result.skill_name)
+            self.ladder.record_event(
+                "claude.propose_unknown_skill", {"skill_name": result.skill_name, "params": result.params},
+            )
+            await self._speak("Sorry, I can't do that.")
+            return None
+
+        ctx = SkillCtx(config=self.config, ladder=self.ladder, armed_by=armed_by, origin=Origin.CLAUDE)
+        try:
+            reply = await spec.invoke(ctx, **result.params)
+        except Exception as exc:
+            _log.error("Turn (%s): Claude-proposed skill %r raised (%s)", source, spec.name, exc)
+            await self._speak(f"Sorry, something went wrong with {spec.name}.")
+            return None
+        await self._speak(reply.text)
+        return reply
+
     async def _speak(self, text: str) -> None:
         """Synthesize and play `text`. NOVA must never go silently mute:
         Synthesizer already falls back to Windows SAPI if Kokoro fails, so
@@ -655,6 +877,21 @@ class NovaApp:
         not own that test."""
         self._last_synth_returned_t = None
         self._last_first_audio_t = None
+
+        # Text mode (config `tts.speak: false`). Deliberate muting, which is a
+        # different thing from the "NOVA must never go silently mute" promise
+        # above -- that promise is about synthesis *failing*. Here nothing has
+        # failed and nothing is wrong, so this logs at INFO and emits the reply
+        # on stdout, and must never log a WARNING/ERROR or reach the SAPI
+        # fallback: a user who asked for text should not be told something
+        # broke. Speak/turn topics are still published so the tray keeps
+        # showing state, and the latency marks simply have no first_audio_out
+        # for this turn, which is honest -- there was no audio.
+        if not self.config.tts.speak:
+            _log.info("Turn reply (text mode, not spoken): %s", text)
+            print(f"NOVA: {text}", flush=True)
+            return
+
         await self.bus.publish(TOPIC_SPEAK_START, None)
         try:
             try:
