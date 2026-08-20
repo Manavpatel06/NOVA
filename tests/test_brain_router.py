@@ -26,7 +26,7 @@ from __future__ import annotations
 
 import pytest
 
-from nova.brain.router import Router
+from nova.brain.router import Router, _similarity
 from nova.security.tiers import Tier
 from nova.security.untrusted import Untrusted
 from nova.skills.registry import Reply, SkillSpec
@@ -403,3 +403,86 @@ def test_documented_param_leak_is_real_against_the_live_registry_not_just_the_fi
         "docstring documents has been fixed against production -- update this "
         "test's framing, don't just relax the assertion"
     )
+
+
+# ---------------------------------------------------------------------------
+# F43: "no signal at all" must not score as a half-match.
+#
+# `_similarity()` has a dedicated branch for when BOTH the input and the
+# example reduce to zero content tokens (all-stopword or non-word input).
+# Before the fix, that case fell through to jaccard=0.0 blended with
+# difflib's "two empty sequences are equal" convention (ratio=1.0),
+# producing a flat 0.5 for every zero-content-token pair -- garbled or
+# unrelated alike -- which cleared the 0.42 floor. The fix compares the
+# stopword-stripped-but-*retained* function words instead of pretending
+# there's no signal (0.0) or that absence-of-signal is agreement (0.5/1.0).
+#
+# These pin `_similarity()` directly, in addition to the router-level
+# adversarial test above, because the router-level test only asserts
+# "< 0.42" -- it can't distinguish "correctly scored near-zero" from
+# "accidentally scored 0.3" the way a direct pin on the primitive can.
+# ---------------------------------------------------------------------------
+
+
+def test_f43_the_mandated_phrase_matches_itself_exactly():
+    """'what can you do' is one of capabilities' own mandated examples
+    (T2.1) and is entirely stopwords. It must still score 1.0 against
+    itself -- a naive 'both sides empty -> return 0.0' guard would break
+    this exact case, which is why the fix compares the retained function
+    words instead of refusing to score them at all."""
+    assert _similarity("what can you do", "what can you do") == 1.0
+
+
+def test_f43_emoji_empty_and_whitespace_all_score_exactly_zero_against_an_all_stopword_example():
+    """The lead's own repro cases for F43: emoji, an empty transcript, and
+    whitespace/control-byte noise -- the shapes a real STT pipeline hands
+    the router on garbled audio -- against 'what can you do'. Before the
+    fix these all scored a flat 0.5 (difflib's empty-sequence convention).
+    They must now score exactly 0.0, not just 'below the floor'."""
+    example = "what can you do"
+    cases = {
+        "emoji": "\U0001F600\U0001F600\U0001F600",
+        "empty_string": "",
+        "whitespace_only": "   ",
+        "control_bytes": "\x00\x01\x02",
+        "newline_tab_only": "\n\t\n\t",
+    }
+    for label, phrase in cases.items():
+        assert _similarity(phrase, example) == 0.0, f"{label} did not score exactly 0.0"
+
+
+def test_f43_an_unrelated_all_stopword_phrase_scores_low_not_a_flat_half_match():
+    """'what's up' is entirely stopwords ('what's' and 'up' are both in
+    _STOPWORDS) and unrelated to 'what can you do' -- both sides reduce to
+    zero content tokens, so this exercises the same branch as the mandated-
+    phrase self-match above, but for two DIFFERENT all-stopword phrases.
+
+    Measured directly against the real function: 0.4167, not the flat 0.5
+    the pre-fix code produced for every zero-content-token pair. It still
+    falls (barely) below the router's 0.42 confidence floor, so the router
+    still asks rather than guesses -- see test_f43_router_level below --
+    but the raw similarity score itself is comparably close to the floor
+    rather than a clean, purpose-built low score. That is a real property
+    of comparing retained function words rather than refusing to score
+    them, worth pinning exactly so a future change to either the stopword
+    list or the fix's comparison strategy is visible here, not just at the
+    router's floor boundary."""
+    score = _similarity("what's up", "what can you do")
+    assert score == pytest.approx(0.4167, abs=0.001)
+    assert score < 0.42  # still below the floor -- the router still clarifies
+
+
+def test_f43_router_level_unrelated_all_stopword_phrase_still_clarifies():
+    router = _router()
+    # Neither M0 fixture skill has an all-stopword example, so this proves
+    # the router-level outcome (ask, don't guess) rather than duplicating
+    # the exact-score pin above, which needs 'what can you do' specifically.
+    match = router.route("what's up")
+    assert match.spec is None
+    assert match.clarification is not None
+
+
+def test_f43_confidence_floor_is_unchanged_at_042():
+    """The fix must not have moved the floor -- only the scoring branch
+    that was producing false-positive half-matches."""
+    assert Router(skills={})._confidence_floor == 0.42

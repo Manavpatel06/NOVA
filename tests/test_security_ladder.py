@@ -274,3 +274,155 @@ async def test_unknown_tier_value_raises_type_error():
     ladder = Ladder(audit)
     with pytest.raises(TypeError):
         await ladder.authorize(bogus, {})
+
+
+# ---------------------------------------------------------------------------
+# F45/T2.0: the shared `floor=` mechanism. Composes as max(declared, floor)
+# via Tier's own real ordering (nova/security/tiers.py) -- can only RAISE
+# the effective tier, never lower it -- and every audited record carries
+# declared_tier/floor/tier_raised_by_floor so *why* an action needed
+# confirming survives in the log. Neither F28 (presence floor) nor T2.4
+# (Claude-provenance floor) is wired to this yet; these tests exercise the
+# mechanism itself, exactly as the module docstring says.
+# ---------------------------------------------------------------------------
+
+
+async def test_no_floor_passed_behaves_exactly_as_before_and_omits_floor_keys():
+    """Backward compatibility: omitting `floor` entirely must not add
+    `floor`/`tier_raised_by_floor` to the audit record at all -- their
+    absence is how a reader distinguishes 'no floor was involved' from a
+    floor that happened not to change anything (module docstring)."""
+    audit = _FakeAudit()
+    ladder = Ladder(audit)
+    decision = await ladder.authorize(_make_skill(Tier.ACT), {})
+
+    assert decision == Decision.allow()
+    record = audit.records[-1]
+    assert record["declared_tier"] == "act"
+    assert record["tier"] == "act"
+    assert "floor" not in record
+    assert "tier_raised_by_floor" not in record
+
+
+async def test_a_floor_raises_a_lower_declared_tier_to_confirm():
+    """An ACT-tier skill under a CONFIRM floor must actually go through the
+    CONFIRM branch -- proved here by the fact that with no confirm channel
+    registered it fails closed with 'no_confirm_channel', which only the
+    CONFIRM branch produces."""
+    audit = _FakeAudit()
+    ladder = Ladder(audit)
+    decision = await ladder.authorize(_make_skill(Tier.ACT), {}, floor=Tier.CONFIRM)
+
+    assert decision.allowed is False
+    assert decision.reason == "no_confirm_channel"
+    record = audit.records[-1]
+    assert record["declared_tier"] == "act"
+    assert record["tier"] == "confirm"
+    assert record["floor"] == "confirm"
+    assert record["tier_raised_by_floor"] is True
+
+
+async def test_a_floor_raised_confirm_can_still_be_approved_via_a_real_channel():
+    audit = _FakeAudit()
+    ladder = Ladder(audit, confirm_channel=_ApprovingChannel())
+    decision = await ladder.authorize(_make_skill(Tier.ACT), {}, floor=Tier.CONFIRM)
+
+    assert decision == Decision.allow()
+    record = audit.records[-1]
+    assert record["tier"] == "confirm"
+    assert record["tier_raised_by_floor"] is True
+
+
+async def test_a_floor_lower_than_the_declared_tier_never_lowers_it():
+    """The floor can only raise, never lower: a CONFIRM-tier skill under an
+    ACT floor must stay CONFIRM -- proved by still failing closed with
+    'no_confirm_channel' rather than the ACT branch's audit-failure-denies
+    behavior."""
+    audit = _FakeAudit()
+    ladder = Ladder(audit)
+    decision = await ladder.authorize(_make_skill(Tier.CONFIRM), {}, floor=Tier.ACT)
+
+    assert decision.allowed is False
+    assert decision.reason == "no_confirm_channel"
+    record = audit.records[-1]
+    assert record["declared_tier"] == "confirm"
+    assert record["tier"] == "confirm"
+    assert record["floor"] == "act"
+    assert record["tier_raised_by_floor"] is False  # unchanged -- not "raised" to its own value
+
+
+async def test_a_floor_equal_to_the_declared_tier_is_not_marked_as_raised():
+    audit = _FakeAudit()
+    ladder = Ladder(audit)
+    decision = await ladder.authorize(_make_skill(Tier.ACT), {}, floor=Tier.ACT)
+
+    assert decision == Decision.allow()
+    record = audit.records[-1]
+    assert record["floor"] == "act"
+    assert record["tier_raised_by_floor"] is False
+
+
+async def test_f47_read_is_exempt_from_any_floor():
+    """F47 (accepted): READ is exempt from any floor, unconditionally. If
+    this exemption were not real, a CONFIRM floor on a READ-tier skill with
+    no confirm channel registered would fail closed -- proving the actual
+    outcome (an unaudited-friction-free allow) is the only way to show the
+    exemption does something, not just that the code has an isinstance
+    check that happens to be unreachable."""
+    audit = _FakeAudit()
+    ladder = Ladder(audit)  # no confirm channel -- if READ were floored to CONFIRM, this would deny
+    decision = await ladder.authorize(_make_skill(Tier.READ), {}, floor=Tier.CONFIRM)
+
+    assert decision == Decision.allow()
+    record = audit.records[-1]
+    assert record["declared_tier"] == "read"
+    assert record["tier"] == "read"  # NOT raised to confirm
+    assert record["floor"] == "confirm"  # the floor was passed...
+    assert record["tier_raised_by_floor"] is False  # ...but had no effect, and that's recorded
+
+
+async def test_f47_read_exemption_holds_even_with_an_approving_channel_present():
+    """Not merely 'it fails closed because there's no channel' -- READ must
+    stay READ (audited once, allowed, no confirm round-trip at all) even
+    when a channel exists and would have approved."""
+    audit = _FakeAudit()
+    channel = _ApprovingChannel()
+    ladder = Ladder(audit, confirm_channel=channel)
+    decision = await ladder.authorize(_make_skill(Tier.READ), {}, floor=Tier.CONFIRM)
+
+    assert decision == Decision.allow()
+    assert audit.records[-1]["tier"] == "read"
+
+
+async def test_floor_composition_uses_the_real_rank_table_not_declaration_order():
+    """Guards against a regression back to F45's original bug: without
+    Tier's real ordering, max(declared, floor) either raises TypeError or
+    silently picks whichever operand happens to come first. Three
+    independent pairings, cross-checked against the documented rank."""
+    audit = _FakeAudit()
+    ladder = Ladder(audit)
+
+    read_floored_by_act = await ladder.authorize(_make_skill(Tier.READ), {}, floor=Tier.ACT)
+    assert audit.records[-1]["tier"] == "read"  # READ exempt regardless of floor
+
+    act_floored_by_read = await ladder.authorize(_make_skill(Tier.ACT), {}, floor=Tier.READ)
+    assert audit.records[-1]["tier"] == "act"  # floor lower than declared: no change
+
+    confirm_floored_by_act = await ladder.authorize(_make_skill(Tier.CONFIRM), {}, floor=Tier.ACT)
+    assert audit.records[-1]["tier"] == "confirm"  # floor lower than declared: no change
+
+
+async def test_a_non_tier_declared_tier_with_a_floor_still_raises_type_error_not_a_keyerror():
+    """The isinstance(declared_tier, Tier) guard around the max() call must
+    protect the unknown-tier path -- a bogus, non-Tier skill.tier with a
+    floor passed must still reach the loud TypeError at the bottom of
+    authorize(), not a confusing KeyError out of the Tier rank table when
+    floor composition tries to look it up."""
+    bogus = SkillSpec(
+        name="bogus", tier="not-a-real-tier", examples=("x",), trusts_input=False,  # type: ignore[arg-type]
+        handler=_dummy_handler,
+    )
+    audit = _FakeAudit()
+    ladder = Ladder(audit)
+    with pytest.raises(TypeError):
+        await ladder.authorize(bogus, {}, floor=Tier.CONFIRM)
