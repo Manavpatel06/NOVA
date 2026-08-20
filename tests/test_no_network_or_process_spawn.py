@@ -50,7 +50,7 @@ _OS_BANNED_ATTRS = {
     "spawnl", "spawnle", "spawnlp", "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe",
 }
 _ASYNCIO_BANNED_ATTRS = {"create_subprocess_exec", "create_subprocess_shell"}
-PROCESS_ALLOWLIST = {"stt/gpu.py", "skills/open_app.py"}
+PROCESS_ALLOWLIST = {"stt/gpu.py", "skills/open_app.py", "brain/claude_arm.py"}
 
 
 def _rel(path: Path) -> str:
@@ -121,12 +121,14 @@ def test_transport_allowlist_is_exactly_one_named_file():
         assert (NOVA_ROOT / rel).is_file(), f"transport allowlist entry {rel} does not exist"
 
 
-def test_process_spawn_allowlist_is_exactly_two_named_files_today():
-    """Three earn it per docs/SECURITY_SPEC.md §3.2, one reserved (M4's
-    Claude CLI adapter, not pre-approved before the file exists) — so two
-    live entries today. A change to this number must be a conscious edit to
+def test_process_spawn_allowlist_is_exactly_three_named_files_today():
+    """Three earn it per docs/SECURITY_SPEC.md §3.2. The third,
+    `nova/brain/claude_arm.py` (T2.4a), was the reserved slot — not
+    pre-approved before the file existed, added the moment it landed, per
+    that section's own reserved-row text ("Not added until M4 actually
+    lands the file"). A change to this number must be a conscious edit to
     this test, not a silently-growing set."""
-    assert len(PROCESS_ALLOWLIST) == 2
+    assert len(PROCESS_ALLOWLIST) == 3
     for rel in PROCESS_ALLOWLIST:
         assert (NOVA_ROOT / rel).is_file(), f"process-spawn allowlist entry {rel} does not exist"
 
