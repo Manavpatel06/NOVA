@@ -41,7 +41,16 @@ security:
     - 'C:\Windows'
     - 'C:\Program Files'
     - 'C:\Program Files (x86)'
-    - 'C:\Program Files\WindowsApps'
+    # NOT here, deliberately: any per-user-writable directory
+    # (%LOCALAPPDATA%, %APPDATA%). Containment only works because an
+    # attacker who can plant a Start Menu shortcut cannot also write
+    # into these dirs -- they are admin-writable. Add a user-writable
+    # one and those two collapse into the same trust level: whoever
+    # plants the shortcut plants its target too. That is why Discord,
+    # VS Code and Steam are refused, and the refusal is correct.
+    # C:\Program Files\WindowsApps was here and was trimmed 2026-08-20:
+    # no allowed_apps entry ever resolved inside it, so it was pure
+    # trust surface with no benefit (nova-security flagged it dormant).
 
   # Manav's own private terms (name, employer, ...) redacted case-
   # insensitively by nova.security.redact. Empty by default -- opt-in,
