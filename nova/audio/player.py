@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import threading
+from typing import Callable
 
 import numpy as np
 import sounddevice as sd
@@ -90,7 +91,26 @@ class Player:
             self._device = None
         self._device_resolved = True
 
-    async def play(self, pcm: np.ndarray, samplerate: int) -> None:
+    async def play(
+        self,
+        pcm: np.ndarray,
+        samplerate: int,
+        *,
+        on_first_frame: "Callable[[], None] | None" = None,
+    ) -> None:
+        """Play `pcm`. If `on_first_frame` is given, it is called exactly
+        once, synchronously, from the audio callback thread, the first time
+        real (non-cancelled, non-empty) audio is handed to the output
+        device -- i.e. as close as this process gets to observing "sound
+        actually started" rather than "synthesis returned" (T2.2: this is
+        the `first_audio_out` instrumentation point, and it belongs here
+        because `Player` is the only module that knows when a callback
+        block has really been filled, not just when `play()` was called).
+
+        Must not block or raise: it runs on `sounddevice`'s realtime audio
+        thread, same constraint as `_callback` itself. Exceptions from it
+        are caught and logged, never allowed to break playback.
+        """
         self._resolve_device()
         pcm = np.asarray(pcm, dtype=np.float32)
         if pcm.ndim == 1:
@@ -101,9 +121,10 @@ class Player:
         done: asyncio.Future[None] = loop.create_future()
         self._cancel_event.clear()
         pos = 0
+        first_frame_fired = False
 
         def _callback(outdata, frames, time_info, status):
-            nonlocal pos
+            nonlocal pos, first_frame_fired
             if status:
                 _log.warning("Player stream status: %s", status)
             if self._cancel_event.is_set():
@@ -117,6 +138,13 @@ class Player:
             outdata[:chunk] = pcm[pos : pos + chunk]
             if chunk < frames:
                 outdata[chunk:] = 0
+            if not first_frame_fired and chunk > 0:
+                first_frame_fired = True
+                if on_first_frame is not None:
+                    try:
+                        on_first_frame()
+                    except Exception as exc:  # never let instrumentation break audio
+                        _log.warning("Player on_first_frame callback raised (%s)", exc)
             pos += chunk
             if pos >= n_frames:
                 raise sd.CallbackStop

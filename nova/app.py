@@ -30,6 +30,14 @@ around its entire body (`try`/`finally`, so every early return still ends
 the turn) — the signal T1.2's `Governor` needs to never unload a component
 mid-turn. This module never calls `Governor.check_once()` itself; the
 governor drives its own poll loop once started.
+
+T2.2: every turn also publishes per-stage `LatencyMark`s (`nova.telemetry`)
+from `ptt_end` through `first_audio_out` — the moment `nova.audio.player`
+actually hands real PCM to the output device, not when synthesis returns —
+so latency is decomposed rather than reported as one number. See
+`docs/T2.2_LATENCY.md` for the measured breakdown and
+`docs/decisions/0011-prewarm-vs-idle-ram.md` for the pre-warm trade this
+instrumentation exists to price.
 """
 
 from __future__ import annotations
@@ -56,6 +64,7 @@ from nova.security.ladder import Ladder
 from nova.security.untrusted import bind_audit
 from nova.skills.registry import Reply, SkillCtx
 from nova.stt.transcriber import Transcriber
+from nova.telemetry import TOPIC_LATENCY_MARK, LatencyLog, LatencyMark
 from nova.tts.synthesizer import Synthesizer
 
 _log = get_logger(__name__)
@@ -144,6 +153,18 @@ class NovaApp:
         # serializes turns -- a stray second ptt.start mid-turn must not
         # start a second, overlapping run_turn()
         self._turn_lock = asyncio.Lock()
+
+        # --- latency instrumentation (T2.2): a turn_id counter (turns are
+        # serialized by _turn_lock, so a plain incrementing int is enough --
+        # no need for uuid4's collision-safety across concurrent turns that
+        # can't happen), the one LatencyLog subscriber that turns marks into
+        # a logged breakdown, and a scratch slot _speak() writes into from
+        # Player's audio-thread callback (see _speak's docstring).
+        self._turn_seq = 0
+        self.latency_log = LatencyLog()
+        self.bus.subscribe(TOPIC_LATENCY_MARK, self.latency_log.handle)
+        self._last_synth_returned_t: float | None = None
+        self._last_first_audio_t: float | None = None
 
         self.bus.subscribe(TOPIC_PTT_START, self._on_ptt_start)
         self.bus.subscribe(TOPIC_PTT_END, self._on_ptt_end)
@@ -235,10 +256,21 @@ class NovaApp:
             _log.warning("ptt.end received with no active capture; ignoring")
             return
 
+        # T2.2: "speech ended" is measured here, at the instant this handler
+        # starts running the PTT-release event it was dispatched -- the
+        # closest this process gets to the real hardware moment (`event.ts`
+        # is wall-clock `time.time()`, not comparable to the monotonic
+        # marks the rest of the turn is measured in). turn_id is minted
+        # here, before either capture-drain outcome, so both the "no
+        # frames" apology and a real turn report under the same id.
+        turn_id = self._next_turn_id()
+        await self._mark(turn_id, "ptt_end")
+
         self._capturing = False
         self._capture_stop.set()
         frames = await self._capture_task
         self._capture_task = None
+        await self._mark(turn_id, "capture_drained")
         try:
             assert self._capture is not None
             self._capture.stop()
@@ -247,54 +279,114 @@ class NovaApp:
 
         if not frames:
             _log.warning("ptt session (mode=%s) produced no audio frames", event.mode)
-            await self._speak("I didn't catch that.")
+            await self._speak_and_mark("I didn't catch that.", turn_id)
             return
 
         pcm = np.concatenate(frames)
         duration_s = len(pcm) / 16000
         _log.info("ptt.end (mode=%s): captured %.2fs of audio", event.mode, duration_s)
-        await self.run_turn(pcm, source=f"ptt:{event.mode}")
+        await self.run_turn(pcm, source=f"ptt:{event.mode}", turn_id=turn_id)
+
+    def _next_turn_id(self) -> str:
+        """Mint the next turn_id -- see the T2.2 comment in __init__ for why
+        a plain counter is safe here."""
+        self._turn_seq += 1
+        return f"t{self._turn_seq}"
+
+    async def _mark(self, turn_id: str, stage: str, *, t: float | None = None, **meta: Any) -> None:
+        """Publish one T2.2 latency mark on the bus. `t` defaults to now
+        (`time.monotonic()`); callers that already captured the real
+        crossing instant (e.g. `_speak_and_mark`, reading a timestamp
+        `_speak()` recorded on another thread) pass it explicitly so the
+        mark reflects when the event actually happened, not when this
+        coroutine got around to publishing it."""
+        await self.bus.publish(
+            TOPIC_LATENCY_MARK,
+            LatencyMark(turn_id=turn_id, stage=stage, t=t if t is not None else time.monotonic(), meta=meta),
+        )
+
+    async def _speak_and_mark(self, text: str, turn_id: str) -> None:
+        """`await self._speak(text)`, then turn the instance-level
+        timestamps it leaves behind into T2.2 bus marks under `turn_id`.
+
+        Kept separate from `_speak()` itself so `_speak()`'s signature
+        never needs a `turn_id` parameter: `test_app_turn_loop.py`
+        (`test_turns_are_serialized_not_overlapping`) replaces the whole
+        bound method with a text-only stand-in
+        (`app._speak = slow_speak`), and a required extra argument here
+        would break that substitution for a test this module doesn't own.
+        """
+        await self._speak(text)
+        if self._last_synth_returned_t is not None:
+            await self._mark(turn_id, "synth_returned", t=self._last_synth_returned_t)
+        if self._last_first_audio_t is not None:
+            await self._mark(turn_id, "first_audio_out", t=self._last_first_audio_t)
+        else:
+            # Audio never reached the device this utterance -- both TTS
+            # engines failed, playback raised before a real frame, or a
+            # monkeypatched _speak() never set it. Still publish the
+            # terminal mark (flagged, not a real timestamp) so LatencyLog
+            # flushes this turn_id instead of holding it forever -- see
+            # LatencyLog's own docstring in nova/telemetry.py.
+            await self._mark(turn_id, "first_audio_out", aborted=True)
 
     # -- the turn ---------------------------------------------------------
 
-    async def run_turn(self, pcm: np.ndarray, *, source: str = "capture") -> Reply | None:
+    async def run_turn(
+        self, pcm: np.ndarray, *, source: str = "capture", turn_id: str | None = None
+    ) -> Reply | None:
         """Run one full turn: STT -> router -> ladder-gated skill -> TTS.
         Returns the skill's Reply, or None if the turn ended in a spoken
         clarification or a caught failure (both cases still *speak*
         something -- never a silent no-op).
+
+        `turn_id` correlates this turn's T2.2 latency marks with the
+        `ptt_end`/`capture_drained` marks `_on_ptt_end` already published
+        before calling this. Optional because `run_turn()` is also called
+        directly -- `scripts/probe_turn.py`, the test suite -- without going
+        through `_on_ptt_end` at all; a fresh id is minted rather than
+        leaving marks unpublishable.
         """
+        if turn_id is None:
+            turn_id = self._next_turn_id()
+
         async with self._turn_lock:
             await self.bus.publish(TOPIC_TURN_START, None)
             try:
-                t_start = time.monotonic()
-                timings: dict[str, float] = {}
+                # marks the instant STT actually starts -- distinct from
+                # capture_drained/ptt_end so lock-acquisition/dispatch
+                # overhead is visible on its own, and so direct run_turn()
+                # callers (scripts, tests, no ptt_end mark at all) still get
+                # an STT-duration delta instead of transcript_ready being
+                # the first mark in the breakdown.
+                await self._mark(turn_id, "stt_start")
 
                 # --- STT -----------------------------------------------
-                t0 = time.monotonic()
                 try:
                     text = await asyncio.to_thread(self.transcriber.transcribe, pcm)
                 except Exception as exc:
                     _log.error("Turn (%s): Transcriber.transcribe() failed (%s)", source, exc)
-                    await self._speak("Sorry, I had trouble hearing that.")
+                    await self._mark(turn_id, "abort:stt")
+                    await self._speak_and_mark("Sorry, I had trouble hearing that.", turn_id)
                     return None
-                timings["stt"] = time.monotonic() - t0
+                await self._mark(turn_id, "transcript_ready")
 
                 text = text.strip()
                 if not text:
                     _log.info("Turn (%s): STT returned empty text; nothing to route", source)
-                    await self._speak("I didn't catch that.")
+                    await self._speak_and_mark("I didn't catch that.", turn_id)
                     return None
                 _log.info("Turn (%s): heard %r", source, text)
 
                 # --- router ------------------------------------------------
-                t0 = time.monotonic()
                 try:
                     match = self.router.route(text)
                 except Exception as exc:
                     _log.error("Turn (%s): Router.route(%r) failed (%s)", source, text, exc)
-                    await self._speak("Sorry, something went wrong understanding that.")
+                    await self._mark(turn_id, "abort:route")
+                    await self._speak_and_mark("Sorry, something went wrong understanding that.", turn_id)
                     return None
-                timings["route"] = time.monotonic() - t0
+                await self._mark(turn_id, "route_decided")
 
                 if match.clarification is not None:
                     # Constitutional requirement, not an error path: below
@@ -305,28 +397,23 @@ class NovaApp:
                         "Turn (%s): confidence %.3f -- asking for clarification instead of acting",
                         source, match.confidence,
                     )
-                    await self._speak(match.clarification)
-                    self._log_timings(source, timings, t_start)
+                    await self._speak_and_mark(match.clarification, turn_id)
                     return None
 
                 # --- skill, through the ladder's one entry point ----------
                 assert match.spec is not None
-                t0 = time.monotonic()
                 ctx = SkillCtx(config=self.config, ladder=self.ladder)
                 try:
                     reply = await match.spec.invoke(ctx, **match.params)
                 except Exception as exc:
                     _log.error("Turn (%s): skill %r raised (%s)", source, match.spec.name, exc)
-                    await self._speak(f"Sorry, something went wrong with {match.spec.name}.")
+                    await self._mark(turn_id, "abort:skill")
+                    await self._speak_and_mark(f"Sorry, something went wrong with {match.spec.name}.", turn_id)
                     return None
-                timings["skill"] = time.monotonic() - t0
+                await self._mark(turn_id, "skill_returned")
 
                 # --- TTS + playback ----------------------------------------
-                t0 = time.monotonic()
-                await self._speak(reply.text)
-                timings["speak"] = time.monotonic() - t0
-
-                self._log_timings(source, timings, t_start)
+                await self._speak_and_mark(reply.text, turn_id)
                 return reply
             finally:
                 await self.bus.publish(TOPIC_TURN_END, None)
@@ -341,7 +428,17 @@ class NovaApp:
         "speaking" state) -- the one place NOVA's tray icon (T1.4) can
         observe "speaking" distinctly from "thinking", mirroring how
         run_turn() already brackets itself with TOPIC_TURN_START/END for the
-        governor."""
+        governor.
+
+        T2.2: records `self._last_synth_returned_t`/`self._last_first_audio_t`
+        (reset to None at the top of every call) for `_speak_and_mark()` to
+        turn into bus marks -- not parameters on this method itself, so its
+        signature stays exactly `_speak(text)`. `test_app_turn_loop.py`
+        replaces this whole bound method with a text-only stand-in
+        (`test_turns_are_serialized_not_overlapping`), and this module does
+        not own that test."""
+        self._last_synth_returned_t = None
+        self._last_first_audio_t = None
         await self.bus.publish(TOPIC_SPEAK_START, None)
         try:
             try:
@@ -352,17 +449,24 @@ class NovaApp:
                     "NOVA cannot speak this turn", text, exc,
                 )
                 return
+            self._last_synth_returned_t = time.monotonic()
+
+            def _on_first_frame() -> None:
+                # Runs on Player's realtime audio callback thread, not this
+                # coroutine's. A plain attribute write is safe unguarded:
+                # single writer, and the only reader (_speak_and_mark) only
+                # looks at it after `await self.player.play(...)` below has
+                # returned, which cannot happen until this callback either
+                # already ran or never will (empty/cancelled playback).
+                if self._last_first_audio_t is None:
+                    self._last_first_audio_t = time.monotonic()
+
             try:
-                await self.player.play(pcm, samplerate)
+                await self.player.play(pcm, samplerate, on_first_frame=_on_first_frame)
             except Exception as exc:
                 _log.error("Player.play() failed (%s); the reply was %r", exc, text)
         finally:
             await self.bus.publish(TOPIC_SPEAK_END, None)
-
-    @staticmethod
-    def _log_timings(source: str, timings: dict[str, float], t_start: float) -> None:
-        timings["total"] = time.monotonic() - t_start
-        _log.info("Turn (%s) timings (s): %s", source, {k: round(v, 3) for k, v in timings.items()})
 
 
 async def _run() -> None:

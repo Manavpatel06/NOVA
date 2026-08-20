@@ -72,8 +72,17 @@ class _FakePlayer:
         self.played: list[tuple] = []
         self.raises = raises
 
-    async def play(self, pcm, samplerate):
+    async def play(self, pcm, samplerate, *, on_first_frame=None):
+        # T2.2 (nova/audio/player.py): production Player.play() now takes
+        # an optional on_first_frame hook, called once real audio is handed
+        # to the device -- mirrored here (called immediately, since this
+        # fake has no real callback thread) so this stand-in keeps matching
+        # Player's actual signature/behavior instead of silently drifting
+        # from it the way _FakePlayer.play()'s TypeError on the new kwarg
+        # did until this fix.
         self.played.append((pcm, samplerate))
+        if on_first_frame is not None:
+            on_first_frame()
         if self.raises is not None:
             raise self.raises
 

@@ -34,7 +34,7 @@ proposal goes through the same binder, ladder and audit log as a local route.
 | # | Task | Owner | State |
 |---|---|---|---|
 | T2.1 | Self-knowledge: `capabilities` skill answering from the live registry | nova-dev-2 | CLAIMED |
-| T2.2 | Latency: per-stage instrumentation, first-audio-out metric, pre-warm ADR | nova-dev-3 | CLAIMED |
+| T2.2 | Latency: per-stage instrumentation, first-audio-out metric, pre-warm ADR | nova-dev-3 | IN REVIEW — measured, see `docs/T2.2_LATENCY.md` + ADR 0011 |
 | T2.3a | App allowlist growth: resolve, CONFIRM, realpath-revalidated config write | unassigned | TODO |
 | T2.3b | Voice confirmation channel | unassigned | **BLOCKED on F28** — refused for acoustically-armed turns until settled |
 | T2.4t | Threat model for the Claude fallthrough, before implementation | nova-security-2 | CLAIMED |
@@ -42,7 +42,13 @@ proposal goes through the same binder, ladder and audit log as a local route.
 
 **Latency budget under test:** first audio out within **1.5 s** of speech ending,
 steady state, READ skills. First-turn reported separately. Manav measured ~5-8 s
-on the live test and called it slow.
+on the live test and called it slow. **Verdict (T2.2, `docs/T2.2_LATENCY.md`):
+budget holds for steady state — 1.07-1.10s, n=8, real hardware — and misses
+badly for the first turn in a process — 4.50-4.83s, n=3 cold-process runs,
+~3-3.5x over. The "felt slow" turn was very likely the cold-load one: 4.5-4.8s
+plus that reply's own ~1.6-1.8s of speech lands at 6.1-6.6s wall time, inside
+Manav's reported 5-8s. Pre-warm-vs-idle-RAM trade priced in ADR 0011, not
+decided.**
 
 **Tier rule:** Claude-proposed actions authorize at `max(declared_tier, CONFIRM)`.
 
@@ -73,6 +79,10 @@ on the live test and called it slow.
 | VRAM, model resident | 2479 MiB | nvidia-smi |
 | VRAM after unload | 367 MiB | nvidia-smi — the C++ side really frees it |
 | int8 on this stack | **does not crash** | contrary to prior art; refused anyway, deliberately |
+| Turn latency, steady state (T2.2) | first audio out **1.07-1.10s** (n=8) | `scripts/measure_latency.py`, real speakers, `time` skill |
+| Turn latency, first turn (T2.2) | first audio out **4.50-4.83s** (n=3 cold processes) | same script; Whisper load ~2.9-3.6s + Kokoro load ~1.3-1.5s dominate |
+| Route+skill latency (T2.2) | **~8ms**, not the plan's assumed ~80ms | same script — router+`time` combined, steady state |
+| Playback-start latency (T2.2) | **~180ms**, stable, ~17% of steady-state total | `synth_returned->first_audio_out`; no explicit `sounddevice` `latency=` set anywhere |
 
 ## Open findings (routed, not yet fixed)
 
