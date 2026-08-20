@@ -60,7 +60,7 @@ async def main() -> None:
     print("=" * 100)
     print("1. BENIGN QUESTION -> expect ClaudeAnswer")
     print("=" * 100)
-    result = await ask(f"{SKILLS_BLOCK}\nUser said: what is the capital of France", egress=egress)
+    result = await ask(f"{SKILLS_BLOCK}\nUser said: what is the capital of France", egress=egress, audit=audit)
     print(f"  {type(result).__name__}: {result}")
     assert isinstance(result, ClaudeAnswer), f"expected ClaudeAnswer, got {result!r}"
     print("  PASS")
@@ -69,7 +69,7 @@ async def main() -> None:
     print("=" * 100)
     print("2. 'open notepad for me' -> expect ClaudeProposal(skill_name='open_app', ...)")
     print("=" * 100)
-    result = await ask(f"{SKILLS_BLOCK}\nUser said: open notepad for me", egress=egress)
+    result = await ask(f"{SKILLS_BLOCK}\nUser said: open notepad for me", egress=egress, audit=audit)
     print(f"  {type(result).__name__}: {result}")
     assert isinstance(result, ClaudeProposal), f"expected ClaudeProposal, got {result!r}"
     assert result.skill_name == "open_app", f"expected open_app, got {result.skill_name!r}"
@@ -86,7 +86,7 @@ async def main() -> None:
                         # to write via a real tool would land here
     try:
         before = set(os.listdir(scratch))
-        result = await ask(HOSTILE_PROMPT, egress=egress)
+        result = await ask(HOSTILE_PROMPT, egress=egress, audit=audit)
     finally:
         os.chdir(cwd_before)
     after = set(os.listdir(scratch))
@@ -105,7 +105,7 @@ async def main() -> None:
     real_find_cli = claude_arm_mod.find_cli
     claude_arm_mod.find_cli = lambda: (_ for _ in ()).throw(claude_arm_mod.ClaudeCliNotFound("simulated"))
     try:
-        result = await ask("hello", egress=egress)
+        result = await ask("hello", egress=egress, audit=audit)
     finally:
         claude_arm_mod.find_cli = real_find_cli
     print(f"  {type(result).__name__}: {result}")

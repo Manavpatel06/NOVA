@@ -73,36 +73,47 @@ runs."
 - **`argv[0]` resolves through `find_cli()`** (`shutil.which`, verified to
   exist), never a raw config/parameter string — per
   `docs/SECURITY_SPEC.md` §3.2's reserved allowlist row.
-- **Env discipline — a real finding, not fully implemented, flagged rather
-  than silently dropped.** `docs/THREAT_MODEL_CLAUDE_FALLTHROUGH.md` finding
-  8 asks for `ANTHROPIC_API_KEY` / `CLAUDE_CODE_USE_BEDROCK` /
-  `CLAUDE_CODE_USE_VERTEX` to be scrubbed from the child's environment before
-  spawn, so nothing accidentally reroutes off Manav's Max-plan OAuth session
-  onto metered API/Bedrock/Vertex billing. Implementing that means reading
-  `os.environ` to build the filtered child env — and `tests/
+- **Env discipline (F59), narrowly scoped by nova-security's ruling.**
+  `docs/THREAT_MODEL_CLAUDE_FALLTHROUGH.md` finding 8 asks for
+  `ANTHROPIC_API_KEY` / `CLAUDE_CODE_USE_BEDROCK` / `CLAUDE_CODE_USE_VERTEX`
+  to be scrubbed from the child's environment, so nothing accidentally
+  reroutes off Manav's Max-plan OAuth session onto metered API/Bedrock/
+  Vertex billing. This module's first attempt skipped the scrub entirely
+  because implementing it means reading `os.environ`, and `tests/
   test_source_hygiene.py::test_module_does_not_read_os_environ` is a
-  zero-exemption, repo-wide static tripwire on exactly that ("no module
-  reads os.environ ... everything comes from Config" — `nova/config.py`'s
-  own docstring, and `nova/security/redact.py`'s home-path redaction is
-  written the way it is *because* of this same absolute rule, per its own
-  comment). This module does **not** pass `env=` to the subprocess call at
-  all — the child inherits the parent's environment unmodified, the same as
-  every other spawn call site in this codebase (`nova/stt/gpu.py`,
-  `nova/skills/open_app.py`, neither of which passes `env=` either). That
-  means finding 8's env-scrub is **not implemented**, on purpose, rather
-  than worked around by reading `os.environ` somewhere that test wouldn't
-  catch. Flagged to nova-security/the lead as an open question: whether to
-  add a narrow, deliberate exemption to the hygiene rule for this one file
-  (mirroring how `docs/SECURITY_SPEC.md` §3.2 pre-reserved this file's
-  process-spawn exemption), or accept that Manav's setup — OAuth/Max-plan
-  login, no `ANTHROPIC_API_KEY` ordinarily present in his shell — makes the
-  scrub belt-and-suspenders rather than load-bearing in practice. Never
-  `--bare` regardless of how that's resolved: its own help text says it
-  *forces* `ANTHROPIC_API_KEY`/`apiKeyHelper` auth and never reads
+  zero-exemption, repo-wide static tripwire on exactly that. The lead
+  proposed exempting this whole file; nova-security agreed with the
+  reasoning (containing a child's environment is not the same category as
+  reading config-by-environment) but rejected that scope as too wide —
+  *"nothing would stop that file from later reading an unrelated var and
+  using its value."* `_child_env()` is the ruling's actual shape: it touches
+  only **presence/absence** of the closed, literal `_ENV_VARS_TO_SCRUB` set
+  via `dict.pop(name, None)`, never reads or branches on what any variable
+  is *set to*, and is the only function in this file that names
+  `os.environ` at all — an unrelated var added here later is a visible,
+  reviewable diff to one five-line function, not a capability the whole
+  file already had. `tests/test_source_hygiene.py` gets a matching
+  `ENVIRON_ALLOWLIST` entry (size-pinned at one) plus a structural test
+  constraining *how* this file touches the environment — nova-tester's
+  file, not edited here. Never `--bare` regardless: its own help text says
+  it *forces* `ANTHROPIC_API_KEY`/`apiKeyHelper` auth and never reads
   OAuth/keychain, which would break the $0-recurring assumption outright.
   `--safe-mode` is used instead — disables CLAUDE.md/hooks/plugins/MCP/
   custom commands/skills while leaving normal OAuth auth and built-in tools
   (which `--tools ""` then removes) alone.
+- **F61: the resolved CLI path is audited on every invocation.** `find_cli()`
+  trusts PATH search order with no containment check — nova-security
+  explicitly did not want an `open_app`-style curated-directory allowlist
+  here (right for Program Files, wrong for an npm-installed tool a global
+  `npm install` can relocate), and instead asked for the resolved path to be
+  logged so a PATH-order swap (something else named `claude`/`claude.cmd`
+  planted earlier on PATH) is visible after the fact rather than never.
+  `ask()` records a `claude_arm.invoke` audit event with the resolved
+  `cli_path` and `model` immediately after `find_cli()` succeeds, before
+  `release_for_process()` or the spawn — via the caller-supplied `audit:
+  AuditLog`, kept as its own parameter rather than reached through `egress`
+  (which does not expose its internal `AuditLog` publicly), so this module
+  adds no new surface to `nova/security/egress.py`.
 - **Kill, not abandon, on timeout (F49).** The confirm channels' pattern of
   abandoning a `daemon=True` thread on timeout is correct for a blocked
   `readline()` with no side effects and wrong for a live child process.
@@ -160,6 +171,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -167,6 +179,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from nova.log import get_logger
+from nova.security.audit import AuditLog
 from nova.security.egress import Egress
 
 _log = get_logger(__name__)
@@ -263,6 +276,30 @@ def find_cli() -> str:
     return path
 
 
+#: F59, closed and literal -- the only three names `_child_env()` may ever
+#: touch. Nothing else in this file reads `os.environ`.
+_ENV_VARS_TO_SCRUB = ("ANTHROPIC_API_KEY", "CLAUDE_CODE_USE_BEDROCK", "CLAUDE_CODE_USE_VERTEX")
+
+
+def _child_env() -> dict[str, str]:
+    """F59 (narrower than this module's first attempt, per nova-security's
+    ruling -- see module docstring's "Env discipline" section): a filtered
+    copy of the parent's environment, built for exactly one purpose -- the
+    `env=` argument to this module's one sanctioned spawn call. Touches only
+    *presence/absence* of the closed, literal set above via `dict.pop(name,
+    None)` -- never reads or branches on a value. This is deliberately
+    narrower than "give this file general os.environ access": nothing here
+    inspects what `ANTHROPIC_API_KEY` (or anything else) is *set to*, and no
+    other line in this file touches `os.environ` at all -- an unrelated var
+    added here later would be a visible, reviewable diff to this one
+    function, not a capability the file already had.
+    """
+    env = dict(os.environ)
+    for name in _ENV_VARS_TO_SCRUB:
+        env.pop(name, None)
+    return env
+
+
 def _argv(cli_path: str, *, model: str) -> list[str]:
     return [
         cli_path,
@@ -345,6 +382,7 @@ async def ask(
     prompt: str,
     *,
     egress: Egress,
+    audit: AuditLog,
     timeout_s: float = DEFAULT_TIMEOUT_S,
     model: str = DEFAULT_MODEL,
 ) -> ClaudeResult:
@@ -363,12 +401,27 @@ async def ask(
     context" list) -- composing that is the caller's job, not this
     function's; this module only owns the output-format contract (the
     system prompt + JSON schema above).
+
+    `audit` is separate from `egress` (which does not expose its internal
+    `AuditLog` publicly) -- used only for F61's `claude_arm.invoke` record
+    below, naming the resolved `cli_path` so a PATH-order substitution is
+    reviewable after the fact. Same "raises uncaught" discipline as
+    `egress.release_for_process()`: a write failure here must not be
+    swallowed into "the audit trail is fine, actually."
     """
     try:
         cli_path = find_cli()
     except ClaudeCliNotFound as exc:
         _log.error("Claude fallthrough: %s", exc)
         return ClaudeFailure(reason="cli_not_found", detail=str(exc))
+
+    # F61: audit the resolved path on every invocation, before anything
+    # else -- find_cli() trusts PATH search order with no containment
+    # check (deliberately: an open_app-style curated-directory allowlist is
+    # wrong for an npm-installed tool), so this is what turns an invisible
+    # PATH substitution into a reviewable one. Raises uncaught on a write
+    # failure, same discipline as release_for_process() below.
+    audit.record({"kind": "claude_arm.invoke", "cli_path": cli_path, "model": model})
 
     # Redact + audit BEFORE spawning -- Egress.release_for_process()'s own
     # docstring: "the caller must not spawn the child on this exception."
@@ -377,16 +430,16 @@ async def ask(
 
     argv = _argv(cli_path, model=model)
     try:
-        # No env= passed -- the child inherits the parent's environment
-        # unmodified, same as every other spawn call site in this codebase
-        # (nova/stt/gpu.py, nova/skills/open_app.py). See this module's
-        # docstring ("Env discipline") for why the threat model's env-scrub
-        # recommendation is flagged, not implemented, here.
+        # F59: env= is a filtered copy (_child_env()), not None/omitted --
+        # see that function's docstring for the exact, narrow scope
+        # nova-security ruled on (presence/absence of three literal names,
+        # never a value, nothing else in this file touches os.environ).
         proc = await asyncio.create_subprocess_exec(
             *argv,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            env=_child_env(),
         )
     except OSError as exc:
         _log.error("Claude fallthrough: failed to spawn %r (%s)", cli_path, exc)
