@@ -33,10 +33,12 @@ from nova.config import (
     SecurityConfig,
     SttConfig,
     TtsConfig,
+    learned_app_path_key,
     load_config,
     orphaned_app_names,
 )
 from nova.security.audit import AuditLog
+from nova.security.redact import redact
 
 
 def _write(path: Path, text: str) -> Path:
@@ -377,8 +379,17 @@ def _confirm(audit_path: Path, name: str, resolved_path: str) -> None:
     AuditLog class (hash-chained envelope, real code path) -- not a
     hand-built JSON line -- so these tests track the real record shape
     Ladder.record_event() produces rather than a guess that could drift
-    from it silently."""
-    AuditLog(path=audit_path).record({"kind": "skill.add_app.learned", "app": name, "resolved_path": resolved_path})
+    from it silently. F66: reconciliation matches on resolved_path_key
+    (learned_app_path_key()'s sha256 digest), not the literal resolved_path
+    text -- computed here via the real function, the same one
+    nova.skills.add_app calls, so this helper can't silently drift from
+    what production actually writes."""
+    AuditLog(path=audit_path).record({
+        "kind": "skill.add_app.learned",
+        "app": name,
+        "resolved_path": resolved_path,
+        "resolved_path_key": learned_app_path_key(resolved_path),
+    })
 
 
 def test_missing_learned_apps_file_is_not_an_error(tmp_path):
@@ -415,30 +426,54 @@ def test_a_learned_entry_with_a_matching_audit_record_is_merged(tmp_path):
     assert cfg.security.allowed_apps == {"discord": resolved}
 
 
-def test_redaction_makes_a_users_path_entry_permanently_unconfirmable():
-    """KNOWN, REAL GAP -- not a hypothetical, and not routed around. A
-    resolved_path under C:\\Users\\<name>\\... (the module's own docstring
-    names %LOCALAPPDATA%\\Discord\\... -- i.e. exactly this shape -- as the
-    TYPICAL case for a real installed app) can never be confirmed by
-    _confirmed_learned_apps(): AuditLog.record() redacts the username
-    segment on write (F14's shared redact(), correctly applied to every
-    audit record), so the stored resolved_path never equals
-    learned_apps.json's own unredacted entry. This pins the collision at
-    the redact() level directly -- the same mismatch load_config()'s
-    reconciliation would hit for any such path, verified end-to-end by the
-    xfail'd tests in test_skills_add_app.py. Update/remove this test only
-    once the reconciliation mechanism itself accounts for the redaction
-    (e.g. by redacting the learned-file side the same way before
-    comparing, or keying on something the redaction doesn't touch)."""
-    from nova.security.redact import redact
+def test_f66_reconciliation_key_is_immune_to_redaction_even_for_a_real_users_path():
+    """FIXED -- F66 (nova-security's ruling, implemented as
+    nova.config.learned_app_path_key()). This test used to pin a KNOWN,
+    REAL GAP: AuditLog.record() redacts the username segment of every
+    string value on write (F14's shared redact(), correctly applied to
+    every audit record), so a resolved_path under C:\\Users\\<name>\\...
+    (the module's own docstring names %LOCALAPPDATA%\\Discord\\... -- i.e.
+    exactly this shape -- as the TYPICAL case for a real installed app)
+    used to be permanently unconfirmable: the redacted string stored in
+    the audit log could never literal-match learned_apps.json's own
+    (necessarily unredacted, because it's what Popen launches) entry.
 
+    The fix reconciles on a sha256 digest of the literal path instead of
+    the path text itself -- a hex digest doesn't match redact()'s home-
+    path/secret/email patterns, so `redact(key) == key` always, verified
+    directly here rather than assumed. The human-readable resolved_path
+    field alongside it in the audit record stays redacted, for a human
+    reading the log; the key exists purely for this machine comparison.
+
+    Kept (not deleted) per the lead's note: the next person to touch
+    reconciliation needs to know WHY it doesn't compare path text
+    directly, not just that it doesn't."""
     real_world_path = r"C:\Users\patel\AppData\Local\Discord\app-1.0\Discord.exe"
-    stored_in_audit_log = redact(real_world_path)
+    key = learned_app_path_key(real_world_path)
 
-    assert stored_in_audit_log != real_world_path, (
-        "if this now passes, redact() no longer touches C:\\Users\\... paths -- "
-        "the reconciliation collision this test documents may no longer apply"
+    assert redact(key) == key, (
+        "the reconciliation key must be unaffected by redact() -- if this fails, "
+        "F66's fix is broken and the C:\\Users\\... collision this test used to "
+        "document is back"
     )
+    # The gap this replaced was specifically that redact() DOES touch the
+    # raw path -- confirm that premise still holds, otherwise the fix
+    # above might be passing vacuously because redact() stopped touching
+    # C:\Users\... paths at all (a different, unrelated change) rather
+    # than because the digest-based key is genuinely redaction-proof.
+    assert redact(real_world_path) != real_world_path
+
+
+def test_learned_app_path_key_is_deterministic_and_content_sensitive():
+    """The two sides of reconciliation (nova.skills.add_app writing the
+    audit event, nova.config reading it back) must compute the identical
+    key from the identical literal string every time, and different paths
+    must not collide."""
+    path_a = r"C:\Users\patel\AppData\Local\Discord\app-1.0\Discord.exe"
+    path_b = r"C:\Users\patel\AppData\Local\Spotify\Spotify.exe"
+
+    assert learned_app_path_key(path_a) == learned_app_path_key(path_a)
+    assert learned_app_path_key(path_a) != learned_app_path_key(path_b)
 
 
 def test_nova_yaml_always_wins_on_a_name_conflict(tmp_path):

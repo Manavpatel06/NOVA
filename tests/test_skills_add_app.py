@@ -43,31 +43,23 @@ from nova.security.audit import AuditLog, AuditWriteError
 from nova.security.ladder import Ladder
 from nova.skills.registry import SkillCtx, get_skill
 
-# KNOWN, REAL, REPORTED BUG (not a test artifact) -- reported to the lead
-# 2026-08-20. AuditLog.record() runs every string value through the shared
-# redact() (F14), whose first pass replaces a Windows home-directory
-# segment with [USER] (nova/security/redact.py's _WIN_HOME_RE). So the
-# 'skill.add_app.learned' audit record's resolved_path never literal-
-# matches learned_apps.json's own (necessarily unredacted, because it's
-# what Popen launches) entry for ANY path under C:\Users\...\ -- which is
-# both this module's own documented common case (%LOCALAPPDATA%\Discord\...)
-# AND, unavoidably, every pytest tmp_path in this suite (rooted under
-# C:\Users\<profile>\AppData\Local\Temp\...). See tests/test_config.py's
-# test_redaction_makes_a_users_path_entry_permanently_unconfirmable, which
-# pins the collision directly at the redact() level. Three tests below are
-# marked xfail(strict=True) rather than routed around with an unrealistic
-# non-tmp_path location -- this team's own standard is "don't mock so
-# heavily the real path never runs" (CLAUDE.md), and a fake path that
-# dodges C:\Users\... specifically to avoid a real Windows path shape is
-# exactly that. strict=True means the moment this is fixed, these three
-# XPASS loudly and force the marker's removal -- they don't silently stay
-# green forever.
-_F62_F63_REDACTION_BUG_XFAIL = pytest.mark.xfail(
-    reason="F62/F63: AuditLog's redact() strips the C:\\Users\\<name>\\ segment on write, so the "
-    "confirming audit record can never literal-match learned_apps.json's unredacted entry for any "
-    "path under C:\\Users\\... -- reported to the lead 2026-08-20, not yet fixed",
-    strict=True,
-)
+# F62/F63/F66 history, kept here for whoever next touches the write-path
+# tests below: this file briefly carried three xfail(strict=True) tests
+# and a shared marker for a KNOWN, REAL bug -- AuditLog.record() redacts
+# the C:\Users\<name>\ segment of every string value on write (F14's
+# shared redact()), which made the 'skill.add_app.learned' audit record's
+# resolved_path never literal-match learned_apps.json's necessarily-
+# unredacted entry for any path under C:\Users\...\ (this module's own
+# documented common case, and unavoidably every pytest tmp_path on this
+# machine). Reported 2026-08-20; fixed the same day as F66
+# (nova.config.learned_app_path_key() -- reconcile on a sha256 digest of
+# the literal path instead of the path text, since a hex digest is immune
+# to redact()'s home-path pattern). strict=True did exactly its job: the
+# fix landing turned two of the three tests into unexpected passes,
+# which FAILED loudly rather than silently going green, forcing the
+# markers off rather than letting them rot. See tests/test_config.py's
+# test_f66_reconciliation_key_is_immune_to_redaction_even_for_a_real_
+# users_path for where that reasoning now lives.
 
 
 class _UnusedLadder:
@@ -275,23 +267,28 @@ async def test_two_partially_matching_shortcuts_refuse_rather_than_guess(
     assert fake_popen.calls == []
 
 
-@_F62_F63_REDACTION_BUG_XFAIL
 async def test_a_single_unambiguous_match_is_not_refused(
-    start_menu, shortcut_targets, trusted_dir, fake_popen, redirected_load_config
+    start_menu, shortcut_targets, trusted_dir, fake_popen, redirected_load_config, tmp_path
 ):
     """The other half of the ambiguity proof: this ISN'T a suite that
     refuses everything. A single match -- even a partial, non-exact one --
     resolves and succeeds. Needs redirected_load_config like the other
     write-path tests: add_app() always round-trips through the real
     load_config() before declaring success, even when a test's own focus
-    is ambiguity rather than the round-trip check itself."""
+    is ambiguity rather than the round-trip check itself.
+
+    Uses a REAL Ladder/AuditLog (F66), not _NoopLadder -- reconciliation
+    (F62/F63) only trusts a learned entry once a real 'skill.add_app.
+    learned' record naming it exists, so record_event() has to actually
+    persist something for the round-trip check to succeed."""
     nova_yaml, _ = redirected_load_config
     _write_nova_yaml(nova_yaml, allowed_app_dirs=[str(trusted_dir)])
     target = _real_exe(trusted_dir, "discord.exe")
     _make_shortcut(start_menu, shortcut_targets, "Discord", target)
+    ladder = Ladder(AuditLog(path=tmp_path / "audit.log"))
     ctx = SkillCtx(
         config=Config(security=SecurityConfig(allowed_app_dirs=[str(trusted_dir)])),
-        ladder=_NoopLadder(),
+        ladder=ladder,
     )
 
     reply = await add_app_mod.add_app(ctx, "discord")
@@ -404,18 +401,21 @@ async def test_a_write_that_nova_yaml_would_shadow_is_refused_and_rolled_back(
     assert fake_popen.calls == [], "add_app launched despite the write never actually taking effect"
 
 
-@_F62_F63_REDACTION_BUG_XFAIL
 async def test_a_write_nova_yaml_does_not_shadow_succeeds_and_survives_the_round_trip(
-    start_menu, shortcut_targets, trusted_dir, fake_popen, redirected_load_config
+    start_menu, shortcut_targets, trusted_dir, fake_popen, redirected_load_config, tmp_path
 ):
     """The other half of the round-trip proof: this isn't a suite that
     refuses every write. A name nova.yaml says nothing about really does
-    get learned, launched, and left in the learned file afterward."""
+    get learned, launched, and left in the learned file afterward.
+
+    Real Ladder/AuditLog (F66), not _NoopLadder -- see the comment on
+    test_a_single_unambiguous_match_is_not_refused for why."""
     nova_yaml, learned_path = redirected_load_config
     _write_nova_yaml(nova_yaml, allowed_app_dirs=[str(trusted_dir)])
     target = _real_exe(trusted_dir, "discord.exe")
     _make_shortcut(start_menu, shortcut_targets, "Discord", target)
-    ctx = SkillCtx(config=Config(security=SecurityConfig(allowed_app_dirs=[str(trusted_dir)])), ladder=_NoopLadder())
+    ladder = Ladder(AuditLog(path=tmp_path / "audit.log"))
+    ctx = SkillCtx(config=Config(security=SecurityConfig(allowed_app_dirs=[str(trusted_dir)])), ladder=ladder)
 
     reply = await add_app_mod.add_app(ctx, "discord")
 
@@ -467,7 +467,6 @@ class _DecliningChannel:
         return False
 
 
-@_F62_F63_REDACTION_BUG_XFAIL
 async def test_end_to_end_through_the_real_ladder_with_an_approving_channel(
     start_menu, shortcut_targets, trusted_dir, fake_popen, redirected_load_config, tmp_path
 ):
