@@ -20,6 +20,7 @@ behavior), not incidental implementation choices.
 from __future__ import annotations
 
 import dataclasses
+import json
 import os
 from pathlib import Path
 
@@ -338,3 +339,171 @@ def test_load_config_never_reads_os_environ(monkeypatch, tmp_path):
     assert tripwire.reads == [], (
         f"load_config() read os.environ keys it must not touch: {tripwire.reads}"
     )
+
+
+# ---------------------------------------------------------------------------
+# T2.3a: learned_apps.json merge (nova.skills.add_app's machine-written
+# second source, module docstring's "second, machine-written source"
+# section). The security-load-bearing property is that a name conflict
+# always resolves in nova.yaml's favor, and that the learned file has no
+# way to touch allowed_app_dirs (the actual trust boundary) at all -- so
+# the rejection tests below matter more than the happy-path ones.
+# ---------------------------------------------------------------------------
+
+def _write_learned_raw(path: Path, raw) -> Path:
+    path.write_text(json.dumps(raw), encoding="utf-8")
+    return path
+
+
+def _write_learned(path: Path, apps: dict) -> Path:
+    return _write_learned_raw(path, {"allowed_apps": apps})
+
+
+def test_missing_learned_apps_file_is_not_an_error(tmp_path):
+    """A learned file that doesn't exist yet is the normal, expected state
+    on a fresh install -- it must load exactly as if T2.3a didn't exist."""
+    cfg_path = _write(tmp_path / "nova.yaml", "")
+    learned_path = tmp_path / "learned_apps.json"  # deliberately never created
+    assert not learned_path.exists()
+
+    cfg = load_config(cfg_path, learned_apps_path=learned_path)
+
+    assert cfg.security.allowed_apps == {}
+
+
+def test_learned_entries_are_merged_into_allowed_apps(tmp_path):
+    cfg_path = _write(tmp_path / "nova.yaml", "")
+    learned_path = _write_learned(tmp_path / "learned_apps.json", {"discord": r"C:\Users\x\Discord.exe"})
+
+    cfg = load_config(cfg_path, learned_apps_path=learned_path)
+
+    assert cfg.security.allowed_apps == {"discord": r"C:\Users\x\Discord.exe"}
+
+
+def test_nova_yaml_always_wins_on_a_name_conflict(tmp_path):
+    """The load-bearing merge rule: a human-authored entry must never be
+    silently overridden by whatever the machine-written file happens to
+    say for the same name, even if the learned entry is 'newer'."""
+    cfg_path = _write(
+        tmp_path / "nova.yaml",
+        'security:\n  allowed_apps:\n    discord: "C:\\\\Human\\\\Discord.exe"\n',
+    )
+    learned_path = _write_learned(tmp_path / "learned_apps.json", {"discord": r"C:\Machine\Discord.exe"})
+
+    cfg = load_config(cfg_path, learned_apps_path=learned_path)
+
+    assert cfg.security.allowed_apps == {"discord": r"C:\Human\Discord.exe"}
+
+
+def test_learned_file_can_add_a_name_but_never_shadow_one_nova_yaml_already_has(tmp_path):
+    """Both directions in one config: a name only nova.yaml knows stays
+    exactly as nova.yaml wrote it; a name only the learned file knows is
+    added; a name both know resolves to nova.yaml's value."""
+    cfg_path = _write(
+        tmp_path / "nova.yaml",
+        'security:\n  allowed_apps:\n'
+        '    notepad: "C:\\\\Windows\\\\notepad.exe"\n'
+        '    discord: "C:\\\\Human\\\\Discord.exe"\n',
+    )
+    learned_path = _write_learned(
+        tmp_path / "learned_apps.json",
+        {"discord": r"C:\Machine\Discord.exe", "spotify": r"C:\Machine\Spotify.exe"},
+    )
+
+    cfg = load_config(cfg_path, learned_apps_path=learned_path)
+
+    assert cfg.security.allowed_apps == {
+        "notepad": r"C:\Windows\notepad.exe",  # nova.yaml-only: untouched
+        "discord": r"C:\Human\Discord.exe",  # conflict: nova.yaml wins
+        "spotify": r"C:\Machine\Spotify.exe",  # learned-only: added
+    }
+
+
+def test_learned_apps_never_widens_allowed_app_dirs(tmp_path):
+    """The trust boundary itself is untouched by the merge even when
+    nova.yaml sets it -- the learned file's own key-shape restriction
+    (tested below) is what makes this true structurally, not just by
+    the merge code happening not to read that field."""
+    cfg_path = _write(
+        tmp_path / "nova.yaml",
+        'security:\n  allowed_app_dirs:\n    - "C:\\\\Trusted"\n',
+    )
+    learned_path = _write_learned(tmp_path / "learned_apps.json", {"discord": r"C:\Machine\Discord.exe"})
+
+    cfg = load_config(cfg_path, learned_apps_path=learned_path)
+
+    assert cfg.security.allowed_app_dirs == ["C:\\Trusted"]
+
+
+def test_learned_file_containing_an_allowed_app_dirs_key_is_rejected(tmp_path):
+    """THE load-bearing rejection test: a learned file is exclusively
+    machine-written by nova.skills.add_app, which never writes anything but
+    'allowed_apps' -- so a learned file that DOES carry an 'allowed_app_dirs'
+    key (or any other key) is tampering or corruption, not a shape this
+    merge should ever quietly accept. Worth more than the happy-path tests
+    above: this is what stops a compromised/corrupted learned_apps.json
+    from ever widening the trust boundary itself."""
+    cfg_path = _write(tmp_path / "nova.yaml", "")
+    learned_path = _write_learned_raw(
+        tmp_path / "learned_apps.json",
+        {"allowed_apps": {"discord": r"C:\x\Discord.exe"}, "allowed_app_dirs": [r"C:\Anywhere"]},
+    )
+
+    with pytest.raises(ConfigError, match="allowed_apps"):
+        load_config(cfg_path, learned_apps_path=learned_path)
+
+
+def test_learned_file_with_only_an_unrecognized_key_is_rejected(tmp_path):
+    cfg_path = _write(tmp_path / "nova.yaml", "")
+    learned_path = _write_learned_raw(tmp_path / "learned_apps.json", {"totally_bogus_key": {}})
+
+    with pytest.raises(ConfigError):
+        load_config(cfg_path, learned_apps_path=learned_path)
+
+
+def test_learned_file_that_is_not_a_json_object_is_rejected(tmp_path):
+    cfg_path = _write(tmp_path / "nova.yaml", "")
+    learned_path = _write_learned_raw(tmp_path / "learned_apps.json", ["not", "a", "mapping"])
+
+    with pytest.raises(ConfigError):
+        load_config(cfg_path, learned_apps_path=learned_path)
+
+
+def test_learned_file_with_a_non_string_value_is_rejected(tmp_path):
+    cfg_path = _write(tmp_path / "nova.yaml", "")
+    learned_path = _write_learned_raw(
+        tmp_path / "learned_apps.json", {"allowed_apps": {"discord": 12345}},
+    )
+
+    with pytest.raises(ConfigError):
+        load_config(cfg_path, learned_apps_path=learned_path)
+
+
+def test_malformed_learned_json_raises_config_error_not_a_raw_json_error(tmp_path):
+    cfg_path = _write(tmp_path / "nova.yaml", "")
+    learned_path = tmp_path / "learned_apps.json"
+    learned_path.write_text("{not valid json", encoding="utf-8")
+
+    with pytest.raises(ConfigError):
+        load_config(cfg_path, learned_apps_path=learned_path)
+
+
+def test_default_learned_apps_path_is_nova_learned_apps_path(tmp_path):
+    """Omitting learned_apps_path entirely must fall back to
+    nova.LEARNED_APPS_PATH, the real production location -- not silently
+    read nothing forever. Proven by pointing the REAL constant at a tmp
+    file via monkeypatch, one layer removed from load_config's own
+    parameter default."""
+    import nova
+    import nova.config as config_mod
+
+    real_path = nova.LEARNED_APPS_PATH
+    fake_path = tmp_path / "learned_apps.json"
+    _write_learned(fake_path, {"discord": r"C:\Machine\Discord.exe"})
+    try:
+        config_mod.LEARNED_APPS_PATH = fake_path
+        cfg_path = _write(tmp_path / "nova.yaml", "")
+        cfg = load_config(cfg_path)  # no learned_apps_path override
+        assert cfg.security.allowed_apps == {"discord": r"C:\Machine\Discord.exe"}
+    finally:
+        config_mod.LEARNED_APPS_PATH = real_path

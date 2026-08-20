@@ -50,7 +50,7 @@ _OS_BANNED_ATTRS = {
     "spawnl", "spawnle", "spawnlp", "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe",
 }
 _ASYNCIO_BANNED_ATTRS = {"create_subprocess_exec", "create_subprocess_shell"}
-PROCESS_ALLOWLIST = {"stt/gpu.py", "skills/open_app.py", "brain/claude_arm.py"}
+PROCESS_ALLOWLIST = {"stt/gpu.py", "skills/open_app.py", "brain/claude_arm.py", "skills/add_app.py"}
 
 
 def _rel(path: Path) -> str:
@@ -121,14 +121,19 @@ def test_transport_allowlist_is_exactly_one_named_file():
         assert (NOVA_ROOT / rel).is_file(), f"transport allowlist entry {rel} does not exist"
 
 
-def test_process_spawn_allowlist_is_exactly_three_named_files_today():
-    """Three earn it per docs/SECURITY_SPEC.md §3.2. The third,
+def test_process_spawn_allowlist_is_exactly_four_named_files_today():
+    """Four earn it per docs/SECURITY_SPEC.md §3.2. The third,
     `nova/brain/claude_arm.py` (T2.4a), was the reserved slot — not
     pre-approved before the file existed, added the moment it landed, per
     that section's own reserved-row text ("Not added until M4 actually
-    lands the file"). A change to this number must be a conscious edit to
+    lands the file"). The fourth, `nova/skills/add_app.py` (T2.3a), earns
+    it the same way `open_app.py` does — see
+    test_add_app_popen_uses_an_argv_list_and_shell_false and
+    test_add_app_popen_target_is_realpath_resolved_before_the_call below,
+    which pin the exact argv shape rather than trusting the module
+    docstring's claim. A change to this number must be a conscious edit to
     this test, not a silently-growing set."""
-    assert len(PROCESS_ALLOWLIST) == 3
+    assert len(PROCESS_ALLOWLIST) == 4
     for rel in PROCESS_ALLOWLIST:
         assert (NOVA_ROOT / rel).is_file(), f"process-spawn allowlist entry {rel} does not exist"
 
@@ -301,3 +306,90 @@ def test_open_app_popen_call_is_not_the_first_statement_in_its_function():
             )
             return
     pytest.fail("no async function containing a Popen call was found in open_app.py")
+
+
+# ---------------------------------------------------------------------------
+# nova/skills/add_app.py: the fourth allowlist entry (T2.3a). Same argv
+# list + shell=False shape open_app.py already earns its entry with, plus
+# one property specific to this module: the module docstring claims the
+# Popen call launches the THIRD, freshest resolution (`final_resolved`,
+# re-verified immediately before both the write and the launch) rather
+# than an earlier one computed before the CONFIRM dialog was shown — pin
+# that structurally, not just "some resolved path was used".
+# ---------------------------------------------------------------------------
+
+
+def test_add_app_popen_uses_an_argv_list_and_shell_false():
+    path = NOVA_ROOT / "skills" / "add_app.py"
+    calls = _find_popen_calls(_parse(path))
+    assert calls, "expected a subprocess.Popen(...) call in nova/skills/add_app.py"
+
+    for call in calls:
+        assert call.args and isinstance(call.args[0], ast.List), (
+            "Popen's first argument must be a literal argv list, never a bare string"
+        )
+        shell_kwargs = [kw for kw in call.keywords if kw.arg == "shell"]
+        assert shell_kwargs, "Popen call must pass shell= explicitly"
+        assert shell_kwargs[0].value.value is False
+
+
+def test_add_app_popen_call_is_not_the_first_statement_in_its_function():
+    """Same minimal-but-real check as open_app's: a validator/rollback path
+    that got deleted entirely must not go unnoticed just because Popen is
+    still called somewhere."""
+    path = NOVA_ROOT / "skills" / "add_app.py"
+    tree = _parse(path)
+
+    for node in ast.walk(tree):
+        if isinstance(node, ast.AsyncFunctionDef):
+            popen_calls = _find_popen_calls(node)
+            if not popen_calls:
+                continue
+            target = popen_calls[0]
+            index = None
+            for i, stmt in enumerate(node.body):
+                if any(n is target for n in ast.walk(stmt)):
+                    index = i
+                    break
+            assert index is not None, "could not locate the statement containing the Popen call"
+            assert index > 0, (
+                f"Popen(...) is the first statement in {node.name}() — no validation precedes it"
+            )
+            return
+    pytest.fail("no async function containing a Popen call was found in add_app.py")
+
+
+def test_add_app_popen_target_is_the_freshest_third_resolution_not_an_earlier_one():
+    """The module docstring's point 3 claims resolution happens three
+    times (display, post-decision, pre-write) and that the Popen call uses
+    the LAST of those (`final_resolved`), never a value computed earlier in
+    the same call — the whole point of re-resolving immediately before the
+    write is defeated if the launch then uses a stale variable instead.
+    Pinned structurally: the sole positional argument passed to `str(...)`
+    inside Popen's argv list must be a bare Name, and that name must not be
+    the earlier `resolved` variable that add_app() also has in scope."""
+    path = NOVA_ROOT / "skills" / "add_app.py"
+    calls = _find_popen_calls(_parse(path))
+    assert calls, "expected a subprocess.Popen(...) call in nova/skills/add_app.py"
+
+    call = calls[0]
+    argv = call.args[0]
+    assert isinstance(argv, ast.List) and len(argv.elts) == 1
+    wrapped = argv.elts[0]
+    assert (
+        isinstance(wrapped, ast.Call)
+        and isinstance(wrapped.func, ast.Name)
+        and wrapped.func.id == "str"
+        and len(wrapped.args) == 1
+    ), "expected Popen([str(<something>)], ...)"
+    inner = wrapped.args[0]
+    assert isinstance(inner, ast.Name), f"expected a bare variable name, got {ast.dump(inner)}"
+    assert inner.id == "final_resolved", (
+        f"Popen launches {inner.id!r}, not the freshest pre-write resolution "
+        "('final_resolved') the module docstring promises"
+    )
+    assert inner.id != "resolved", (
+        "Popen launches the FIRST resolution, computed before the CONFIRM "
+        "decision — the whole point of re-resolving before the write is "
+        "defeated if the launch doesn't use that fresh value"
+    )
