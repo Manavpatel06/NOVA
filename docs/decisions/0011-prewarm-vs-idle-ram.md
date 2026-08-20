@@ -1,6 +1,6 @@
-# ADR 0011: pre-warm models at boot vs. stay lazy — priced, not decided
+# ADR 0011: pre-warm models at boot vs. stay lazy — DECIDED: stay lazy
 
-**Status: open. This is Manav's decision, not the team's — see
+**Status: DECIDED by Manav, 2026-08-20 — do not pre-warm. NOVA stays lazy.**
 `docs/M2_OPEN_BRAIN_PLAN.md` T2.2, which asked for this trade to be written
 down "with both numbers, and Manav decides," explicitly not chosen silently.**
 
@@ -91,3 +91,34 @@ way.
 
 **Not decided here.** Both numbers are now real, not modelled, per T2.2's
 instructions. Manav's call.
+
+---
+
+## Decision (Manav, 2026-08-20): do not pre-warm
+
+NOVA keeps loading models on first use. The first turn of a session pays
+~4.5-4.8 s; every turn after it is ~1.1 s to first audio, comfortably inside the
+1.5 s budget.
+
+**What this buys.** On any day Manav never speaks to NOVA, it costs him nothing
+beyond a ~60 MB idle process. That is the common case on a 16 GB machine he also
+works on — an assistant that is *usually* silent should not hold ~800 MB against
+the possibility of being asked something.
+
+**What it costs, stated plainly so nobody is surprised.** The first request after
+a cold start feels slow, and that is *exactly what Manav reported* on 2026-08-20
+("~5-8 s, felt slow") before any of this was measured. This decision means that
+experience is retained, deliberately, rather than engineered away. It is the
+right trade only because the cost is paid once per session and is invisible
+thereafter.
+
+**What would reopen this.** A pre-warm triggered by something better than boot —
+the wake word arming, the tray being clicked, the hotkey going down — would buy
+most of the latency for a fraction of the idle cost, because it starts loading
+during the seconds Manav is still speaking. That is a real future option and it
+is *not* what was rejected here. What was rejected is paying the full floor
+unconditionally at boot.
+
+Recorded as a decision rather than a default: NOVA is lazy because that was
+chosen with both numbers on the table, not because nobody got round to changing
+it.
