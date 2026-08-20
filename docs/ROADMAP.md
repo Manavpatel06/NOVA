@@ -34,15 +34,15 @@ for one specific reason recorded below.
 
 | Item | State |
 |---|---|
-| Wake word (`hey_jarvis` stand-in) | **Built, tested** (40 tests). Vendored rather than depending on `openwakeword`, whose unconditional `requests` import would have made the no-socket guarantee unenforceable (ADR 0007). Measured 0.99224 TP / 0.00004 control, independently re-verified. **Deliberately not wired in** — see below |
+| Wake word (`hey_jarvis` stand-in) | **LIVE** — wired into the turn loop 2026-08-20 (`6d62171`). NOVA answers to its name. **Built, tested** (40 tests). Vendored rather than depending on `openwakeword`, whose unconditional `requests` import would have made the no-socket guarantee unenforceable (ADR 0007). Measured 0.99224 TP / 0.00004 control, independently re-verified. Was deliberately held back until both preconditions existed; they do |
 | VAD endpointing, pre-roll ring, arm timeout | **Built, tested.** 1000 ms pre-roll derived from the classifier's ~760 ms receptive field, not a round number |
-| Half-duplex ducking | **NOT BUILT — this is what gates M1.** Finding F26; contract written as T1.7. No coordination exists between `Player` and `WakeWord` at all |
+| Half-duplex ducking | **BUILT** (T1.7/F26) — was the gate on wiring the wake word. Finding F26; contract written as T1.7. No coordination exists between `Player` and `WakeWord` at all |
 | Full-duplex AEC | **Explicitly descoped**, as the roadmap's own "no silent aspiration" clause demands. Neither backend has a reliable Windows wheel; half-duplex is sufficient and is stated as such rather than aspired to |
 | Tray icon, hotkey, single-instance guard | **Built, tested** (33 tests). Guard verified to work independently of the tray icon existing |
 | Governor with **measured** RSS/VRAM | **Built, tested** (17 tests), measurements published — and they contradicted the budget I had invented, so `ARCHITECTURE.md` was rewritten from them |
 | Permission ladder with a working CONFIRM UI | **Built, tested.** Three distinct denial reasons; the dialog drives a real `Ladder` and produces real audit records. **Never confirmed by a human clicking it** — which is exactly how the retired build's CONFIRM died while shipping two working dialogs |
 
-### Why M1 does not ship yet
+### Why M1 was held back, and why it no longer is
 
 The wake word is finished and stays unwired until a duplex gate exists. The
 retired build hit the self-echo loop — NOVA hears its own reply, the detector
