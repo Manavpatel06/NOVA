@@ -7,8 +7,41 @@ The M0 thread, end to end:
 
 `NovaApp` wires to the `EventBus`, not to the other modules directly: it
 subscribes to `ptt.start`/`ptt.end` (published by `nova.interfaces.hotkey`)
-rather than reaching into the hotkey module, so M1's wake word is a drop-in
-publisher swap, not a rewrite of this file.
+and, since M1's wake word (docs/THREAT_MODEL_ALWAYS_ON.md), `wake.start`/
+`wake.end` (published by `nova.audio.wake.WakeWord`) rather than reaching
+into either module directly — this file was written so that second
+subscription would be a drop-in publisher swap, not a rewrite, and F28's
+ceiling/`ArmedBy` seam is what actually made landing it safe (see below).
+
+**Capture's lifecycle changed for the wake word, and it is worth being
+explicit about the shape.** Before M1, `Capture` started on `ptt.start` and
+stopped on `ptt.end` — the mic was only ever open inside an explicit,
+human-armed window. `WakeWord.process()` needs to see every frame
+continuously to hear the wake phrase at all (`nova/audio/wake.py`'s own
+module docstring), so `Capture` now runs for the whole app lifetime,
+started once in `start()`, read by exactly one continuous loop
+(`_continuous_capture_loop`) that fans each frame out to at most two
+destinations: the active PTT/wake session buffer (if either is capturing)
+and `WakeWord.process()` — SUPPRESSED while a PTT session is capturing
+(the lead's ruling: a PTT session already proves presence and deliberate
+speech, so the wake word re-arming INSIDE that same utterance would only
+produce a redundant, overlapping second turn, never a legitimate new one;
+suppression can only ever reduce arming, never permit more, which is the
+fail-safe direction). `Capture.read()` pulls from one shared queue with
+one intended consumer — this is why there is exactly one reader loop, not
+one per session, and why `_on_ptt_start`/`_on_ptt_end` no longer own
+`Capture`'s start/stop at all, only a boolean flag and a frame buffer.
+
+Landing this required two preconditions docs/THREAT_MODEL_ALWAYS_ON.md
+named explicitly and called a precondition for wiring the wake word in at
+all, not a follow-up: a mute-while-speaking control between `Player` and
+`WakeWord`/`Capture` (`nova.audio.duplex.DuplexGate`, T1.7/F26, already
+built) so NOVA's own playback can't re-trigger its own detector, and a
+decision capping what an acoustic-only arm can reach (F28, T2.2's
+`Ladder.authorize(ceiling=...)` / `SkillCtx.armed_by`) so an external
+source (a TV, a person who isn't Manav) saying something wake-phrase-shaped
+can reach READ at most, never ACT/CONFIRM. Both were checked as landed,
+not assumed, before this wiring went in.
 
 Every skill call goes through `SkillSpec.invoke()` — never a handler
 directly — because that is the seam `nova-dev-sec` wired `Ladder.authorize()`
@@ -51,7 +84,9 @@ import numpy as np
 
 import nova.skills  # import triggers discover_skills() (nova/skills/__init__.py)
 from nova.audio.capture import Capture
+from nova.audio.duplex import DuplexGate
 from nova.audio.player import Player
+from nova.audio.wake import TOPIC_WAKE_END, TOPIC_WAKE_START, WakeEvent, WakeWord
 from nova.brain.router import Router
 from nova.config import Config, load_config
 from nova.governor import TOPIC_TURN_END, TOPIC_TURN_START, Governor
@@ -130,6 +165,18 @@ class NovaApp:
         self.player = Player()
         self.hotkey = Hotkey(self.bus)
 
+        # --- wake word (M1, docs/THREAT_MODEL_ALWAYS_ON.md). DuplexGate
+        # subscribes itself to TOPIC_SPEAK_START/END at construction (its
+        # own docstring: "one instance, constructed at boot") -- built
+        # before WakeWord so it can be threaded in as WakeWord's gate=
+        # from the start, never a gap where the detector could run ungated.
+        # Neither loads a model here; WakeWord.start() (called from this
+        # app's own start(), below) is what loads the ONNX sessions, and
+        # degrades loudly on its own if the model files are missing (see
+        # its own docstring) -- this app does not duplicate that check.
+        self.duplex_gate = DuplexGate(self.bus)
+        self.wake_word = WakeWord(self.bus, gate=self.duplex_gate)
+
         # --- tray icon (T1.4): subscribes itself to ptt/turn/speak topics
         # in its own __init__ (see nova.interfaces.tray's module docstring
         # for why TOPIC_SPEAK_* are owned there rather than here). Quit from
@@ -145,11 +192,30 @@ class NovaApp:
         self.governor.register("transcriber", self.transcriber, typical_rss_mb=780.0)
         self.governor.register("synth", self.synth, typical_rss_mb=1150.0)
 
-        # --- capture session state, populated per ptt.start/ptt.end pair
-        self._capture: Capture | None = None
+        # --- capture: ONE instance, ONE continuous reader for the app's
+        # whole lifetime (module docstring's "Capture's lifecycle changed"
+        # section explains why). Constructed here so probing the input
+        # device happens once, at boot, not on Manav's first PTT press;
+        # started/stopped in start()/stop(), never inside a bus handler.
+        self._capture = Capture()
+        self._capture_reader_task: asyncio.Task[None] | None = None
+        self._capture_reader_stop: asyncio.Event | None = None
+
+        # --- PTT session state, populated per ptt.start/ptt.end pair. A
+        # plain list the continuous reader appends to while `_capturing`,
+        # not a dedicated per-session task any more -- there is only ever
+        # one reader now.
         self._capturing = False
-        self._capture_stop: asyncio.Event | None = None
-        self._capture_task: asyncio.Task[list[np.ndarray]] | None = None
+        self._ptt_frames: list[np.ndarray] = []
+
+        # --- wake session state, populated per wake.start/wake.end pair,
+        # same shape as the PTT state above and fed by the same continuous
+        # reader. `preroll` (WakeEvent.wake.start's lead-in audio) seeds
+        # the buffer in _on_wake_start so the phrase itself isn't lost --
+        # WakeWord's own detection is inherently a little late relative to
+        # when the phrase started (nova/audio/wake.py's own docstring).
+        self._wake_capturing = False
+        self._wake_frames: list[np.ndarray] = []
 
         # serializes turns -- a stray second ptt.start mid-turn must not
         # start a second, overlapping run_turn()
@@ -169,11 +235,44 @@ class NovaApp:
 
         self.bus.subscribe(TOPIC_PTT_START, self._on_ptt_start)
         self.bus.subscribe(TOPIC_PTT_END, self._on_ptt_end)
+        self.bus.subscribe(TOPIC_WAKE_START, self._on_wake_start)
+        self.bus.subscribe(TOPIC_WAKE_END, self._on_wake_end)
 
     # -- lifecycle ----------------------------------------------------------
 
     async def start(self) -> None:
-        """Arm the hotkey and start listening. Loads no models."""
+        """Arm the hotkey and start listening. Loads no models except
+        WakeWord's -- small (~1MB each, its own module docstring), always-
+        resident, and not governor-managed (unlike Transcriber/Synth it is
+        never unloaded while idle; there is no idle for an always-on
+        detector to be idle *from*).
+
+        Starts Capture once, for the app's whole lifetime, before either
+        the wake word or the hotkey needs it -- see module docstring's
+        "Capture's lifecycle changed" section. A missing/unusable input
+        device degrades the same way the hotkey backend already does:
+        loud WARNING, no exception, both PTT and the wake word are simply
+        non-functional for this boot (there is no third path around "no
+        microphone").
+        """
+        try:
+            self._capture.start()
+            self._capture_reader_stop = asyncio.Event()
+            self._capture_reader_task = asyncio.create_task(self._continuous_capture_loop())
+        except Exception as exc:
+            _log.error(
+                "Capture failed to start (%s) -- neither push-to-talk nor the wake word "
+                "will produce any audio until this is fixed.",
+                exc,
+            )
+
+        self.wake_word.start(loop=asyncio.get_running_loop())
+        if not self.wake_word.backend_available:
+            _log.warning(
+                "Wake word unavailable (see the WARNING above naming why) -- "
+                "NOVA will still respond to push-to-talk."
+            )
+
         self.hotkey.start(loop=asyncio.get_running_loop())
         if not self.hotkey.backend_available:
             _log.warning(
@@ -191,9 +290,24 @@ class NovaApp:
         await self.governor.start()
 
     async def stop(self) -> None:
-        """Tear down cleanly: stop the hotkey, the tray, the governor,
-        release loaded models."""
+        """Tear down cleanly: stop the hotkey, the wake word, the
+        continuous capture reader, the tray, the governor, release loaded
+        models.
+
+        Order matters: the reader task must actually finish (it is the
+        only thing calling `self._capture.read()`) before `Capture.stop()`
+        closes the stream underneath it, and the wake word stops before
+        Capture so nothing calls `WakeWord.process()` on a frame read from
+        a stream that's mid-teardown.
+        """
         self.hotkey.stop()
+        self.wake_word.stop()
+        if self._capture_reader_stop is not None:
+            self._capture_reader_stop.set()
+        if self._capture_reader_task is not None:
+            await self._capture_reader_task
+            self._capture_reader_task = None
+        self._capture.stop()
         self.tray.stop()
         await self.governor.stop()
         self.transcriber.unload()
@@ -216,44 +330,66 @@ class NovaApp:
 
     # -- bus handlers ---------------------------------------------------
 
+    async def _continuous_capture_loop(self) -> None:
+        """Runs for the app's whole lifetime (launched once from start(),
+        stopped from stop()) — the single consumer of `Capture.read()`,
+        fanning each frame out to whichever of PTT/wake is actually
+        capturing. See module docstring's "Capture's lifecycle changed"
+        section for why there is exactly one of these rather than one per
+        session.
+
+        Suppression, not just routing: `WakeWord.process()` is skipped
+        entirely while a PTT session is capturing (never fed the frame at
+        all, not muted after the fact) -- the lead's ruling on why a wake
+        re-arm inside a PTT utterance would only ever be redundant, never
+        legitimate, and why suppressing is the fail-safe direction (it can
+        only reduce arming, never permit more).
+        """
+        assert self._capture_reader_stop is not None
+        stop_event = self._capture_reader_stop
+
+        def _blocking_read() -> np.ndarray | None:
+            try:
+                return self._capture.read(timeout=_CAPTURE_POLL_S)
+            except queue.Empty:
+                return None
+            except Exception as exc:
+                _log.error("Capture.read() failed in the continuous loop (%s)", exc)
+                return None
+
+        while not stop_event.is_set():
+            frame = await asyncio.to_thread(_blocking_read)
+            if frame is None:
+                continue
+            if self._capturing:
+                self._ptt_frames.append(frame)
+            else:
+                self.wake_word.process(frame)  # own broad try/except; safe to call from any thread/context
+            if self._wake_capturing:
+                self._wake_frames.append(frame)
+
     async def _on_ptt_start(self, event: PTTEvent) -> None:
         if self._capturing:
             _log.warning("ptt.start received while a capture is already in progress; ignoring")
             return
-        try:
-            if self._capture is None:
-                self._capture = Capture()
-            self._capture.start()
-        except Exception as exc:
-            _log.error("Capture failed to start (%s); this turn will produce no audio", exc)
-            return
+        if self._wake_capturing:
+            # A human just grabbed the hotkey mid-wake-session (the wake
+            # word fired, VAD is still watching for end-of-speech, and PTT
+            # arrived before wake.end did). PTT is the stronger, more
+            # deliberate signal -- abort the in-flight wake turn rather
+            # than let both eventually fire; _turn_lock would only
+            # serialize two overlapping replies to what was really one
+            # utterance, not prevent the second one.
+            _log.info("ptt.start: aborting an in-flight wake-armed session in favor of push-to-talk")
+            self._wake_capturing = False
+            self._wake_frames = []
 
         self._capturing = True
-        self._capture_stop = asyncio.Event()
-        self._capture_task = asyncio.create_task(self._read_capture_until_stopped())
+        self._ptt_frames = []
         _log.info("ptt.start: capture began")
 
-    async def _read_capture_until_stopped(self) -> list[np.ndarray]:
-        assert self._capture is not None and self._capture_stop is not None
-        capture = self._capture
-        stop_event = self._capture_stop
-
-        def _blocking_reader() -> list[np.ndarray]:
-            frames: list[np.ndarray] = []
-            while not stop_event.is_set():
-                try:
-                    frames.append(capture.read(timeout=_CAPTURE_POLL_S))
-                except queue.Empty:
-                    continue
-                except Exception as exc:
-                    _log.error("Capture.read() failed mid-turn (%s); ending capture early", exc)
-                    break
-            return frames
-
-        return await asyncio.to_thread(_blocking_reader)
-
     async def _on_ptt_end(self, event: PTTEvent) -> None:
-        if not self._capturing or self._capture_task is None or self._capture_stop is None:
+        if not self._capturing:
             _log.warning("ptt.end received with no active capture; ignoring")
             return
 
@@ -268,15 +404,9 @@ class NovaApp:
         await self._mark(turn_id, "ptt_end")
 
         self._capturing = False
-        self._capture_stop.set()
-        frames = await self._capture_task
-        self._capture_task = None
+        frames = self._ptt_frames
+        self._ptt_frames = []
         await self._mark(turn_id, "capture_drained")
-        try:
-            assert self._capture is not None
-            self._capture.stop()
-        except Exception as exc:
-            _log.warning("Capture.stop() failed (%s)", exc)
 
         if not frames:
             _log.warning("ptt session (mode=%s) produced no audio frames", event.mode)
@@ -287,6 +417,49 @@ class NovaApp:
         duration_s = len(pcm) / 16000
         _log.info("ptt.end (mode=%s): captured %.2fs of audio", event.mode, duration_s)
         await self.run_turn(pcm, source=f"ptt:{event.mode}", armed_by=ArmedBy.PTT, turn_id=turn_id)
+
+    async def _on_wake_start(self, event: WakeEvent) -> None:
+        if self._wake_capturing:
+            _log.warning("wake.start received while a wake capture is already in progress; ignoring")
+            return
+        if self._capturing:
+            # Structurally shouldn't happen -- _continuous_capture_loop
+            # never feeds WakeWord.process() while a PTT session is
+            # capturing, so it cannot have detected anything to arm on.
+            # Logged rather than silently accepted in case that invariant
+            # is ever broken by a future change to the loop above.
+            _log.warning("wake.start received during an active PTT session; ignoring (should be unreachable)")
+            return
+        self._wake_capturing = True
+        # preroll is the audio immediately before detection -- the
+        # classifier's own receptive field makes detection inherently a
+        # little late relative to when the phrase actually started
+        # (nova/audio/wake.py's own docstring); seeding the buffer with it
+        # is how the wake phrase itself isn't lost from the transcript.
+        self._wake_frames = [event.preroll] if event.preroll is not None else []
+        _log.info("wake.start: wake word detected, listening for the command")
+
+    async def _on_wake_end(self, event: WakeEvent) -> None:
+        if not self._wake_capturing:
+            _log.warning("wake.end received with no active wake capture; ignoring")
+            return
+
+        turn_id = self._next_turn_id()
+        await self._mark(turn_id, "wake_end")
+
+        self._wake_capturing = False
+        frames = self._wake_frames
+        self._wake_frames = []
+
+        if not frames:
+            _log.warning("wake session (mode=%s) produced no audio frames", event.mode)
+            await self._speak_and_mark("I didn't catch that.", turn_id)
+            return
+
+        pcm = np.concatenate(frames)
+        duration_s = len(pcm) / 16000
+        _log.info("wake.end (mode=%s): captured %.2fs of audio", event.mode, duration_s)
+        await self.run_turn(pcm, source="wake", armed_by=ArmedBy.WAKE, turn_id=turn_id)
 
     def _next_turn_id(self) -> str:
         """Mint the next turn_id -- see the T2.2 comment in __init__ for why
