@@ -91,8 +91,8 @@ Warm turn ~2.3 s. Nothing regressed.
 ### Pending — requires a human, and cannot be closed without one
 
 M0's exit bar in `docs/ROADMAP.md` is *"Manav holds the hotkey, says 'open
-notepad', Notepad opens, NOVA says so out loud."* **One of the three below is now
-closed; two remain.** Until they are observed, that bar is **unmet**, no matter
+notepad', Notepad opens, NOVA says so out loud."* **Two of the three below are now
+closed; one remains — the elevated-window hotkey question.** Until they are observed, that bar is **unmet**, no matter
 how much of the code path is proven.
 
 - [x] **Speakers are audible — CLOSED 2026-08-18 by Manav.** He confirmed hearing
@@ -107,9 +107,23 @@ how much of the code path is proven.
       reaches them — not that the new prober picks the right endpoint every time.
       `scripts/probe_output.py` plays a tone through the current path if that
       ever needs re-confirming.
-- [ ] **A real human voice transcribes correctly.** All STT evidence to date is
-      Kokoro's synthetic speech, which is real speech but not a human in a room
-      with ambient noise.
+- [x] **A real human voice transcribes correctly — CLOSED 2026-08-20 by Manav.**
+      He spoke to NOVA through the real microphone and it worked end to end:
+
+      | Said | Result |
+      |---|---|
+      | "what time is it" | answered correctly (~5-8 s total, **felt slow**) |
+      | "open notepad" | **Notepad genuinely launched** |
+      | "open \<other apps\>" | **refused** — the closed allowlist held against a real request |
+      | "what can you do" | produced a clarifying question — *wrong answer, see M2* |
+
+      This is the first time a human has spoken to this assistant. Every prior
+      STT number was Kokoro-synthetic. Two things it settles beyond the tick:
+      the allowlist refuses a real spoken request rather than only a synthetic
+      one, and the confidence floor asks rather than guesses on a question it
+      has no skill for. Two things it opens: **~5-8 s is too slow** (M2 latency
+      work), and **"what can you do" should never be a clarifying question**
+      (M2 self-knowledge).
 - [ ] **The hotkey fires while an elevated (UAC) window has focus.** Unknown.
       `WH_KEYBOARD_LL` behaviour across the UIPI boundary was deliberately not
       asserted from memory. Run Task Manager as administrator and press
