@@ -393,13 +393,39 @@ class NovaApp:
                     _log.info("Turn (%s): STT returned empty text; nothing to route", source)
                     await self._speak_and_mark("I didn't catch that.", turn_id)
                     return None
-                _log.info("Turn (%s): heard %r", source, text)
+                # docs/THREAT_MODEL_ALWAYS_ON.md §1.4: a PTT-armed turn only
+                # ever logs what Manav deliberately pressed the hotkey and
+                # said -- full verbatim logging there is fine, and stays.
+                # A wake-armed turn has no such bound: every detector fire,
+                # including a false accept from a TV or ambient noise, would
+                # otherwise write whatever the room said, verbatim, to
+                # nova.log.LOG_PATH -- a local plaintext file the retired
+                # build's own hotkey module already named as "a file that
+                # later gets attached to a bug report." Gating this behind
+                # a debug LOG LEVEL would not actually help: nova/log.py's
+                # file handler is set to DEBUG (only the console handler
+                # caps at INFO), so a debug-level call still lands in the
+                # persistent file just as verbatim as INFO would. Length
+                # only, never content, for a wake-armed turn -- the honest
+                # fix, not a truncation cap that a short ambient snippet
+                # would sail under anyway.
+                if armed_by is ArmedBy.WAKE:
+                    _log.info("Turn (%s): heard %d chars (wake-armed; content withheld from the log)", source, len(text))
+                else:
+                    _log.info("Turn (%s): heard %r", source, text)
 
                 # --- router ------------------------------------------------
                 try:
                     match = self.router.route(text)
                 except Exception as exc:
-                    _log.error("Turn (%s): Router.route(%r) failed (%s)", source, text, exc)
+                    # Same §1.4 reasoning as the "heard" log above -- an
+                    # internal Router crash is rare, but a wake-armed turn
+                    # hitting it must not be the one path that still leaks
+                    # room audio verbatim into the log file.
+                    if armed_by is ArmedBy.WAKE:
+                        _log.error("Turn (%s): Router.route() failed on %d chars (wake-armed; content withheld) (%s)", source, len(text), exc)
+                    else:
+                        _log.error("Turn (%s): Router.route(%r) failed (%s)", source, text, exc)
                     await self._mark(turn_id, "abort:route")
                     await self._speak_and_mark("Sorry, something went wrong understanding that.", turn_id)
                     return None
