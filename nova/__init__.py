@@ -50,3 +50,13 @@ LOG_PATH: Path = DATA_DIR / "nova.log"
 AUDIO_PROFILE_PATH: Path = DATA_DIR / "audio_profile.json"
 GPU_PROFILE_PATH: Path = DATA_DIR / "gpu_profile.json"
 AUDIT_LOG_PATH: Path = DATA_DIR / "audit.log"
+
+#: T2.3a's machine-written allowlist additions (nova.skills.add_app) --
+#: deliberately NOT under config/, and NOT git-tracked. config/nova.yaml is
+#: hand-authored and carries comments a runtime dump-and-rewrite would
+#: destroy (the wake threshold's whole derivation lives in one); this file
+#: is exclusively machine-written, same lifecycle as audit.log and the two
+#: profile caches above. nova/config.py's load_config() merges this file's
+#: entries into Config.security.allowed_apps, with nova.yaml always winning
+#: on a name conflict -- see its module docstring for the merge rule.
+LEARNED_APPS_PATH: Path = DATA_DIR / "learned_apps.json"

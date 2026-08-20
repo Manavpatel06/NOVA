@@ -281,6 +281,34 @@ class Ladder:
                 reason, skill.name, exc,
             )
 
+    def record_event(self, kind: str, payload: dict[str, Any]) -> None:
+        """Audit a security-relevant EFFECT a skill produced after its own
+        `authorize()` call already approved it — first user: T2.3a's
+        `add_app` recording the resolved path it just wrote to the
+        allowlist. `authorize()`'s own record deliberately does NOT carry
+        that detail (F46: the audit records what a call was actually
+        invoked with; a CONFIRM prompt's `confirm_display` is a separate,
+        display-only overlay — conflating the two was what made F46 a
+        finding in the first place), so a skill that needs a durable record
+        of what it actually DID, not just that it was allowed to run,
+        reaches for this instead of inventing its own audit path.
+
+        Unlike `record_denial`, this is NOT best-effort: it re-raises
+        `AuditWriteError` rather than swallowing it. A refusal that already
+        happened costs nothing if its own log entry fails to write: the
+        outcome (deny) is unchanged either way. A successful write that
+        just granted a future capability is the opposite case — an
+        unrecorded grant sitting on disk is precisely what "audit failure
+        means deny" (this module's own docstring, rule 1) exists to
+        prevent, applied here to "was this durably recorded as having
+        happened" rather than "was this allowed to happen". The caller
+        (add_app) is responsible for rolling back whatever it just did if
+        this raises — this method only makes the failure loud, the same
+        division of labor `AuditLog.record()` itself already has with
+        every ACT/CONFIRM path above.
+        """
+        self._audit.record({"kind": kind, **payload})
+
     def _record(
         self,
         skill: SkillSpec,

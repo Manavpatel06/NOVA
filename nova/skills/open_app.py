@@ -31,6 +31,7 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+from nova.config import orphaned_app_names
 from nova.log import get_logger
 from nova.security.tiers import Tier
 from nova.skills.registry import Reply, SkillCtx, skill
@@ -140,6 +141,19 @@ async def open_app(ctx: SkillCtx, app: str) -> Reply:
     name = app.strip().lower()
     resolved, reason = _resolve_and_verify(name, ctx)
     if resolved is None:
+        # F62's UX follow-up: a name that's in data/learned_apps.json but
+        # was refused at load time for having no matching audit record
+        # (F63 -- see nova.config's module docstring) still deserves a
+        # more honest refusal than the generic "I don't know how to open
+        # X" a name NOVA has genuinely never seen. This is a text-only
+        # difference -- both branches return the identical Reply shape
+        # (ACT tier, success=False, no side effect) -- it changes nothing
+        # about what's trusted, only what a human is told about why.
+        if name in orphaned_app_names():
+            return Reply(
+                text=f"I have '{app}' on file, but no record of ever approving it — try adding it again.",
+                success=False,
+            )
         return Reply(text=f"I don't know how to open '{app}'.", success=False)
 
     logger.info("open_app: launching %r -> %s", app, resolved)

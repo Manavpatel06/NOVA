@@ -1,4 +1,5 @@
-"""Load and validate config/nova.yaml — the one config file (docs/CONTRACTS.md).
+"""Load and validate config/nova.yaml — the one HUMAN-authored config file
+(docs/CONTRACTS.md).
 
 Design rules this module enforces:
   - Unknown keys anywhere in the file are a hard error naming the offending
@@ -7,11 +8,115 @@ Design rules this module enforces:
     key here unless you can point at the code that reads it.
   - No module reads os.environ or hardcodes a path — this is the only place
     nova.yaml is parsed, and nova/__init__.py is the only place paths live.
+
+**T2.3a's second, machine-written source**: `nova.LEARNED_APPS_PATH`
+(`data/learned_apps.json`), merged into `Config.security.allowed_apps` at
+the end of `load_config()`. Deliberately a separate file rather than a
+runtime rewrite of nova.yaml itself — nova.yaml is hand-authored and its
+comments are load-bearing (the wake threshold's whole derivation, F27/F41,
+lives in one; see WakeConfig.threshold below). A dump-and-rewrite of the
+parsed dict back to YAML would destroy every one of them the first time
+`nova.skills.add_app` wrote an entry, and a naive comment-preserving-YAML
+library is one more dependency and one more way a machine write could
+subtly corrupt a file a human also hand-edits. Machine-written state and
+human-authored config have different lifecycles (this file's own git
+history changes on a `git commit`; `learned_apps.json`'s changes on
+whatever Manav approves by voice) — the same reasoning `data/`'s existing
+contents (audit.log, the two profile caches) already follow, applied here
+for the first time to something that feeds a *security* boundary rather
+than a cache.
+
+The merge rule, load-bearing and simple on purpose: nova.yaml's own
+`security.allowed_apps` always wins on a name conflict. The learned file
+can only ADD a name nova.yaml doesn't already configure — it can never
+override or shadow a human-configured entry, and it can never add or widen
+`allowed_app_dirs` (the actual trust boundary) at all; that stays
+exclusively human-controlled, on purpose (nova.skills.add_app's own module
+docstring explains what this costs in practice).
+
+**F62/F63 (nova-security): reconciliation against the audit log, not
+unconditional trust.** Planting `learned_apps.json` directly is strictly
+easier than the voice path it was built to protect — it skips Start Menu
+resolution, the CONFIRM prompt, `add_app`'s three-layer TOCTOU check, AND
+the audit trail, all in the one step of editing a file. `open_app`'s own
+containment check still bounds the damage (a planted entry can't point
+outside `allowed_app_dirs`), but a planted entry aimed at a legitimate
+in-boundary binary would otherwise load and launch under any friendly name
+with zero record of how it got there — precisely the silent-grant failure
+`add_app` exists to prevent, reached by skipping the mechanism rather than
+breaking it. So every entry in the learned file is checked against
+`nova.AUDIT_LOG_PATH` for a matching `skill.add_app.learned` record
+(`nova.security.ladder.Ladder.record_event()`'s own write) before it is
+trusted; an orphan — present in the file, absent from the log — is logged
+loudly and dropped from the merge, never silently trusted by default. This
+is a plain content scan, not a cryptographic replay of the audit chain's
+hash links: per nova-security's own framing, planting is already inside
+the attacker model for every file under `data/`, audit.log included, so
+verifying hash-chain integrity here would not raise the bar against that
+same attacker, only cost more at every boot for no real gain. This makes
+an inconsistent state DETECTABLE — the honest ceiling nova-security named
+for this fix — not cryptographically prevented.
+
+**F65 (nova-security, HIGH): a grant can be reversed, so "matching
+record" means the LATEST one, not just any one.** `add_app` now records
+the grant before its own round-trip verification (verifying first
+deadlocked every call — every fresh write looked like an orphan to this
+exact reconciliation, since its confirming record didn't exist yet; see
+`nova.skills.add_app`'s module docstring). A write that then fails
+verification appends a compensating `skill.add_app.rolled_back` event for
+the same `(app, resolved_path)` pair rather than trying to un-record the
+grant — the audit log is append-only and hash-chained, so there is no
+un-recording, only correcting. `_confirmed_learned_apps()` below walks the
+whole log and keeps the LATEST status per pair; a pair is trusted only if
+that latest status is `skill.add_app.learned`, not `skill.add_app.
+rolled_back`. A ledger that records both a grant and its own reversal, in
+order, is honest in a way silently discarding either one would not be.
+
+**F66 (nova-security): reconciliation compares `learned_app_path_key()`
+(a sha256 digest), not the literal resolved path.** `AuditLog.record()`
+runs every string through `nova.security.redact.redact()` (F14) before
+writing, which rewrites the user-home segment of any path under
+`C:\\Users\\<name>\\...`. Real installed apps overwhelmingly live there, so
+the audit record's own `resolved_path` field is NOT byte-identical to
+`learned_apps.json`'s literal one (which must stay literal — it's what
+`subprocess.Popen` actually launches) for exactly the common case, not an
+edge case: a first verification of F62/F63/F65 against a System32 path
+(never redacted, since it isn't under a user's home directory) missed this
+entirely, and only surfaced once tested against a path that looks like
+what a real `add_app` call actually produces. A sha256 hex digest doesn't
+match `redact()`'s home-path, secret, or email patterns, so it survives
+unchanged on both sides — see `learned_app_path_key()`'s own docstring for
+the verified claim, not an assumed one.
+
+**Measured cost, so "walking the log at every boot" isn't a guess**:
+scanning a synthetic 1,000,000-line audit.log (≈284 MB — the volume of
+roughly 5-10 years of heavy daily use extrapolated from this project's
+real per-entry size) took ~2.4s on this machine. That is material at that
+scale and not something to pretend otherwise. It is NOT material at
+today's or the next few years' real scale: this project's actual
+audit.log is 59 lines as of T2.3a; even 100,000 lines (a very heavy few
+years) scans in well under half a second. No bounded/windowed scan is
+implemented here — a "most recent N lines" cutoff was considered and
+rejected: unlike routine audit growth, `add_app` writes are rare (a human
+voice-approving a new app, not a daily event), so a legitimately-approved
+entry's confirming record could scroll past any fixed recency window
+purely from OTHER, unrelated audit activity accumulating — silently
+un-trusting a working app for a reason that has nothing to do with it,
+which is a worse failure mode than the boot-time cost it would save. The
+honest bounded fix, if this ever becomes real (revisit past roughly
+200,000-300,000 lines, per the measurement above), is a write-time pointer
+— `add_app` recording the exact audit-log position of its own write
+alongside the entry, verified by direct lookup instead of a scan — not a
+sliding window. Not built now because nothing at today's scale asks for
+it, and building it speculatively would be new, untested infrastructure
+for a cost that does not yet exist.
 """
 
 from __future__ import annotations
 
 import dataclasses
+import hashlib
+import json
 import math
 import typing
 from dataclasses import dataclass, field
@@ -20,7 +125,10 @@ from typing import Any
 
 import yaml
 
-from nova import DEFAULT_CONFIG_PATH
+from nova import AUDIT_LOG_PATH, DEFAULT_CONFIG_PATH, LEARNED_APPS_PATH
+from nova.log import get_logger
+
+logger = get_logger("config")
 
 
 class ConfigError(ValueError):
@@ -426,11 +534,176 @@ def _build_section(section_name: str, section_type: type, raw: Any) -> Any:
     return section_type(**kwargs)
 
 
-def load_config(path: Path | None = None) -> Config:
-    """Parse, validate, and return config/nova.yaml as a typed Config tree.
+def _load_learned_apps(path: Path) -> dict[str, str]:
+    """Read T2.3a's machine-written allowlist additions. A missing file is
+    normal (nothing learned yet on this machine) -> {}. A PRESENT but
+    malformed file is a loud ConfigError, same treatment as nova.yaml
+    itself -- this file is written only by nova.skills.add_app's own
+    atomic writer, so a shape this function doesn't recognize means
+    corruption or tampering, not an ordinary missing-file case, and a
+    security-relevant allowlist silently reverting to empty because its
+    file got corrupted is exactly the kind of quiet failure this module
+    exists to refuse.
+    """
+    if not path.exists():
+        return {}
+    try:
+        with path.open("r", encoding="utf-8") as fh:
+            raw = json.load(fh)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise ConfigError(f"{path}: could not read learned apps: {exc}") from exc
+    if not isinstance(raw, dict) or set(raw) - {"allowed_apps"}:
+        raise ConfigError(
+            f"{path}: must be a mapping with only an 'allowed_apps' key, got {raw!r}"
+        )
+    apps = raw.get("allowed_apps", {})
+    if not isinstance(apps, dict) or not all(
+        isinstance(k, str) and isinstance(v, str) for k, v in apps.items()
+    ):
+        raise ConfigError(f"{path}: 'allowed_apps' must be a mapping of str to str")
+    return dict(apps)
 
-    Raises ConfigError if the file is missing, malformed, contains an
-    unknown key at any level, or a value of the wrong type.
+
+_LEARNED_EVENT_KINDS = {"skill.add_app.learned", "skill.add_app.rolled_back"}
+
+
+def learned_app_path_key(resolved_path: str) -> str:
+    """F66 (nova-security): the machine-comparable reconciliation key for a
+    resolved app path — NOT the literal path.
+
+    `AuditLog.record()` runs every string value through `nova.security.
+    redact.redact()` (F14) before writing, which rewrites the user-home
+    segment of any path shaped like `C:\\Users\\<name>\\...` (or the POSIX
+    equivalent) to `[USER]`. Real installed apps overwhelmingly live there
+    — Discord, VS Code, Spotify; `nova.skills.add_app`'s own module
+    docstring already found this true for most of what a human would
+    actually ask to add. So comparing `learned_apps.json`'s literal,
+    unredacted path (it has to stay literal — it's what `subprocess.Popen`
+    launches) against the REDACTED string that landed in the audit record
+    would silently fail reconciliation for exactly that common case. A
+    verification built only against a System32 path (outside the home
+    directory, never redacted) would not catch this — the failure needs a
+    path under the user's profile to appear at all.
+
+    A sha256 hex digest of the literal path sidesteps this rather than
+    fighting it: a hex digest doesn't match `redact()`'s home-path,
+    secret, or email patterns, so `redact(digest) == digest` always —
+    verified directly, not assumed. Both sides compute this same digest
+    from the same literal string (`nova.skills.add_app` when it writes the
+    audit event, this module when it reconciles), so they agree regardless
+    of what redaction did to the path text sitting next to it in the log.
+    The audit record still carries the (redacted) `resolved_path` in plain
+    form for a human reading the log — this key exists purely for the
+    machine comparison, never in place of the readable field.
+    """
+    return hashlib.sha256(resolved_path.encode("utf-8")).hexdigest()
+
+
+def _confirmed_learned_apps(audit_path: Path) -> frozenset[tuple[str, str]]:
+    """F62/F63/F65/F66: the set of (name, path_key) pairs — `path_key`
+    being `learned_app_path_key()`'s hash, not the literal path (F66) —
+    whose MOST RECENT matching audit event is 'skill.add_app.learned', not
+    merely "has one somewhere". See this module's own docstring for why
+    this is a plain content scan, not a hash-chain replay, and what that
+    ceiling honestly buys.
+
+    F65: a grant can be reversed. `nova.skills.add_app` records the grant
+    BEFORE its own round-trip verification (it has to — see that module's
+    docstring for why verifying first deadlocked every call), so a write
+    that fails verification after the grant was already, durably recorded
+    appends a compensating 'skill.add_app.rolled_back' event for the same
+    pair rather than trying to un-record it (the audit log is append-only
+    and hash-chained; there is no un-recording). This function has to
+    honor that: it walks the WHOLE log in order and keeps only the LATEST
+    status per (name, path_key) pair, so a 'rolled_back' event correctly
+    un-trusts a pair its own earlier 'learned' event granted, and a later,
+    fresh 'learned' event (a legitimate re-add) correctly re-trusts a pair
+    an older 'rolled_back' had revoked. Two different kinds sharing one
+    status map, last-write-wins by file position — an append-only log's
+    position IS its timestamp.
+
+    A missing audit.log means "nothing confirmed yet" (empty set), not an
+    error — a fresh machine with no audit history and no learned apps yet
+    is the ordinary starting state. A line that isn't valid JSON is
+    audit.log's OWN integrity problem (AuditLog.verify() is what diagnoses
+    that); silently skipped here rather than raised, so one corrupt line
+    can't turn "nothing confirmed" into "config won't load at all".
+    """
+    if not audit_path.exists():
+        return frozenset()
+    status: dict[tuple[str, str], str] = {}
+    with audit_path.open("r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            event = entry.get("event") if isinstance(entry, dict) else None
+            if not isinstance(event, dict) or event.get("kind") not in _LEARNED_EVENT_KINDS:
+                continue
+            name, path_key = event.get("app"), event.get("resolved_path_key")
+            if isinstance(name, str) and isinstance(path_key, str):
+                status[(name, path_key)] = event["kind"]  # later line overwrites earlier -- file order is chronological
+    return frozenset(pair for pair, kind in status.items() if kind == "skill.add_app.learned")
+
+
+def orphaned_app_names(
+    *, learned_apps_path: Path | None = None, audit_log_path: Path | None = None
+) -> frozenset[str]:
+    """The names in the learned-apps file with NO matching audit record —
+    exactly the entries `load_config()` just refused to trust (F62/F63).
+
+    Exposed standalone rather than through `Config`/`SecurityConfig` on
+    purpose: `_build_section()` treats every declared dataclass field as an
+    ALLOWED nova.yaml key (unknown keys are a hard error), so a purely-
+    computed field would look like a human-settable knob it structurally
+    isn't. A skill wanting a more informative refusal than "I don't know
+    how to open X" for a name it recognizes but doesn't trust
+    (nova.skills.open_app, F62's UX follow-up) calls this directly
+    instead — it does its own fresh read of both files, deliberately not
+    cached, since it only runs on an already-slow-path refusal, never on
+    every boot.
+    """
+    learned_path = Path(learned_apps_path) if learned_apps_path is not None else LEARNED_APPS_PATH
+    audit_path = Path(audit_log_path) if audit_log_path is not None else AUDIT_LOG_PATH
+    try:
+        learned = _load_learned_apps(learned_path)
+    except ConfigError:
+        # A malformed learned_apps.json is load_config()'s own error to
+        # raise loudly on the next boot -- this helper only ever runs
+        # mid-session, on a refusal path, and must not turn "give a nicer
+        # message" into a second way to crash a turn.
+        return frozenset()
+    if not learned:
+        return frozenset()
+    confirmed = _confirmed_learned_apps(audit_path)
+    return frozenset(
+        name for name, resolved_path in learned.items()
+        if (name, learned_app_path_key(resolved_path)) not in confirmed
+    )
+
+
+def load_config(
+    path: Path | None = None,
+    *,
+    learned_apps_path: Path | None = None,
+    audit_log_path: Path | None = None,
+) -> Config:
+    """Parse, validate, and return config/nova.yaml as a typed Config tree,
+    merged with `nova.LEARNED_APPS_PATH`'s machine-written entries (T2.3a;
+    see this module's own docstring for the merge rule and why it's a
+    separate file) and reconciled against `nova.AUDIT_LOG_PATH` (F62/F63;
+    see this module's own docstring for why and its measured cost).
+    `learned_apps_path`/`audit_log_path` override where those two files are
+    read from — for tests only; every real caller gets the defaults.
+
+    Raises ConfigError if nova.yaml or the learned-apps file is malformed,
+    contains an unknown key at any level, or a value of the wrong type. A
+    missing learned-apps file or audit log is normal and not an error; a
+    missing nova.yaml still is.
     """
     config_path = Path(path) if path is not None else DEFAULT_CONFIG_PATH
 
@@ -461,4 +734,40 @@ def load_config(path: Path | None = None) -> Config:
         name: _build_section(name, section_type, raw.get(name))
         for name, section_type in _SECTIONS.items()
     }
+
+    # T2.3a: merge machine-learned allowlist entries UNDER nova.yaml's own —
+    # a name nova.yaml already configures always wins; the learned file can
+    # only ADD names nova.yaml doesn't mention, never override or remove
+    # one. allowed_app_dirs (the actual trust boundary) is never touched by
+    # this merge — the learned file has no key for it at all, enforced by
+    # _load_learned_apps' own "only an allowed_apps key" check above.
+    learned_path = Path(learned_apps_path) if learned_apps_path is not None else LEARNED_APPS_PATH
+    learned = _load_learned_apps(learned_path)
+    if learned:
+        # F62/F63: reconcile before merging — an entry with no matching
+        # audit record was never approved through add_app's CONFIRM path,
+        # whatever put it there, and is dropped rather than trusted by
+        # default (see this module's own docstring for the full reasoning
+        # and the measured cost of the scan this performs).
+        audit_path = Path(audit_log_path) if audit_log_path is not None else AUDIT_LOG_PATH
+        confirmed = _confirmed_learned_apps(audit_path)
+        reconciled: dict[str, str] = {}
+        for name, resolved_path in learned.items():
+            # F66: compare by learned_app_path_key(), not the literal path
+            # — the audit record's own resolved_path may have been
+            # redacted (F14) if it sits under the user's home directory,
+            # which most real installed apps do.
+            if (name, learned_app_path_key(resolved_path)) in confirmed:
+                reconciled[name] = resolved_path
+            else:
+                logger.warning(
+                    "%s: '%s' -> %r has no matching 'skill.add_app.learned' audit record in %s — "
+                    "refusing to trust it (F63: this bypasses Start Menu resolution, the CONFIRM "
+                    "prompt, and the audit trail in one step; not merged into allowed_apps)",
+                    learned_path, name, resolved_path, audit_path,
+                )
+        if reconciled:
+            merged_apps = {**reconciled, **sections["security"].allowed_apps}
+            sections["security"] = dataclasses.replace(sections["security"], allowed_apps=merged_apps)
+
     return Config(**sections)
