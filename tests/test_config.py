@@ -34,7 +34,9 @@ from nova.config import (
     SttConfig,
     TtsConfig,
     load_config,
+    orphaned_app_names,
 )
+from nova.security.audit import AuditLog
 
 
 def _write(path: Path, text: str) -> Path:
@@ -348,6 +350,17 @@ def test_load_config_never_reads_os_environ(monkeypatch, tmp_path):
 # always resolves in nova.yaml's favor, and that the learned file has no
 # way to touch allowed_app_dirs (the actual trust boundary) at all -- so
 # the rejection tests below matter more than the happy-path ones.
+#
+# F62/F63 (nova-security): every merge test below now also passes
+# audit_log_path -- a SECOND file load_config() reconciles learned entries
+# against, per the module's own docstring ("every entry in the learned file
+# is checked against nova.AUDIT_LOG_PATH for a matching 'skill.add_app.
+# learned' record before it is trusted; an orphan... is dropped from the
+# merge"). Omitting the override would read this repo's REAL data/audit.log
+# instead of a tmp one -- exactly the isolation break F64 exists to prevent
+# one class of (see that finding). A test whose intent is "this entry IS
+# trusted" must seed a real matching record via the helper below; a test
+# whose intent is the orphan-rejection path itself doesn't.
 # ---------------------------------------------------------------------------
 
 def _write_learned_raw(path: Path, raw) -> Path:
@@ -359,63 +372,120 @@ def _write_learned(path: Path, apps: dict) -> Path:
     return _write_learned_raw(path, {"allowed_apps": apps})
 
 
+def _confirm(audit_path: Path, name: str, resolved_path: str) -> None:
+    """Write a REAL 'skill.add_app.learned' audit record via the actual
+    AuditLog class (hash-chained envelope, real code path) -- not a
+    hand-built JSON line -- so these tests track the real record shape
+    Ladder.record_event() produces rather than a guess that could drift
+    from it silently."""
+    AuditLog(path=audit_path).record({"kind": "skill.add_app.learned", "app": name, "resolved_path": resolved_path})
+
+
 def test_missing_learned_apps_file_is_not_an_error(tmp_path):
     """A learned file that doesn't exist yet is the normal, expected state
     on a fresh install -- it must load exactly as if T2.3a didn't exist."""
     cfg_path = _write(tmp_path / "nova.yaml", "")
     learned_path = tmp_path / "learned_apps.json"  # deliberately never created
+    audit_path = tmp_path / "audit.log"
     assert not learned_path.exists()
 
-    cfg = load_config(cfg_path, learned_apps_path=learned_path)
+    cfg = load_config(cfg_path, learned_apps_path=learned_path, audit_log_path=audit_path)
 
     assert cfg.security.allowed_apps == {}
 
 
-def test_learned_entries_are_merged_into_allowed_apps(tmp_path):
+def test_a_learned_entry_with_a_matching_audit_record_is_merged(tmp_path):
+    """Deliberately NOT a C:\\Users\\... path -- AuditLog.record() runs
+    every string value through the shared redact(), whose first pass
+    replaces a Windows home-directory segment with [USER]
+    (nova/security/redact.py's _WIN_HOME_RE). A resolved_path under
+    C:\\Users\\... would come back out of the audit log redacted and could
+    never literal-match learned_apps.json's own (unredacted, because it has
+    to be launchable) entry -- see test_redaction_makes_a_users_path_entry_
+    permanently_unconfirmable below, which pins that as a real, known gap
+    rather than silently avoiding it here."""
     cfg_path = _write(tmp_path / "nova.yaml", "")
-    learned_path = _write_learned(tmp_path / "learned_apps.json", {"discord": r"C:\Users\x\Discord.exe"})
+    resolved = r"C:\Machine\Discord.exe"
+    learned_path = _write_learned(tmp_path / "learned_apps.json", {"discord": resolved})
+    audit_path = tmp_path / "audit.log"
+    _confirm(audit_path, "discord", resolved)
 
-    cfg = load_config(cfg_path, learned_apps_path=learned_path)
+    cfg = load_config(cfg_path, learned_apps_path=learned_path, audit_log_path=audit_path)
 
-    assert cfg.security.allowed_apps == {"discord": r"C:\Users\x\Discord.exe"}
+    assert cfg.security.allowed_apps == {"discord": resolved}
+
+
+def test_redaction_makes_a_users_path_entry_permanently_unconfirmable():
+    """KNOWN, REAL GAP -- not a hypothetical, and not routed around. A
+    resolved_path under C:\\Users\\<name>\\... (the module's own docstring
+    names %LOCALAPPDATA%\\Discord\\... -- i.e. exactly this shape -- as the
+    TYPICAL case for a real installed app) can never be confirmed by
+    _confirmed_learned_apps(): AuditLog.record() redacts the username
+    segment on write (F14's shared redact(), correctly applied to every
+    audit record), so the stored resolved_path never equals
+    learned_apps.json's own unredacted entry. This pins the collision at
+    the redact() level directly -- the same mismatch load_config()'s
+    reconciliation would hit for any such path, verified end-to-end by the
+    xfail'd tests in test_skills_add_app.py. Update/remove this test only
+    once the reconciliation mechanism itself accounts for the redaction
+    (e.g. by redacting the learned-file side the same way before
+    comparing, or keying on something the redaction doesn't touch)."""
+    from nova.security.redact import redact
+
+    real_world_path = r"C:\Users\patel\AppData\Local\Discord\app-1.0\Discord.exe"
+    stored_in_audit_log = redact(real_world_path)
+
+    assert stored_in_audit_log != real_world_path, (
+        "if this now passes, redact() no longer touches C:\\Users\\... paths -- "
+        "the reconciliation collision this test documents may no longer apply"
+    )
 
 
 def test_nova_yaml_always_wins_on_a_name_conflict(tmp_path):
     """The load-bearing merge rule: a human-authored entry must never be
     silently overridden by whatever the machine-written file happens to
-    say for the same name, even if the learned entry is 'newer'."""
+    say for the same name, even if the learned entry is 'newer' (and even
+    if it's a confirmed, non-orphaned entry -- audit confirmation is not
+    the same thing as winning a name conflict)."""
     cfg_path = _write(
         tmp_path / "nova.yaml",
         'security:\n  allowed_apps:\n    discord: "C:\\\\Human\\\\Discord.exe"\n',
     )
-    learned_path = _write_learned(tmp_path / "learned_apps.json", {"discord": r"C:\Machine\Discord.exe"})
+    machine_path = r"C:\Machine\Discord.exe"
+    learned_path = _write_learned(tmp_path / "learned_apps.json", {"discord": machine_path})
+    audit_path = tmp_path / "audit.log"
+    _confirm(audit_path, "discord", machine_path)  # confirmed, and STILL must lose to nova.yaml
 
-    cfg = load_config(cfg_path, learned_apps_path=learned_path)
+    cfg = load_config(cfg_path, learned_apps_path=learned_path, audit_log_path=audit_path)
 
     assert cfg.security.allowed_apps == {"discord": r"C:\Human\Discord.exe"}
 
 
 def test_learned_file_can_add_a_name_but_never_shadow_one_nova_yaml_already_has(tmp_path):
     """Both directions in one config: a name only nova.yaml knows stays
-    exactly as nova.yaml wrote it; a name only the learned file knows is
-    added; a name both know resolves to nova.yaml's value."""
+    exactly as nova.yaml wrote it; a confirmed name only the learned file
+    knows is added; a name both know resolves to nova.yaml's value."""
     cfg_path = _write(
         tmp_path / "nova.yaml",
         'security:\n  allowed_apps:\n'
         '    notepad: "C:\\\\Windows\\\\notepad.exe"\n'
         '    discord: "C:\\\\Human\\\\Discord.exe"\n',
     )
+    spotify_path = r"C:\Machine\Spotify.exe"
     learned_path = _write_learned(
         tmp_path / "learned_apps.json",
-        {"discord": r"C:\Machine\Discord.exe", "spotify": r"C:\Machine\Spotify.exe"},
+        {"discord": r"C:\Machine\Discord.exe", "spotify": spotify_path},
     )
+    audit_path = tmp_path / "audit.log"
+    _confirm(audit_path, "discord", r"C:\Machine\Discord.exe")
+    _confirm(audit_path, "spotify", spotify_path)
 
-    cfg = load_config(cfg_path, learned_apps_path=learned_path)
+    cfg = load_config(cfg_path, learned_apps_path=learned_path, audit_log_path=audit_path)
 
     assert cfg.security.allowed_apps == {
         "notepad": r"C:\Windows\notepad.exe",  # nova.yaml-only: untouched
-        "discord": r"C:\Human\Discord.exe",  # conflict: nova.yaml wins
-        "spotify": r"C:\Machine\Spotify.exe",  # learned-only: added
+        "discord": r"C:\Human\Discord.exe",  # conflict: nova.yaml wins even though confirmed
+        "spotify": spotify_path,  # learned-only, confirmed: added
     }
 
 
@@ -428,11 +498,136 @@ def test_learned_apps_never_widens_allowed_app_dirs(tmp_path):
         tmp_path / "nova.yaml",
         'security:\n  allowed_app_dirs:\n    - "C:\\\\Trusted"\n',
     )
-    learned_path = _write_learned(tmp_path / "learned_apps.json", {"discord": r"C:\Machine\Discord.exe"})
+    resolved = r"C:\Machine\Discord.exe"
+    learned_path = _write_learned(tmp_path / "learned_apps.json", {"discord": resolved})
+    audit_path = tmp_path / "audit.log"
+    _confirm(audit_path, "discord", resolved)
 
-    cfg = load_config(cfg_path, learned_apps_path=learned_path)
+    cfg = load_config(cfg_path, learned_apps_path=learned_path, audit_log_path=audit_path)
 
     assert cfg.security.allowed_app_dirs == ["C:\\Trusted"]
+
+
+# ---------------------------------------------------------------------------
+# F62/F63: reconciliation itself -- an entry present in the learned file but
+# absent (or mismatched) in the audit log is an orphan, dropped from the
+# merge with a loud warning, never silently trusted by default. Planting or
+# hand-editing learned_apps.json is strictly easier than going through
+# add_app's CONFIRM path, so this is the control that makes that shortcut
+# not work.
+# ---------------------------------------------------------------------------
+
+
+def test_an_orphaned_learned_entry_with_no_matching_audit_record_is_dropped(tmp_path, caplog):
+    """The load-bearing negative case: a learned entry with NO confirming
+    audit record at all -- exactly what hand-planting the file, or editing
+    it directly instead of going through add_app's voice/CONFIRM path,
+    would produce."""
+    cfg_path = _write(tmp_path / "nova.yaml", "")
+    learned_path = _write_learned(tmp_path / "learned_apps.json", {"discord": r"C:\Planted\Discord.exe"})
+    audit_path = tmp_path / "audit.log"  # never written -- no confirming record exists
+
+    with caplog.at_level("WARNING"):
+        cfg = load_config(cfg_path, learned_apps_path=learned_path, audit_log_path=audit_path)
+
+    assert cfg.security.allowed_apps == {}
+    assert any("discord" in rec.message for rec in caplog.records), (
+        "expected a loud warning naming the orphaned entry, not a silent drop"
+    )
+
+
+def test_missing_audit_log_treats_every_learned_entry_as_an_orphan(tmp_path):
+    """A fresh machine with learned entries but no audit history at all
+    (e.g. audit.log was deleted, or this is a copied learned_apps.json with
+    no accompanying history) confirms nothing -- 'missing audit log' must
+    not be treated as 'trust everything', the opposite of the missing-
+    learned-file case above."""
+    cfg_path = _write(tmp_path / "nova.yaml", "")
+    learned_path = _write_learned(tmp_path / "learned_apps.json", {"discord": r"C:\x\Discord.exe"})
+    audit_path = tmp_path / "does_not_exist.log"
+    assert not audit_path.exists()
+
+    cfg = load_config(cfg_path, learned_apps_path=learned_path, audit_log_path=audit_path)
+
+    assert cfg.security.allowed_apps == {}
+
+
+def test_an_audit_record_for_a_different_resolved_path_does_not_confirm_the_entry(tmp_path):
+    """Precision, not just presence: the confirming record must match BOTH
+    name and resolved_path. A record that confirms 'discord' pointing
+    somewhere else (e.g. a stale confirmation from before a reinstall
+    changed the path) must not vouch for a learned entry pointing
+    somewhere different now."""
+    cfg_path = _write(tmp_path / "nova.yaml", "")
+    learned_path = _write_learned(tmp_path / "learned_apps.json", {"discord": r"C:\New\Discord.exe"})
+    audit_path = tmp_path / "audit.log"
+    _confirm(audit_path, "discord", r"C:\Old\Discord.exe")  # confirms a DIFFERENT path
+
+    cfg = load_config(cfg_path, learned_apps_path=learned_path, audit_log_path=audit_path)
+
+    assert cfg.security.allowed_apps == {}
+
+
+def test_a_malformed_audit_log_line_is_skipped_not_fatal(tmp_path):
+    """audit.log's own integrity is AuditLog.verify()'s job, not
+    load_config()'s -- a corrupt line here must not turn 'this entry isn't
+    confirmed yet' into 'config won't load at all'. A valid confirming
+    record after the bad line still counts."""
+    cfg_path = _write(tmp_path / "nova.yaml", "")
+    resolved = r"C:\x\Discord.exe"
+    learned_path = _write_learned(tmp_path / "learned_apps.json", {"discord": resolved})
+    audit_path = tmp_path / "audit.log"
+    _confirm(audit_path, "discord", resolved)
+    with audit_path.open("a", encoding="utf-8") as fh:
+        fh.write("{not valid json at all\n")
+
+    cfg = load_config(cfg_path, learned_apps_path=learned_path, audit_log_path=audit_path)  # must not raise
+
+    assert cfg.security.allowed_apps == {"discord": resolved}
+
+
+def test_orphaned_app_names_reports_exactly_the_unconfirmed_names(tmp_path):
+    learned_path = _write_learned(
+        tmp_path / "learned_apps.json",
+        {"discord": r"C:\x\Discord.exe", "spotify": r"C:\x\Spotify.exe"},
+    )
+    audit_path = tmp_path / "audit.log"
+    _confirm(audit_path, "spotify", r"C:\x\Spotify.exe")  # only spotify is confirmed
+
+    orphans = orphaned_app_names(learned_apps_path=learned_path, audit_log_path=audit_path)
+
+    assert orphans == frozenset({"discord"})
+
+
+def test_orphaned_app_names_is_empty_when_everything_is_confirmed(tmp_path):
+    resolved = r"C:\x\Discord.exe"
+    learned_path = _write_learned(tmp_path / "learned_apps.json", {"discord": resolved})
+    audit_path = tmp_path / "audit.log"
+    _confirm(audit_path, "discord", resolved)
+
+    orphans = orphaned_app_names(learned_apps_path=learned_path, audit_log_path=audit_path)
+
+    assert orphans == frozenset()
+
+
+def test_orphaned_app_names_is_empty_when_the_learned_file_does_not_exist(tmp_path):
+    orphans = orphaned_app_names(
+        learned_apps_path=tmp_path / "does_not_exist.json", audit_log_path=tmp_path / "audit.log",
+    )
+    assert orphans == frozenset()
+
+
+def test_orphaned_app_names_returns_empty_on_a_malformed_learned_file_rather_than_raising(tmp_path):
+    """Per the function's own docstring: this only ever runs mid-session on
+    an already-slow-path refusal, and must not turn 'give a nicer message'
+    into a second way to crash a turn -- load_config() is still the one
+    place a malformed learned file is a loud ConfigError, at boot."""
+    learned_path = tmp_path / "learned_apps.json"
+    learned_path.write_text("not valid json", encoding="utf-8")
+
+    orphans = orphaned_app_names(learned_apps_path=learned_path, audit_log_path=tmp_path / "audit.log")  # must not raise
+
+    assert orphans == frozenset()
 
 
 def test_learned_file_containing_an_allowed_app_dirs_key_is_rejected(tmp_path):
@@ -493,17 +688,26 @@ def test_default_learned_apps_path_is_nova_learned_apps_path(tmp_path):
     nova.LEARNED_APPS_PATH, the real production location -- not silently
     read nothing forever. Proven by pointing the REAL constant at a tmp
     file via monkeypatch, one layer removed from load_config's own
-    parameter default."""
+    parameter default. audit_log_path is ALSO redirected (real constant,
+    same technique) -- omitting that redirect would reconcile against this
+    repo's actual data/audit.log instead of a tmp one, the exact isolation
+    break F64 exists to prevent."""
     import nova
     import nova.config as config_mod
 
-    real_path = nova.LEARNED_APPS_PATH
-    fake_path = tmp_path / "learned_apps.json"
-    _write_learned(fake_path, {"discord": r"C:\Machine\Discord.exe"})
+    real_learned_path = nova.LEARNED_APPS_PATH
+    real_audit_path = nova.AUDIT_LOG_PATH
+    fake_learned_path = tmp_path / "learned_apps.json"
+    fake_audit_path = tmp_path / "audit.log"
+    resolved = r"C:\Machine\Discord.exe"
+    _write_learned(fake_learned_path, {"discord": resolved})
+    _confirm(fake_audit_path, "discord", resolved)
     try:
-        config_mod.LEARNED_APPS_PATH = fake_path
+        config_mod.LEARNED_APPS_PATH = fake_learned_path
+        config_mod.AUDIT_LOG_PATH = fake_audit_path
         cfg_path = _write(tmp_path / "nova.yaml", "")
-        cfg = load_config(cfg_path)  # no learned_apps_path override
-        assert cfg.security.allowed_apps == {"discord": r"C:\Machine\Discord.exe"}
+        cfg = load_config(cfg_path)  # no learned_apps_path/audit_log_path override
+        assert cfg.security.allowed_apps == {"discord": resolved}
     finally:
-        config_mod.LEARNED_APPS_PATH = real_path
+        config_mod.LEARNED_APPS_PATH = real_learned_path
+        config_mod.AUDIT_LOG_PATH = real_audit_path
