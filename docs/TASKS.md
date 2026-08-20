@@ -33,13 +33,13 @@ proposal goes through the same binder, ladder and audit log as a local route.
 
 | # | Task | Owner | State |
 |---|---|---|---|
-| T2.1 | Self-knowledge: `capabilities` skill answering from the live registry | nova-dev-2 | CLAIMED |
-| T2.2 | Latency: per-stage instrumentation, first-audio-out metric, pre-warm ADR | nova-dev-3 | IN REVIEW — measured, see `docs/T2.2_LATENCY.md` + ADR 0011 |
-| T2.3a | App allowlist growth: resolve, CONFIRM, realpath-revalidated config write | unassigned | TODO |
-| T2.3b | Voice confirmation channel | unassigned | **BLOCKED on F28** — refused for acoustically-armed turns until settled |
-| T2.4t | Threat model for the Claude fallthrough, before implementation | nova-security-2 | CLAIMED |
+| T2.1 | Self-knowledge: `capabilities` skill answering from the live registry | nova-dev-2 | **DONE** (e4a0ccf) — answers from the live registry; one file, no core edits |
+| T2.2 | Latency: per-stage instrumentation, first-audio-out metric, pre-warm ADR | nova-dev-3 | **DONE** (b78d0e4) — warm turn 1.105 s to first audio, budget holds; ADR 0011 open for Manav |
+| T2.3a | App allowlist growth: resolve, CONFIRM, realpath-revalidated config write | unassigned | **DONE** (b637989) — resolve, CONFIRM on the resolved path, ledger-reconciled write, launch |
+| T2.3b | Voice confirmation channel | unassigned | **BLOCKED on F28** — voice approval refused for acoustically-armed turns until decided |
+| T2.4t | Threat model for the Claude fallthrough, before implementation | nova-security-2 | **DONE** — threat model produced F44/F45/F46/F47/F48/F49/F50, all closed or scoped |
 | T2.4a | Claude invocation adapter, standalone (spawns `claude`, no router/ladder wiring) | nova-dev-5 | **DONE** — `nova/brain/claude_arm.py`, see `docs/T2.4A_CLAUDE_ARM.md`. Two open items flagged for nova-security: env-scrub vs. the os.environ hygiene rule (not implemented), and the process-spawn allowlist's reserved slot now filled |
-| T2.4 | Claude fallthrough via `Egress.release_for_process` (router/ladder wiring) | unassigned | TODO — blocked on the tier-floor mechanism reaching a real Claude-proposal call site (F45 built but unwired) |
+| T2.4 | Claude fallthrough via `Egress.release_for_process` (router/ladder wiring) | unassigned | **BLOCKED on F28** — the adapter is built and proved (F58); only the router wiring remains |
 
 **Latency budget under test:** first audio out within **1.5 s** of speech ending,
 steady state, READ skills. First-turn reported separately. Manav measured ~5-8 s
