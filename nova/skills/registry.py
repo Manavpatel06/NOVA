@@ -59,20 +59,56 @@ class SkillError(ValueError):
     examples, wrong tier type) — always at import time, never at call time."""
 
 
-# F28: a denial's `reason` string is a machine-audit label first
-# ("presence_required", "no_confirm_channel", ...) — spoken verbatim, it
-# reads as a broken assistant rather than a deliberately limited one, and
-# nova-security specifically called this out for the ceiling: it is the
-# first control Manav will actually feel day to day, and a generic refusal
-# would make the wake word feel broken instead of intentional. A small
-# mapping, not a general "prettify every denial" pass — every OTHER
-# reason below still falls through to its raw string (`.get(reason,
-# reason)`), same as before F28 existed. That is a real, pre-existing gap
-# in how CONFIRM denials sound out loud, named here rather than silently
-# expanded past what this task actually asked for.
+# F28 built this as a small, deliberately narrow mapping (just
+# "presence_required") and explicitly declined to expand it, since a
+# general pass was scoped elsewhere at the time. F67 is that general pass:
+# a denial's `reason` string is a machine-audit label first
+# ("no_confirm_channel", "confirm_declined", ...) — spoken verbatim, it
+# reads as a broken assistant rather than a deliberately limited one. That
+# distinction matters more now that the wake word is live (F28/T2.4's
+# `ceiling`): acoustic arming caps at READ tier by design, so Manav hits a
+# CONFIRM-path refusal *regularly*, not as an edge case, and a refusal a
+# human can't parse is exactly the path by which a working security
+# control gets diagnosed as a bug and switched off. The one thing worse
+# than a control Manav finds annoying is one he thinks is broken.
+#
+# Only the SPOKEN form is translated here. The audit log keeps `reason`
+# exactly as `Ladder` produced it (`_deny_audited`/`_record` in
+# nova/security/ladder.py never see this dict) — the log is for
+# reconstructing what happened, the speech is for a human deciding what to
+# do next. Same split nova-dev-4 drew for F46: audit keeps raw params, the
+# CONFIRM prompt shows the resolved detail.
 _FRIENDLY_DENIAL_TEXT: dict[str, str] = {
     "presence_required": "I can't do that unless you press the hotkey.",
+    "no_confirm_channel": "I can't do that — I don't have a way to ask you to confirm it right now.",
+    "confirm_declined": "You said no, so I didn't do that.",
+    "confirm_timed_out": "I asked you to confirm, but didn't hear back in time, so I didn't do that.",
+    "confirm_channel_error": "Something went wrong while I was asking you to confirm, so I didn't do that.",
+    # The sharpest one: this fires when Ladder itself couldn't write the
+    # audit record for what it was about to do, and refused rather than
+    # act unrecorded (nova/security/ladder.py's Decision.deny("audit_write_
+    # failed")). "I couldn't record that I did this, so I didn't do it" is
+    # the actual, deliberate, defensible behavior underneath the label --
+    # worth Manav understanding, not working around.
+    "audit_write_failed": "I couldn't record that I was about to do that, so I didn't do it.",
 }
+
+
+def _spoken_denial_text(reason: str) -> str:
+    """Turn a CONFIRM-denial machine reason into a sentence Manav can act
+    on (F67). A reason with no mapping falls back to a generic-but-honest
+    refusal rather than the raw snake_case string or a crash — and logs at
+    WARNING so a newly-added denial reason gets *noticed* instead of
+    quietly sounding like a bug forever."""
+    text = _FRIENDLY_DENIAL_TEXT.get(reason)
+    if text is None:
+        logger.warning(
+            "no spoken-text mapping for CONFIRM denial reason %r -- falling back to a "
+            "generic refusal; add an entry to _FRIENDLY_DENIAL_TEXT in nova/skills/registry.py",
+            reason,
+        )
+        return "I can't do that right now."
+    return text
 
 
 def _find_untrusted(value: Any, path: str) -> str | None:
@@ -257,7 +293,7 @@ class SkillSpec:
         # friction, not unaudited — docs/THREAT_MODEL.md §4).
         decision = await ctx.ladder.authorize(self, params, ceiling=ceiling, confirm_display=pre_resolution)
         if not decision.allowed:
-            spoken = _FRIENDLY_DENIAL_TEXT.get(decision.reason, decision.reason)
+            spoken = _spoken_denial_text(decision.reason)
             return Reply(text=spoken, success=False)
 
         # F46/T2.0: the TOCTOU close. A CONFIRM dialog can sit open for as
