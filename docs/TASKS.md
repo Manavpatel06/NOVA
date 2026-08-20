@@ -71,6 +71,11 @@ decided.**
 | Wake word, ~15 s ambient noise | peak 0.01003 — **55x below** the 0.55 threshold | "zero detections" confirmed |
 | Tray RSS delta | +2.66 MB (claimed ~2.6) | independent script |
 | Confirm channel, 50 requests | threads flat at 1, RSS -1.0 MB | no per-request accumulation |
+| Warm turn, first audio out | **mean 1.105 s** (min 1.080, max 1.123, n=8) | lead-reproduced independently; 1.5 s budget holds |
+| ...of which STT | ~0.48 s (43%) | transcript_ready |
+| ...of which TTS synth | ~0.44 s (40%) | synth_returned |
+| ...of which output buffering | ~0.18 s (17%) | F52 — nobody chose this |
+| ...of which route + skill | ~0.008 s (0.7%) | my plan assumed 0.08 s (F53) |
 | Mic selected | WDM-KS idx 22; RMS 0.048 at first probe, 0.0663 on re-probe | real capture (RMS varies with ambient noise; the device choice is the stable fact, not the number) |
 | Lying endpoint | WDM-KS idx 17, exactly 0.0, 3/3 trials | real capture |
 | Same mic via WASAPI/MME | ~1e-4, AGC-suppressed, non-zero but useless | real capture |
