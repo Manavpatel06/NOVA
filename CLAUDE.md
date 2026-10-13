@@ -28,6 +28,7 @@ A voice-first, always-on personal assistant for Manav's Windows 11 laptop. Open-
 - **Confidence honesty.** If a router/intent match is below the confidence floor or crosses domains, NOVA asks a clarifying question — it never answers a low-confidence match as if certain.
 - **Commit every module as it lands.** Work that exists only in a conversation does not exist.
 - **One source of truth** per invariant — a test and a config file describing the same promise differently is a promise nobody can act on.
+- **Open source first (Manav, 2026-10-13).** Prefer proven, freely available libraries and APIs over building from scratch when they make NOVA easier, faster or more accurate — within the privacy/egress rules above. Manav also has Anthropic API credits, so the Claude arm may use the API as well as the `claude` CLI.
 
 ## Verification rules (nova-accuracy enforces)
 

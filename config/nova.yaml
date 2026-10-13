@@ -108,4 +108,4 @@ governor:
   # below "both resident" (~1150-1350 MB) -- the realistic job this does
   # is shedding Kokoro when both are loaded and idle.
   poll_interval_s: 5.0
-  rss_ceiling_mb: 900.0
+  rss_ceiling_mb: 2048.0   # raised from 900 on 2026-10-13 (Manav): keep models resident -- no unload/reload churn, no F21 VRAM creep; see docs/decisions/0012
