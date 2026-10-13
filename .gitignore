@@ -25,3 +25,6 @@ Desktop.ini
 
 # Packaging artefacts
 *.egg-info/
+
+# Cowork session outputs on this machine
+Claude outputs/

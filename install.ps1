@@ -35,7 +35,7 @@ function New-NovaShortcut([string]$Path) {
   $sh.Arguments        = "-m nova"
   $sh.WorkingDirectory = $Root
   $sh.WindowStyle      = 7
-  $sh.IconLocation     = "$Py,0"
+  $sh.IconLocation     = "$Root\assets\nova.ico"
   $sh.Description      = "NOVA voice assistant"
   $sh.Save()
 }
