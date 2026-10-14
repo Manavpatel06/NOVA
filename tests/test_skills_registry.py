@@ -97,12 +97,12 @@ def test_unknown_skill_name_returns_none():
 
 
 def test_duplicate_skill_name_raises_and_keeps_the_first_registration(clean_registry):
-    @skill(name="__test_dup__", tier=Tier.READ, examples=["x"], trusts_input=False)
+    @skill(name="__test_dup__", tier=Tier.READ, examples=["x"], description="test skill", trusts_input=False)
     async def first(ctx, **params):
         return Reply(text="first")
 
     with pytest.raises(SkillError, match="__test_dup__"):
-        @skill(name="__test_dup__", tier=Tier.READ, examples=["y"], trusts_input=False)
+        @skill(name="__test_dup__", tier=Tier.READ, examples=["y"], description="test skill", trusts_input=False)
         async def second(ctx, **params):
             return Reply(text="second")
 
@@ -113,14 +113,14 @@ def test_duplicate_skill_name_raises_and_keeps_the_first_registration(clean_regi
 
 def test_skill_decorator_rejects_a_non_tier_value(clean_registry):
     with pytest.raises(SkillError):
-        @skill(name="__test_bad_tier__", tier="read", examples=["x"], trusts_input=False)  # type: ignore[arg-type]
+        @skill(name="__test_bad_tier__", tier="read", examples=["x"], description="test skill", trusts_input=False)  # type: ignore[arg-type]
         async def handler(ctx, **params):
             return Reply(text="x")
 
 
 def test_skill_decorator_rejects_empty_examples(clean_registry):
     with pytest.raises(SkillError):
-        @skill(name="__test_no_examples__", tier=Tier.READ, examples=[], trusts_input=False)
+        @skill(name="__test_no_examples__", tier=Tier.READ, examples=[], description="test skill", trusts_input=False)
         async def handler(ctx, **params):
             return Reply(text="x")
 
@@ -143,7 +143,7 @@ def test_all_skills_returns_a_copy_not_the_live_registry():
     and the ladder read this, and a caller mutating it by accident must not
     be able to add/remove skills for everyone else."""
     snapshot = all_skills()
-    snapshot["__injected__"] = SkillSpec(
+    snapshot["__injected__"] = SkillSpec(description="test skill", 
         name="__injected__", tier=Tier.READ, examples=("x",), trusts_input=False,
         handler=_dummy_handler,
     )
@@ -215,7 +215,7 @@ def _make_probe_spec(name: str, handler_ran: list) -> SkillSpec:
         handler_ran.append(params)
         return Reply(text="ok")
 
-    return SkillSpec(name=name, tier=Tier.READ, examples=("probe",), trusts_input=False, handler=handler)
+    return SkillSpec(description="test skill", name=name, tier=Tier.READ, examples=("probe",), trusts_input=False, handler=handler)
 
 
 async def test_invoke_rejects_a_top_level_untrusted_parameter_before_the_handler_runs(clean_registry):

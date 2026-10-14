@@ -23,6 +23,8 @@ CONFIG_DIR: Path = ROOT / "config"
 DATA_DIR: Path = ROOT / "data"
 MODELS_DIR: Path = ROOT / "models"
 CACHE_DIR: Path = ROOT / "cache"
+#: Brand assets (icon, logo) -- assets/nova.ico, assets/nova.png.
+ASSETS_DIR: Path = ROOT / "assets"
 
 #: The one config file (docs/CONTRACTS.md).
 DEFAULT_CONFIG_PATH: Path = CONFIG_DIR / "nova.yaml"

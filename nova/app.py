@@ -108,7 +108,10 @@ import nova.skills  # import triggers discover_skills() (nova/skills/__init__.py
 from nova.audio.capture import Capture
 from nova.audio.duplex import DuplexGate
 from nova.audio.player import Player
+from nova.audio.utterance import UtteranceSegmenter
+from nova.audio.vad import Vad
 from nova.audio.wake import TOPIC_WAKE_END, TOPIC_WAKE_START, WakeEvent, WakeWord
+from nova.brain.address import strip_address
 from nova.brain import claude_arm
 from nova.brain.claude_arm import ClaudeAnswer, ClaudeFailure, ClaudeProposal
 from nova.brain.router import Router
@@ -116,6 +119,7 @@ from nova.config import Config, load_config
 from nova.governor import TOPIC_TURN_END, TOPIC_TURN_START, Governor
 from nova.interfaces.hotkey import TOPIC_PTT_END, TOPIC_PTT_START, Hotkey, PTTEvent
 from nova.interfaces.tray import TOPIC_SPEAK_END, TOPIC_SPEAK_START, Tray
+from nova.interfaces.window import TOPIC_UI_HEARD, TOPIC_UI_SAID, TOPIC_UI_STATE
 from nova.log import get_logger
 from nova.security.audit import AuditLog
 from nova.security.confirm import DialogConfirmChannel
@@ -129,6 +133,7 @@ from nova.telemetry import TOPIC_LATENCY_MARK, LatencyLog, LatencyMark
 from nova.tts.synthesizer import Synthesizer
 
 _log = get_logger(__name__)
+
 
 #: how often the capture reader thread re-checks the stop flag while
 #: waiting for the next audio frame (Capture.read()'s timeout= parameter)
@@ -240,7 +245,7 @@ class NovaApp:
         # --- speech I/O. Constructing these does not load a model; both
         # classes lazy-load on first real use (Transcriber.transcribe(),
         # Synthesizer.say()).
-        self.transcriber = Transcriber()
+        self.transcriber = Transcriber(language=self.config.stt.language)
         self.synth = Synthesizer()
         self.player = Player()
         self.hotkey = Hotkey(self.bus)
@@ -263,7 +268,40 @@ class NovaApp:
         # the tray menu requests a graceful shutdown via self._stop_event,
         # the same seam a future signal handler / CLI Ctrl+C could use.
         self._stop_event = asyncio.Event()
-        self.tray = Tray(self.bus, on_quit=self._request_stop)
+        self.window = None
+        self.tray = None
+        if self.config.ui.window:
+            from nova.interfaces.window import NovaWindow
+
+            self.window = NovaWindow(
+                self.bus,
+                on_close=self._request_stop,
+                on_text=self._on_typed_text,
+                on_mic_toggle=self._on_mic_toggle,
+            )
+        else:
+            self.tray = Tray(self.bus, on_quit=self._request_stop)
+
+        # --- prefix wake (Manav, 2026-10-14): while the window is open,
+        # every utterance is transcribed locally and acted on ONLY if it
+        # starts with NOVA's name (nova/brain/address.py). The detector-
+        # based wake word above stays available as wake.mode = "model".
+        # An unrecognised mode fails CLOSED to "model" (wake-armed turns are
+        # READ-only), never open to prefix's action-capable voice commands.
+        if self.config.wake.mode not in ("prefix", "model"):
+            _log.warning("wake.mode %r is not 'prefix' or 'model' -- using the restrictive 'model' mode", self.config.wake.mode)
+        self._prefix_mode = self.config.wake.mode == "prefix"
+        self.vad = Vad()
+        self.segmenter = UtteranceSegmenter(
+            self.vad,
+            silence_ms=self.config.wake.vad_silence_ms,
+            max_ms=self.config.wake.max_utterance_ms,
+            min_speech_ms=self.config.wake.min_speech_ms,
+        )
+        self._listening = True          # mic toggle in the window
+        self._stopping = False
+        self._follow_up_until = 0.0     # monotonic deadline after a bare "Nova"
+        self._utterance_tasks: set[asyncio.Task[None]] = set()
 
         # --- governor (T1.2): drives existing load()/unload() lifecycle,
         # never calls load() itself. typical_rss_mb hints are measured, not
@@ -346,12 +384,19 @@ class NovaApp:
                 exc,
             )
 
-        self.wake_word.start(loop=asyncio.get_running_loop())
-        if not self.wake_word.backend_available:
-            _log.warning(
-                "Wake word unavailable (see the WARNING above naming why) -- "
-                "NOVA will still respond to push-to-talk."
-            )
+        if self._prefix_mode:
+            self.vad.load()
+            if self.vad.available:
+                _log.info("Listening for sentences that start with %s", " / ".join(repr(n) for n in self.config.wake.names))
+            else:
+                _log.warning("VAD model unavailable -- 'Nova ...' voice commands are off; the hotkey and typing still work.")
+        else:
+            self.wake_word.start(loop=asyncio.get_running_loop())
+            if not self.wake_word.backend_available:
+                _log.warning(
+                    "Wake word unavailable (see the WARNING above naming why) -- "
+                    "NOVA will still respond to push-to-talk."
+                )
 
         self.hotkey.start(loop=asyncio.get_running_loop())
         if not self.hotkey.backend_available:
@@ -366,8 +411,12 @@ class NovaApp:
         # tray icon must never mean a missing assistant, so its failure is
         # not checked here the way the hotkey's is; the hotkey is NOVA's
         # only input path, the tray is not.
-        self.tray.start(loop=asyncio.get_running_loop())
+        if self.window is not None:
+            self.window.start(loop=asyncio.get_running_loop())
+        if self.tray is not None:
+            self.tray.start(loop=asyncio.get_running_loop())
         await self.governor.start()
+        await self._ui_state("idle")
 
     async def stop(self) -> None:
         """Tear down cleanly: stop the hotkey, the wake word, the
@@ -380,15 +429,25 @@ class NovaApp:
         Capture so nothing calls `WakeWord.process()` on a frame read from
         a stream that's mid-teardown.
         """
+        self._stopping = True
+        self._listening = False
         self.hotkey.stop()
-        self.wake_word.stop()
+        if not self._prefix_mode:
+            self.wake_word.stop()
+        if self._utterance_tasks:
+            # let in-flight transcriptions finish (they now see _stopping and
+            # do nothing) so Whisper is never unloaded mid-transcribe
+            await asyncio.wait(list(self._utterance_tasks), timeout=5.0)
         if self._capture_reader_stop is not None:
             self._capture_reader_stop.set()
         if self._capture_reader_task is not None:
             await self._capture_reader_task
             self._capture_reader_task = None
         self._capture.stop()
-        self.tray.stop()
+        if self.tray is not None:
+            self.tray.stop()
+        if self.window is not None:
+            self.window.stop()
         await self.governor.stop()
         self.transcriber.unload()
         self.synth.unload()
@@ -400,7 +459,7 @@ class NovaApp:
         is safe to touch asyncio state directly -- and if the loop had
         already closed by then, post_callback would have dropped the call
         before this method ever ran (F30)."""
-        _log.info("Stop requested (tray Quit)")
+        _log.info("Stop requested (%s)", "window closed" if self.window is not None else "tray Quit")
         self._stop_event.set()
 
     async def wait_until_stopped(self) -> None:
@@ -443,6 +502,8 @@ class NovaApp:
                 continue
             if self._capturing:
                 self._ptt_frames.append(frame)
+            elif self._prefix_mode:
+                self._feed_prefix_listener(frame)
             else:
                 self.wake_word.process(frame)  # own broad try/except; safe to call from any thread/context
             if self._wake_capturing:
@@ -466,7 +527,9 @@ class NovaApp:
 
         self._capturing = True
         self._ptt_frames = []
+        self.segmenter.reset()
         _log.info("ptt.start: capture began")
+        await self._ui_state("listening")
 
     async def _on_ptt_end(self, event: PTTEvent) -> None:
         if not self._capturing:
@@ -540,6 +603,108 @@ class NovaApp:
         duration_s = len(pcm) / 16000
         _log.info("wake.end (mode=%s): captured %.2fs of audio", event.mode, duration_s)
         await self.run_turn(pcm, source="wake", armed_by=ArmedBy.WAKE, turn_id=turn_id)
+
+    # -- prefix wake + window -------------------------------------------
+
+    def _feed_prefix_listener(self, frame: np.ndarray) -> None:
+        """Called for every mic frame in prefix mode (from the capture loop).
+        Frames are not even segmented while the mic is muted from the
+        window, while NOVA is talking (DuplexGate -- it must not hear its
+        own voice), or while a turn is running."""
+        if not self._listening or not self.vad.available:
+            return
+        if not self.duplex_gate.mic_open() or self._turn_lock.locked():
+            if self.segmenter.in_speech:
+                self.segmenter.reset()
+            return
+        utterance = self.segmenter.process(frame)
+        if utterance is not None:
+            task = asyncio.create_task(self._on_utterance(utterance))
+            self._utterance_tasks.add(task)
+            task.add_done_callback(self._utterance_tasks.discard)
+
+    async def _on_utterance(self, pcm: np.ndarray) -> None:
+        """One utterance heard while NOVA's window is open. Transcribed
+        locally; acted on only if it starts with NOVA's name (or arrives
+        inside the follow-up window after a bare "Nova"). Everything else
+        is dropped: its text is never logged, displayed or kept."""
+        if self._turn_lock.locked():
+            return
+        async with self._turn_lock:
+            # bracket STT like a turn so the governor never unloads Whisper
+            # mid-transcription (its own docstring's undefined-behaviour case)
+            await self.bus.publish(TOPIC_TURN_START, None)
+            try:
+                text = await asyncio.to_thread(self.transcriber.transcribe, pcm)
+            except Exception as exc:
+                _log.error("Prefix listener: transcription failed (%s)", exc)
+                return
+            finally:
+                await self.bus.publish(TOPIC_TURN_END, None)
+
+        # muted, or shutting down, while this utterance was being transcribed
+        if not self._listening or self._stopping:
+            return
+
+        text = (text or "").strip()
+        command = strip_address(text, self.config.wake.names)
+
+        if time.monotonic() < self._follow_up_until:
+            # Follow-up after a bare "Nova": the next real sentence is the
+            # command, name optional. Noise (empty text) and another bare
+            # "Nova" neither consume nor extend the window -- the deadline
+            # set when "Yes?" finished is the hard limit (security review
+            # 2026-10-14: re-arming on noise kept it open indefinitely).
+            if command is None:
+                command = text
+            if not command:
+                return
+            self._follow_up_until = 0.0  # exactly one sentence
+            await self.run_text(command, source="voice", armed_by=ArmedBy.VOICE)
+            return
+
+        if command is None:
+            _log.debug("Prefix listener: speech not addressed to NOVA -- ignored")
+            return
+        if command == "":
+            await self._acknowledge_bare_name()
+            return
+        await self.run_text(command, source="voice", armed_by=ArmedBy.VOICE)
+
+    async def _acknowledge_bare_name(self) -> None:
+        """Bare "Nova": say "Yes?" and open the follow-up window. Spoken
+        under the turn lock (nothing else may talk over it), and the window
+        starts only AFTER the reply finished playing, so NOVA's own "Yes?"
+        cannot land inside it."""
+        if self._turn_lock.locked():
+            return
+        async with self._turn_lock:
+            await self.bus.publish(TOPIC_TURN_START, None)
+            try:
+                await self._ui_state("listening")
+                await self._speak("Yes?")
+            finally:
+                await self.bus.publish(TOPIC_TURN_END, None)
+        self.segmenter.reset()
+        self._follow_up_until = time.monotonic() + self.config.wake.follow_up_ms / 1000.0
+
+    async def _on_typed_text(self, text: str) -> None:
+        """Window text box -> a turn. Typing is the same as asking."""
+        text = (text or "").strip()
+        if text:
+            await self.run_text(text, source="typed", armed_by=ArmedBy.TYPED)
+
+    async def _on_mic_toggle(self, enabled: bool) -> None:
+        self._listening = bool(enabled)
+        self.segmenter.reset()
+        self._follow_up_until = 0.0
+        _log.info("Voice listening %s from the window", "resumed" if enabled else "paused")
+        await self._ui_state("idle" if enabled else "muted")
+
+    async def _ui_state(self, state: str) -> None:
+        if not self._listening and state == "idle":
+            state = "muted"
+        await self.bus.publish(TOPIC_UI_STATE, state)
 
     def _next_turn_id(self) -> str:
         """Mint the next turn_id -- see the T2.2 comment in __init__ for why
@@ -641,90 +806,125 @@ class NovaApp:
                     return None
                 await self._mark(turn_id, "transcript_ready")
 
-                text = text.strip()
-                if not text:
-                    _log.info("Turn (%s): STT returned empty text; nothing to route", source)
-                    await self._speak_and_mark("I didn't catch that.", turn_id)
-                    return None
-                # docs/THREAT_MODEL_ALWAYS_ON.md §1.4: a PTT-armed turn only
-                # ever logs what Manav deliberately pressed the hotkey and
-                # said -- full verbatim logging there is fine, and stays.
-                # A wake-armed turn has no such bound: every detector fire,
-                # including a false accept from a TV or ambient noise, would
-                # otherwise write whatever the room said, verbatim, to
-                # nova.log.LOG_PATH -- a local plaintext file the retired
-                # build's own hotkey module already named as "a file that
-                # later gets attached to a bug report." Gating this behind
-                # a debug LOG LEVEL would not actually help: nova/log.py's
-                # file handler is set to DEBUG (only the console handler
-                # caps at INFO), so a debug-level call still lands in the
-                # persistent file just as verbatim as INFO would. Length
-                # only, never content, for a wake-armed turn -- the honest
-                # fix, not a truncation cap that a short ambient snippet
-                # would sail under anyway.
-                if armed_by is ArmedBy.WAKE:
-                    _log.info("Turn (%s): heard %d chars (wake-armed; content withheld from the log)", source, len(text))
-                else:
-                    _log.info("Turn (%s): heard %r", source, text)
-
-                # --- router ------------------------------------------------
-                try:
-                    match = self.router.route(text)
-                except Exception as exc:
-                    # Same §1.4 reasoning as the "heard" log above -- an
-                    # internal Router crash is rare, but a wake-armed turn
-                    # hitting it must not be the one path that still leaks
-                    # room audio verbatim into the log file.
-                    if armed_by is ArmedBy.WAKE:
-                        _log.error("Turn (%s): Router.route() failed on %d chars (wake-armed; content withheld) (%s)", source, len(text), exc)
-                    else:
-                        _log.error("Turn (%s): Router.route(%r) failed (%s)", source, text, exc)
-                    await self._mark(turn_id, "abort:route")
-                    await self._speak_and_mark("Sorry, something went wrong understanding that.", turn_id)
-                    return None
-                await self._mark(turn_id, "route_decided")
-
-                if match.clarification is not None:
-                    # T2.4: below the router's OWN confidence floor (the
-                    # exact value it was constructed with) and no local
-                    # skill matched at all -- "the router finds no skill"
-                    # in docs/M2_OPEN_BRAIN_PLAN.md's own words. This is
-                    # the only clarification sub-case that falls through to
-                    # Claude; see _run_claude_fallthrough's own docstring
-                    # for why ambiguous / missing-param stay local instead.
-                    if match.confidence < self.config.brain.confidence_floor:
-                        return await self._run_claude_fallthrough(
-                            text, source=source, armed_by=armed_by, turn_id=turn_id,
-                        )
-                    # Constitutional requirement, not an error path: an
-                    # ambiguous match or a confidently-identified skill
-                    # missing a param -- NOVA asks rather than guesses (or
-                    # defers to a model that has no more insight into
-                    # Manav's own intent than NOVA already does).
-                    _log.info(
-                        "Turn (%s): confidence %.3f -- asking for clarification instead of acting",
-                        source, match.confidence,
-                    )
-                    await self._speak_and_mark(match.clarification, turn_id)
-                    return None
-
-                # --- skill, through the ladder's one entry point ----------
-                assert match.spec is not None
-                ctx = SkillCtx(config=self.config, ladder=self.ladder, armed_by=armed_by)
-                try:
-                    reply = await match.spec.invoke(ctx, **match.params)
-                except Exception as exc:
-                    _log.error("Turn (%s): skill %r raised (%s)", source, match.spec.name, exc)
-                    await self._mark(turn_id, "abort:skill")
-                    await self._speak_and_mark(f"Sorry, something went wrong with {match.spec.name}.", turn_id)
-                    return None
-                await self._mark(turn_id, "skill_returned")
-
-                # --- TTS + playback ----------------------------------------
-                await self._speak_and_mark(reply.text, turn_id)
-                return reply
+                return await self._handle_text(text, source=source, armed_by=armed_by, turn_id=turn_id)
             finally:
                 await self.bus.publish(TOPIC_TURN_END, None)
+                await self._ui_state("idle")
+
+    async def run_text(
+        self,
+        text: str,
+        *,
+        source: str = "typed",
+        armed_by: ArmedBy = ArmedBy.TYPED,
+        turn_id: str | None = None,
+    ) -> Reply | None:
+        """Run one turn from text that is already known -- typed into NOVA's
+        window, or a prefix-wake command already transcribed and stripped of
+        "Nova". Same router -> ladder -> skill/Claude -> speech path as
+        run_turn(), minus STT."""
+        if turn_id is None:
+            turn_id = self._next_turn_id()
+        async with self._turn_lock:
+            await self.bus.publish(TOPIC_TURN_START, None)
+            try:
+                await self._mark(turn_id, "transcript_ready")
+                return await self._handle_text(text, source=source, armed_by=armed_by, turn_id=turn_id)
+            finally:
+                await self.bus.publish(TOPIC_TURN_END, None)
+                await self._ui_state("idle")
+
+    async def _handle_text(
+        self, text: str, *, source: str, armed_by: ArmedBy, turn_id: str,
+    ) -> Reply | None:
+        """Everything after speech has become text: route, act, reply.
+        Caller holds `_turn_lock` and brackets TOPIC_TURN_START/END."""
+
+        if text.strip():
+            await self.bus.publish(TOPIC_UI_HEARD, text.strip())
+            await self._ui_state("thinking")
+        text = text.strip()
+        if not text:
+            _log.info("Turn (%s): STT returned empty text; nothing to route", source)
+            await self._speak_and_mark("I didn't catch that.", turn_id)
+            return None
+        # docs/THREAT_MODEL_ALWAYS_ON.md §1.4: a PTT-armed turn only
+        # ever logs what Manav deliberately pressed the hotkey and
+        # said -- full verbatim logging there is fine, and stays.
+        # A wake-armed turn has no such bound: every detector fire,
+        # including a false accept from a TV or ambient noise, would
+        # otherwise write whatever the room said, verbatim, to
+        # nova.log.LOG_PATH -- a local plaintext file the retired
+        # build's own hotkey module already named as "a file that
+        # later gets attached to a bug report." Gating this behind
+        # a debug LOG LEVEL would not actually help: nova/log.py's
+        # file handler is set to DEBUG (only the console handler
+        # caps at INFO), so a debug-level call still lands in the
+        # persistent file just as verbatim as INFO would. Length
+        # only, never content, for a wake-armed turn -- the honest
+        # fix, not a truncation cap that a short ambient snippet
+        # would sail under anyway.
+        if armed_by is ArmedBy.WAKE:
+            _log.info("Turn (%s): heard %d chars (wake-armed; content withheld from the log)", source, len(text))
+        else:
+            _log.info("Turn (%s): heard %r", source, text)
+
+        # --- router ------------------------------------------------
+        try:
+            match = self.router.route(text)
+        except Exception as exc:
+            # Same §1.4 reasoning as the "heard" log above -- an
+            # internal Router crash is rare, but a wake-armed turn
+            # hitting it must not be the one path that still leaks
+            # room audio verbatim into the log file.
+            if armed_by is ArmedBy.WAKE:
+                _log.error("Turn (%s): Router.route() failed on %d chars (wake-armed; content withheld) (%s)", source, len(text), exc)
+            else:
+                _log.error("Turn (%s): Router.route(%r) failed (%s)", source, text, exc)
+            await self._mark(turn_id, "abort:route")
+            await self._speak_and_mark("Sorry, something went wrong understanding that.", turn_id)
+            return None
+        await self._mark(turn_id, "route_decided")
+
+        if match.clarification is not None:
+            # T2.4: below the router's OWN confidence floor (the
+            # exact value it was constructed with) and no local
+            # skill matched at all -- "the router finds no skill"
+            # in docs/M2_OPEN_BRAIN_PLAN.md's own words. This is
+            # the only clarification sub-case that falls through to
+            # Claude; see _run_claude_fallthrough's own docstring
+            # for why ambiguous / missing-param stay local instead.
+            if match.confidence < self.config.brain.confidence_floor:
+                return await self._run_claude_fallthrough(
+                    text, source=source, armed_by=armed_by, turn_id=turn_id,
+                )
+            # Constitutional requirement, not an error path: an
+            # ambiguous match or a confidently-identified skill
+            # missing a param -- NOVA asks rather than guesses (or
+            # defers to a model that has no more insight into
+            # Manav's own intent than NOVA already does).
+            _log.info(
+                "Turn (%s): confidence %.3f -- asking for clarification instead of acting",
+                source, match.confidence,
+            )
+            await self._speak_and_mark(match.clarification, turn_id)
+            return None
+
+        # --- skill, through the ladder's one entry point ----------
+        assert match.spec is not None
+        ctx = SkillCtx(config=self.config, ladder=self.ladder, armed_by=armed_by)
+        try:
+            reply = await match.spec.invoke(ctx, **match.params)
+        except Exception as exc:
+            _log.error("Turn (%s): skill %r raised (%s)", source, match.spec.name, exc)
+            await self._mark(turn_id, "abort:skill")
+            await self._speak_and_mark(f"Sorry, something went wrong with {match.spec.name}.", turn_id)
+            return None
+        await self._mark(turn_id, "skill_returned")
+
+        # --- TTS + playback ----------------------------------------
+        await self._speak_and_mark(reply.text, turn_id)
+        return reply
 
     def _compose_claude_prompt(self, text: str) -> str:
         """T2.4's "minimal context" list (docs/M2_OPEN_BRAIN_PLAN.md),
@@ -877,6 +1077,7 @@ class NovaApp:
         not own that test."""
         self._last_synth_returned_t = None
         self._last_first_audio_t = None
+        await self.bus.publish(TOPIC_UI_SAID, text)
 
         # Text mode (config `tts.speak: false`). Deliberate muting, which is a
         # different thing from the "NOVA must never go silently mute" promise
@@ -946,9 +1147,23 @@ def run() -> None:
 
     if not acquire_single_instance_lock():
         _log.error("NOVA is already running (or the single-instance check failed) -- exiting.")
+        _tell_user_already_running()
         return
 
     try:
         asyncio.run(_run())
     except KeyboardInterrupt:
+        pass
+
+
+def _tell_user_already_running() -> None:
+    """A second launch used to vanish silently (no console in windowed
+    mode), which looked exactly like NOVA being broken. Say so instead."""
+    try:
+        import ctypes
+
+        ctypes.windll.user32.MessageBoxW(  # type: ignore[attr-defined]
+            0, "NOVA is already open -- look for its window on the taskbar.", "NOVA", 0x40 | 0x40000,
+        )
+    except Exception:  # noqa: BLE001 -- not Windows / no desktop: the log line above is enough
         pass

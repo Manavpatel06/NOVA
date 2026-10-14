@@ -28,8 +28,10 @@ from nova.stt.transcriber import Transcriber
 
 
 class _FakeSegment:
-    def __init__(self, text):
+    def __init__(self, text, no_speech_prob=0.0, avg_logprob=-0.2):
         self.text = text
+        self.no_speech_prob = no_speech_prob
+        self.avg_logprob = avg_logprob
 
 
 class _FakeWhisperModel:
@@ -42,10 +44,15 @@ class _FakeWhisperModel:
         self.download_root = download_root
         self.local_files_only = local_files_only
         self.transcribe_calls: list = []
+        self.transcribe_kwargs: list = []
+        self.next_segments = None
         _FakeWhisperModel.instances.append(self)
 
-    def transcribe(self, pcm):
+    def transcribe(self, pcm, **kwargs):
         self.transcribe_calls.append(pcm)
+        self.transcribe_kwargs.append(kwargs)
+        if self.next_segments is not None:
+            return iter(self.next_segments), object()
         segments = iter([_FakeSegment(" hello "), _FakeSegment("world ")])
         return segments, object()
 
@@ -206,3 +213,35 @@ def test_real_transcriber_loads_and_transcribes_real_audio():
         assert isinstance(text, str)
     finally:
         t.unload()
+
+
+# ---------------------------------------------------------------------------
+# 2026-10-14: config stt.language was read by nothing, so Whisper guessed the
+# language per clip; a 0.8 s near-silent clip came back as "¡Gracias!".
+# ---------------------------------------------------------------------------
+
+
+def test_transcribe_passes_the_configured_language(fake_whisper_model, cuda_profile, no_probe):
+    t = Transcriber(gpu_profile=cuda_profile, language="en")
+    t.transcribe(np.zeros(16000, dtype=np.float32))
+    kwargs = _FakeWhisperModel.instances[-1].transcribe_kwargs[-1]
+    assert kwargs["language"] == "en"
+    assert kwargs["condition_on_previous_text"] is False
+
+
+def test_silence_hallucination_segments_are_dropped(fake_whisper_model, cuda_profile, no_probe):
+    t = Transcriber(gpu_profile=cuda_profile)
+    t.load()
+    _FakeWhisperModel.instances[-1].next_segments = [
+        _FakeSegment(" ¡Gracias!", no_speech_prob=0.9, avg_logprob=-1.4),
+    ]
+    assert t.transcribe(np.zeros(16000, dtype=np.float32)) == ""
+
+
+def test_confident_speech_is_kept_even_with_some_no_speech_probability(fake_whisper_model, cuda_profile, no_probe):
+    t = Transcriber(gpu_profile=cuda_profile)
+    t.load()
+    _FakeWhisperModel.instances[-1].next_segments = [
+        _FakeSegment(" Nova, what time is it?", no_speech_prob=0.7, avg_logprob=-0.3),
+    ]
+    assert t.transcribe(np.zeros(16000, dtype=np.float32)) == "Nova, what time is it?"

@@ -314,7 +314,9 @@ class SkillSpec:
         # only translates the arming source into a ceiling value —
         # Ladder.authorize() is the one place that actually enforces it,
         # same separation of concerns as the floor/confirm_display above.
-        ceiling = Tier.READ if ctx.armed_by is ArmedBy.WAKE else None
+        # Explicit allow-list (security review 2026-10-14): a future arming
+        # source must be given its ruling here, or it gets READ -- fail closed.
+        ceiling = None if ctx.armed_by in (ArmedBy.PTT, ArmedBy.VOICE, ArmedBy.TYPED) else Tier.READ
 
         # T2.4: the floor this call is subject to, derived the identical
         # way from ctx.origin — Origin.ROUTER (a local match) means no

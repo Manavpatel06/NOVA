@@ -37,7 +37,7 @@ async def _noop_handler(ctx):
 
 
 def _fake_spec(name: str, example: str, tier: Tier = Tier.READ) -> SkillSpec:
-    return SkillSpec(name=name, tier=tier, examples=(example,), trusts_input=False, handler=_noop_handler)
+    return SkillSpec(description="test skill", name=name, tier=tier, examples=(example,), trusts_input=False, handler=_noop_handler)
 
 
 class _UnusedLadder:

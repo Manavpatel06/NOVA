@@ -74,7 +74,7 @@ _log = get_logger(__name__)
 # honesty standard as nova.interfaces.hotkey's DEFAULT_TAP_THRESHOLD_MS,
 # not a finding. Rounded up slightly (180 -> 200) for a little extra margin
 # given it is unmeasured here specifically.
-DEFAULT_HANGOVER_MS = 200
+DEFAULT_HANGOVER_MS = 500  # 200 until 2026-10-14; raised so prefix-mode NOVA never hears its own tail
 
 
 def _default_duplex_config():

@@ -26,10 +26,15 @@ class Transcriber:
     """Loads large-v3-turbo on the best verified device/compute type and
     transcribes 16 kHz mono float32 PCM to text."""
 
-    def __init__(self, gpu_profile: GpuProfile | None = None) -> None:
+    def __init__(self, gpu_profile: GpuProfile | None = None, language: str | None = "en") -> None:
         ensure_dll_directories()
         self._profile = gpu_profile or probe_gpu()
         self._model = None
+        # Passed to every transcribe() call. Before 2026-10-14 config
+        # `stt.language` was read by nothing, so Whisper auto-detected the
+        # language of every clip -- a 0.8 s near-silent clip came back as
+        # Spanish ("¡Gracias!"). None = auto-detect, kept as an escape hatch.
+        self._language = language or None
 
     @property
     def profile(self) -> GpuProfile:
@@ -135,5 +140,26 @@ class Transcriber:
     def transcribe(self, pcm: np.ndarray) -> str:
         if self._model is None:
             self.load()
-        segments, _info = self._model.transcribe(pcm)
-        return "".join(segment.text for segment in segments).strip()
+        segments, _info = self._model.transcribe(
+            pcm,
+            language=self._language,
+            # each utterance stands alone; carrying context across calls is
+            # what lets one hallucination seed the next
+            condition_on_previous_text=False,
+        )
+        return "".join(seg.text for seg in segments if not _is_silence_hallucination(seg)).strip()
+
+
+#: Whisper's classic failure on near-silence is a fluent, confident-looking
+#: phrase ("Thank you.", "¡Gracias!", "Thanks for watching!"). Faster-whisper
+#: reports, per segment, how likely the audio was NOT speech and how unsure
+#: the decoder was; both high together is the documented hallucination
+#: signature (these are faster-whisper's own default thresholds).
+_NO_SPEECH_PROB = 0.6
+_LOW_AVG_LOGPROB = -1.0
+
+
+def _is_silence_hallucination(seg: object) -> bool:
+    no_speech = getattr(seg, "no_speech_prob", 0.0) or 0.0
+    avg_logprob = getattr(seg, "avg_logprob", 0.0) or 0.0
+    return no_speech > _NO_SPEECH_PROB and avg_logprob < _LOW_AVG_LOGPROB

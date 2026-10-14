@@ -1,5 +1,15 @@
 # NOVA
 
+## Using NOVA (2026-10-14)
+
+1. Press **Win**, type **NOVA**, press Enter. The NOVA window opens and NOVA starts listening.
+2. Start a sentence with its name: **"Nova, what time is it?"**, **"Nova, open Notepad."** Saying just "Nova" gets a "Yes?" — then say the request.
+3. Anything said *without* "Nova" at the start is ignored and never stored.
+4. You can also type in the window, or hold **Ctrl+Alt+Space** to talk.
+5. **Close the window to quit** — the microphone turns off with it.
+
+Requests no built-in skill handles go to Claude (needs the `claude` CLI signed in). Risky actions, and anything Claude suggests doing, ask for your click first.
+
 A voice-first, always-on personal assistant for Manav's Windows 11 laptop, running entirely locally. See `CLAUDE.md` for the constitution this project is held to and `docs/ARCHITECTURE.md` for the full design.
 
 **Status: Milestone 0 — walking skeleton.** The thread `hold Ctrl+Alt+Space → speak → Whisper on the GPU → one real action → Kokoro says the answer aloud` is wired end to end (`nova/app.py`, entry point `python -m nova`) and has been verified by an agent using Kokoro-synthesized speech in place of a live microphone (`docs/EVIDENCE.md`). **M0's exit bar is still explicitly unmet** — `docs/EVIDENCE.md` names three things that cannot be closed without Manav (audible speakers, a real human voice, the UAC hotkey question) and a proven code path is not the same as a met milestone. There is no wake word, no always-on listening, and no local LLM. Those are deliberate scope cuts for M0, not oversights; see `docs/ROADMAP.md`.

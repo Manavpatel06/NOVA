@@ -68,7 +68,7 @@ async def _dummy_handler(ctx, **params):
     return Reply(text="ok")
 
 
-CONFIRM_SKILL = SkillSpec(
+CONFIRM_SKILL = SkillSpec(description="test skill", 
     name="dispatch_claude", tier=Tier.CONFIRM, examples=("build me an app",),
     trusts_input=False, handler=_dummy_handler,
 )
@@ -308,7 +308,7 @@ def test_a_timed_out_confirm_does_not_prevent_process_exit():
         "async def handler(ctx):\n"
         "    return Reply(text='ok')\n"
         "\n"
-        "skill = SkillSpec(name='x', tier=Tier.CONFIRM, examples=('x',), trusts_input=False, handler=handler)\n"
+        "skill = SkillSpec(description='test skill', name='x', tier=Tier.CONFIRM, examples=('x',), trusts_input=False, handler=handler)\n"
         "\n"
         "class NeverAnswers:\n"
         "    def readline(self):\n"
@@ -636,7 +636,7 @@ def test_a_timed_out_dialog_does_not_prevent_process_exit():
         "async def handler(ctx):\n"
         "    return Reply(text='ok')\n"
         "\n"
-        "skill = SkillSpec(name='x', tier=Tier.CONFIRM, examples=('x',), trusts_input=False, handler=handler)\n"
+        "skill = SkillSpec(description='test skill', name='x', tier=Tier.CONFIRM, examples=('x',), trusts_input=False, handler=handler)\n"
         "\n"
         "async def main():\n"
         "    channel = DialogConfirmChannel(timeout_s=0.1)\n"

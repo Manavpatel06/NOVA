@@ -96,6 +96,12 @@ def app(tmp_path, monkeypatch):
         app_mod, "AuditLog",
         lambda **kw: AuditLog(path=tmp_path / "audit.log", redact_terms=kw.get("redact_terms", ())),
     )
+    # Unit tests must never spawn the real `claude` CLI (it exists on dev
+    # machines and would make network calls). Any test that wants the
+    # fallthrough to answer overrides this stub explicitly.
+    async def _no_real_claude(*_a, **_kw):
+        return app_mod.ClaudeFailure(reason="cli_not_found", detail="stubbed in tests")
+    monkeypatch.setattr(app_mod.claude_arm, "ask", _no_real_claude)
     application = app_mod.NovaApp(config=Config())
     application.transcriber = _FakeTranscriber()
     application.synth = _FakeSynth()
@@ -208,24 +214,36 @@ async def test_act_tier_skill_also_produces_exactly_one_audit_record(app):
 # ---------------------------------------------------------------------------
 
 
-async def test_low_confidence_text_invokes_zero_skills_and_produces_zero_audit_records(app):
+async def test_low_confidence_text_invokes_zero_skills_and_produces_zero_audit_records(app, monkeypatch):
+    """Below the router's floor, no LOCAL skill runs; since T2.4 the turn
+    falls through to Claude. A plain ClaudeAnswer is spoken and touches
+    nothing -- zero skills, zero audit records."""
+    calls = []
+
+    async def fake_ask(prompt, **kw):
+        calls.append(prompt)
+        return app_mod.ClaudeAnswer(text="I'm not sure what you mean -- could you rephrase?")
+
+    monkeypatch.setattr(app_mod.claude_arm, "ask", fake_ask)
     app.transcriber = _FakeTranscriber(text="asdkjhaslkdjh gibberish nonsense")
 
-    reply = await app.run_turn(np.zeros(16000, dtype=np.float32))
+    await app.run_turn(np.zeros(16000, dtype=np.float32))
 
-    assert reply is None  # clarification, not a routed skill result
+    assert len(calls) == 1  # the fallthrough really ran
     assert app.audit.verify().entries == 0
-    assert len(app.synth.said) == 1
-    assert "rephrase" in app.synth.said[0].lower()
+    assert app.synth.said[-1].endswith("could you rephrase?")
 
 
-async def test_clarification_is_spoken_not_silently_dropped(app):
+async def test_unanswerable_request_is_spoken_not_silently_dropped(app):
+    """Claude unreachable (the fixture's stub) -> NOVA still says something
+    out loud rather than going silent."""
     app.transcriber = _FakeTranscriber(text="what is the weather today")
 
     await app.run_turn(np.zeros(16000, dtype=np.float32))
 
-    assert len(app.synth.said) == 1
-    assert len(app.player.played) == 1  # the clarification itself gets spoken and played
+    assert len(app.synth.said) >= 1
+    assert len(app.player.played) >= 1
+    assert "claude" in app.synth.said[-1].lower()  # "I can't reach Claude right now."
 
 
 # ---------------------------------------------------------------------------
@@ -263,7 +281,7 @@ async def test_skill_handler_exception_is_caught_and_apologized_for(app):
     async def exploding_handler(ctx, **params):
         raise RuntimeError("handler bug")
 
-    boom_spec = SkillSpec(
+    boom_spec = SkillSpec(description="test skill", 
         name="time", tier=Tier.READ, examples=("what time is it",),
         trusts_input=False, handler=exploding_handler,
     )
@@ -358,7 +376,7 @@ async def test_turn_end_is_published_even_when_the_skill_handler_raises(app):
     async def exploding_handler(ctx, **params):
         raise RuntimeError("handler bug")
 
-    boom_spec = SkillSpec(
+    boom_spec = SkillSpec(description="test skill", 
         name="time", tier=Tier.READ, examples=("what time is it",),
         trusts_input=False, handler=exploding_handler,
     )

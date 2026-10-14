@@ -68,6 +68,16 @@ hotkey:
   latch_timeout_ms: 30000    # LATCHED auto-expires after this long with no closing tap
 
 wake:
+  # How NOVA knows you're talking to it (2026-10-14):
+  #   prefix -- while NOVA's window is open it acts ONLY on sentences that
+  #             START with one of `names` ("Nova, open Spotify"). Other
+  #             speech is transcribed locally, discarded unread, never logged.
+  #   model  -- the older always-on "hey jarvis" detector below.
+  mode: prefix
+  names: [nova]
+  follow_up_ms: 8000        # after a bare "Nova", how long to wait for the command
+  max_utterance_ms: 15000
+  min_speech_ms: 300
   model_path: hey_jarvis_v0.1.onnx   # resolved against models/wake/; swap for hey_nova.onnx later, zero code changes
   # The one knob Manav will actually tune -- this is the access-control gate
   # for hands-free arming, not a comfort setting.
@@ -92,7 +102,7 @@ duplex:
   # word, plus a hangover after speech ends. Inherited from the retired
   # build's 180ms (speaker decay + WASAPI output buffering), rounded up --
   # NOT measured on this machine's speakers/room. See nova/audio/duplex.py.
-  hangover_ms: 200
+  hangover_ms: 500   # raised from 200 (2026-10-14): in prefix mode NOVA must not hear the tail of its own voice
 
 brain:
   # Calibrated against a labelled phrase set, not chosen decoratively --
@@ -109,3 +119,8 @@ governor:
   # is shedding Kokoro when both are loaded and idle.
   poll_interval_s: 5.0
   rss_ceiling_mb: 2048.0   # raised from 900 on 2026-10-13 (Manav): keep models resident -- no unload/reload churn, no F21 VRAM creep; see docs/decisions/0012
+
+ui:
+  # true: NOVA is a windowed app -- open it to use it, close the window to
+  # quit (mic off). false: the older background tray-icon mode.
+  window: true

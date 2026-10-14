@@ -28,7 +28,7 @@ async def _dummy_handler(ctx, **params):
 
 
 def _make_skill(tier, name="dummy") -> SkillSpec:
-    return SkillSpec(
+    return SkillSpec(description="test skill", 
         name=name, tier=tier, examples=("do the thing",), trusts_input=False, handler=_dummy_handler,
     )
 
@@ -266,7 +266,7 @@ async def test_params_cannot_smuggle_a_lower_tier():
 
 
 async def test_unknown_tier_value_raises_type_error():
-    bogus = SkillSpec(
+    bogus = SkillSpec(description="test skill", 
         name="bogus", tier="not-a-real-tier", examples=("x",), trusts_input=False,  # type: ignore[arg-type]
         handler=_dummy_handler,
     )
@@ -418,7 +418,7 @@ async def test_a_non_tier_declared_tier_with_a_floor_still_raises_type_error_not
     floor passed must still reach the loud TypeError at the bottom of
     authorize(), not a confusing KeyError out of the Tier rank table when
     floor composition tries to look it up."""
-    bogus = SkillSpec(
+    bogus = SkillSpec(description="test skill", 
         name="bogus", tier="not-a-real-tier", examples=("x",), trusts_input=False,  # type: ignore[arg-type]
         handler=_dummy_handler,
     )
@@ -549,7 +549,7 @@ async def test_ceiling_violation_is_checked_before_the_confirm_branch_never_pops
 
 
 async def test_a_non_tier_declared_tier_with_a_ceiling_still_raises_type_error_not_a_comparison_error():
-    bogus = SkillSpec(
+    bogus = SkillSpec(description="test skill", 
         name="bogus", tier="not-a-real-tier", examples=("x",), trusts_input=False,  # type: ignore[arg-type]
         handler=_dummy_handler,
     )

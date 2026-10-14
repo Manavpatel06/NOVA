@@ -40,11 +40,11 @@ async def _open_app_handler(ctx, app):
     return Reply(text=f"Opening {app}.")
 
 
-TIME_SPEC = SkillSpec(
+TIME_SPEC = SkillSpec(description="test skill", 
     name="time", tier=Tier.READ, trusts_input=False, handler=_time_handler,
     examples=("what time is it", "what's the time", "tell me the time", "current time"),
 )
-OPEN_APP_SPEC = SkillSpec(
+OPEN_APP_SPEC = SkillSpec(description="test skill", 
     name="open_app", tier=Tier.ACT, trusts_input=False, handler=_open_app_handler,
     examples=("open notepad", "launch calculator", "open file explorer",
               "open task manager", "open control panel"),
@@ -199,7 +199,7 @@ def test_skill_with_more_than_one_param_always_clarifies():
     async def two_param_handler(ctx, src, dst):
         return Reply(text="moved")
 
-    spec = SkillSpec(
+    spec = SkillSpec(description="test skill", 
         name="mover", tier=Tier.ACT, trusts_input=False, handler=two_param_handler,
         examples=("move file from here to there",),
     )
@@ -223,9 +223,9 @@ def test_near_tied_scores_ask_which_skill_rather_than_picking_one():
     async def handler_b(ctx):
         return Reply(text="b")
 
-    skill_a = SkillSpec(name="skill_a", tier=Tier.READ, trusts_input=False,
+    skill_a = SkillSpec(description="test skill", name="skill_a", tier=Tier.READ, trusts_input=False,
                          handler=handler_a, examples=("show me the report",))
-    skill_b = SkillSpec(name="skill_b", tier=Tier.READ, trusts_input=False,
+    skill_b = SkillSpec(description="test skill", name="skill_b", tier=Tier.READ, trusts_input=False,
                          handler=handler_b, examples=("show me the summary",))
     router = Router(skills={"skill_a": skill_a, "skill_b": skill_b})
 
@@ -243,9 +243,9 @@ def test_a_clear_winner_is_not_treated_as_ambiguous():
     async def handler_b(ctx):
         return Reply(text="b")
 
-    skill_a = SkillSpec(name="skill_a", tier=Tier.READ, trusts_input=False,
+    skill_a = SkillSpec(description="test skill", name="skill_a", tier=Tier.READ, trusts_input=False,
                          handler=handler_a, examples=("show me the report",))
-    skill_b = SkillSpec(name="skill_b", tier=Tier.READ, trusts_input=False,
+    skill_b = SkillSpec(description="test skill", name="skill_b", tier=Tier.READ, trusts_input=False,
                          handler=handler_b, examples=("show me the summary",))
     router = Router(skills={"skill_a": skill_a, "skill_b": skill_b})
 
@@ -265,9 +265,9 @@ def test_ambiguity_margin_is_configurable():
     async def handler_b(ctx):
         return Reply(text="b")
 
-    skill_a = SkillSpec(name="skill_a", tier=Tier.READ, trusts_input=False,
+    skill_a = SkillSpec(description="test skill", name="skill_a", tier=Tier.READ, trusts_input=False,
                          handler=handler_a, examples=("show me the report",))
-    skill_b = SkillSpec(name="skill_b", tier=Tier.READ, trusts_input=False,
+    skill_b = SkillSpec(description="test skill", name="skill_b", tier=Tier.READ, trusts_input=False,
                          handler=handler_b, examples=("show me the summary",))
 
     narrow = Router(skills={"skill_a": skill_a, "skill_b": skill_b}, ambiguity_margin=0.01)

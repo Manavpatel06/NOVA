@@ -359,6 +359,33 @@ class WakeConfig:
     preroll_ms: int = 1000  # audio kept before detection so the first syllables of the command aren't lost
     arm_timeout_ms: int = 15000  # hard ceiling if VAD never detects end-of-speech
     vad_silence_ms: int = 800  # consecutive trailing silence (VAD) that ends an armed turn once speech has started
+    #: How NOVA decides speech is meant for it (Manav, 2026-10-14):
+    #:   "prefix" -- NOVA listens only while its window is open, transcribes
+    #:               each utterance locally, and acts ONLY when the sentence
+    #:               starts with one of `names` ("Nova, open Spotify").
+    #:               Everything else is discarded unread and never logged.
+    #:   "model"  -- the original always-on wake-word detector (model_path).
+    mode: str = "model"  # config/nova.yaml sets "prefix" -- the shipped behaviour
+    #: Names NOVA answers to in prefix mode, matched case-insensitively at the
+    #: start of a sentence, optionally after "hey"/"hi"/"ok"/"okay".
+    names: list[str] = field(default_factory=lambda: ["nova"])
+    #: After a bare "Nova" (nothing else said), how long NOVA keeps listening
+    #: for the command without needing its name again.
+    follow_up_ms: int = field(default=8000, metadata={"bounds": Bounds(lo=0, hi=60000)})
+    #: Longest single utterance NOVA will buffer in prefix mode.
+    max_utterance_ms: int = field(default=15000, metadata={"bounds": Bounds(lo=1000, hi=60000)})
+    #: Speech shorter than this is treated as noise (coughs, clicks) and dropped.
+    min_speech_ms: int = field(default=300, metadata={"bounds": Bounds(lo=0, hi=5000)})
+
+
+@dataclass(frozen=True)
+class UiConfig:
+    """Consumed by nova.app / nova.interfaces.window (Manav, 2026-10-14)."""
+
+    #: True: NOVA is a normal windowed app -- opening it shows the NOVA
+    #: window and starts listening; closing the window quits NOVA and turns
+    #: the microphone off. False: the older background tray-icon mode.
+    window: bool = False  # config/nova.yaml sets true -- the shipped behaviour
 
 
 @dataclass(frozen=True)
@@ -375,7 +402,7 @@ class DuplexConfig:
     #: security concern like WakeConfig.threshold's floor -- no upper bound
     #: needed for the same reason none of the other timing knobs in this
     #: file have one).
-    hangover_ms: int = field(default=200, metadata={"bounds": Bounds(lo=0)})
+    hangover_ms: int = field(default=500, metadata={"bounds": Bounds(lo=0)})
 
 
 @dataclass(frozen=True)
@@ -426,6 +453,7 @@ class Config:
     duplex: DuplexConfig = field(default_factory=DuplexConfig)
     brain: BrainConfig = field(default_factory=BrainConfig)
     governor: GovernorConfig = field(default_factory=GovernorConfig)
+    ui: UiConfig = field(default_factory=UiConfig)
 
 
 _SECTIONS: dict[str, type] = {
@@ -438,6 +466,7 @@ _SECTIONS: dict[str, type] = {
     "duplex": DuplexConfig,
     "brain": BrainConfig,
     "governor": GovernorConfig,
+    "ui": UiConfig,
 }
 
 

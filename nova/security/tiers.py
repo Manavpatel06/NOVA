@@ -93,8 +93,8 @@ class ArmedBy(Enum):
            purpose (docs/THREAT_MODEL_ALWAYS_ON.md §4's whole concern, and
            WakeConfig.threshold's own comment names this as the reason
            lowering that number widens more than false-accept risk) — ACT
-           and CONFIRM require push-to-talk, unconditionally, until this
-           enum grows a third source with its own explicit ruling.
+           and CONFIRM require push-to-talk, unconditionally.
+    VOICE / TYPED — see the members below for Manav's 2026-10-14 ruling.
 
     Co-located with `Tier` rather than in `nova/audio/wake.py` or `nova/
     app.py`: this is a security primitive `Ladder.authorize()`'s docstring
@@ -104,6 +104,17 @@ class ArmedBy(Enum):
 
     PTT = "ptt"
     WAKE = "wake"
+    # VOICE (Manav, 2026-10-14): the sentence began with NOVA's name while
+    # NOVA's window was open on screen -- prefix wake, nova/brain/address.py.
+    # Manav's ruling: actions are allowed (no ceiling). Two things still
+    # stand between overheard speech and an action: the sentence must START
+    # with "Nova" (not merely mention it), and listening only happens while
+    # he has the window open. CONFIRM-tier actions -- and every action
+    # Claude proposes (Origin.CLAUDE's floor) -- still require a human click.
+    VOICE = "voice"
+    # TYPED: Manav typed the request into NOVA's window. A human at the
+    # keyboard is at least as present as one holding the hotkey.
+    TYPED = "typed"
 
 
 class Origin(Enum):
