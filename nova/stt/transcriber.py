@@ -8,6 +8,7 @@ supported. See `nova.stt.gpu` for why that distinction matters.
 from __future__ import annotations
 
 import gc
+import threading
 import time
 
 import numpy as np
@@ -35,12 +36,19 @@ class Transcriber:
         # language of every clip -- a 0.8 s near-silent clip came back as
         # Spanish ("¡Gracias!"). None = auto-detect, kept as an escape hatch.
         self._language = language or None
+        # background pre-load (window mode) and a first utterance can race
+        # to load(); without this both would build a model and double VRAM
+        self._load_lock = threading.Lock()
 
     @property
     def profile(self) -> GpuProfile:
         return self._profile
 
     def load(self) -> None:
+        with self._load_lock:
+            self._load_unlocked()
+
+    def _load_unlocked(self) -> None:
         if self._model is not None:
             return
         from faster_whisper import WhisperModel

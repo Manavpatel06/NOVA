@@ -417,6 +417,13 @@ class NovaApp:
             self.tray.start(loop=asyncio.get_running_loop())
         await self.governor.start()
         await self._ui_state("idle")
+        if self.window is not None:
+            # Windowed NOVA is opened in order to be used: load Whisper and
+            # the voice now, in the background, so the first "Nova, ..." is
+            # answered in ~1 s instead of waiting ~10 s for models to load
+            # (measured 2026-10-13: 7.0 s Whisper load + Kokoro load on the
+            # first turn). ADR 0012 already keeps them resident.
+            self._prewarm_task = asyncio.create_task(self._prewarm())
 
     async def stop(self) -> None:
         """Tear down cleanly: stop the hotkey, the wake word, the
@@ -434,6 +441,9 @@ class NovaApp:
         self.hotkey.stop()
         if not self._prefix_mode:
             self.wake_word.stop()
+        prewarm = getattr(self, "_prewarm_task", None)
+        if prewarm is not None and not prewarm.done():
+            await asyncio.wait([prewarm], timeout=30.0)
         if self._utterance_tasks:
             # let in-flight transcriptions finish (they now see _stopping and
             # do nothing) so Whisper is never unloaded mid-transcribe
@@ -687,6 +697,19 @@ class NovaApp:
                 await self.bus.publish(TOPIC_TURN_END, None)
         self.segmenter.reset()
         self._follow_up_until = time.monotonic() + self.config.wake.follow_up_ms / 1000.0
+
+    async def _prewarm(self) -> None:
+        await self._ui_state("loading")
+        for name, model in (("speech recognition", self.transcriber), ("voice", self.synth)):
+            loader = getattr(model, "load", None)
+            if loader is None:
+                continue
+            try:
+                await asyncio.to_thread(loader)
+            except Exception as exc:  # noqa: BLE001 -- lazy load on first use still works
+                _log.warning("Pre-loading %s failed (%s); it will load on first use instead.", name, exc)
+        _log.info("Models pre-loaded -- NOVA is ready")
+        await self._ui_state("idle")
 
     async def _on_typed_text(self, text: str) -> None:
         """Window text box -> a turn. Typing is the same as asking."""

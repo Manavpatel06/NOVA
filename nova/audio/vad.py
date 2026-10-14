@@ -33,6 +33,8 @@ from nova.log import get_logger
 _log = get_logger(__name__)
 
 DEFAULT_SAMPLERATE = 16000
+_CHUNK = 512    # samples per model call at 16 kHz (Silero v5)
+_CONTEXT = 64   # trailing samples of the previous chunk prepended to each call
 
 
 class Vad:
@@ -50,6 +52,9 @@ class Vad:
         self._samplerate = samplerate
         self._session: ort.InferenceSession | None = None
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        self._pending = np.zeros(0, dtype=np.float32)
+        self._context = np.zeros(_CONTEXT, dtype=np.float32)
+        self._last_prob = 0.0
         self.available = False
 
     def load(self) -> None:
@@ -85,21 +90,36 @@ class Vad:
         """Clear recurrent state. Call at the start of each new utterance/
         turn so a previous turn's context doesn't bleed into the next."""
         self._state = np.zeros((2, 1, 128), dtype=np.float32)
+        self._pending = np.zeros(0, dtype=np.float32)
+        self._context = np.zeros(_CONTEXT, dtype=np.float32)
+        self._last_prob = 0.0
 
     def process(self, frame: np.ndarray) -> float:
-        """Return speech probability in [0, 1] for this frame. Never
-        raises and never logs the frame itself -- only counts/scores ever
-        reach a log line (same discipline as nova.interfaces.hotkey)."""
+        """Return the latest speech probability in [0, 1]. Never raises and
+        never logs the frame itself.
+
+        FIXED 2026-10-14: frames used to go to the model as bare 480-sample
+        chunks. The model only works when fed exactly the way Silero's own
+        wrapper feeds it -- 512-sample chunks, each prefixed with the last
+        64 samples of the previous one. Fed bare chunks it returned ~0.002
+        for clear speech (measured on a TTS sample: 0 of 205 frames over
+        0.5, versus 96 of 193 fed correctly), so NOVA never detected speech
+        at all. Callers still pass 30 ms Capture frames; this re-buffers
+        internally and returns the most recent chunk's probability."""
         if not self.available or self._session is None:
             return 0.0
-        x = np.asarray(frame, dtype=np.float32).reshape(1, -1)
+        self._pending = np.concatenate([self._pending, np.asarray(frame, dtype=np.float32).reshape(-1)])
         sr = np.array(self._samplerate, dtype=np.int64)
-        try:
-            out, new_state = self._session.run(
-                None, {"input": x, "state": self._state, "sr": sr}
-            )
+        while len(self._pending) >= _CHUNK:
+            chunk, self._pending = self._pending[:_CHUNK], self._pending[_CHUNK:]
+            x = np.concatenate([self._context, chunk]).reshape(1, -1)
+            try:
+                out, new_state = self._session.run(None, {"input": x, "state": self._state, "sr": sr})
+            except Exception as exc:
+                _log.warning("VAD inference failed (%s); treating frame as silence", type(exc).__name__)
+                self._last_prob = 0.0
+                continue
             self._state = new_state
-            return float(out.reshape(-1)[0])
-        except Exception as exc:
-            _log.warning("VAD inference failed (%s); treating frame as silence", type(exc).__name__)
-            return 0.0
+            self._context = chunk[-_CONTEXT:]
+            self._last_prob = float(out.reshape(-1)[0])
+        return self._last_prob

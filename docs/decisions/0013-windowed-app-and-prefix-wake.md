@@ -40,3 +40,19 @@ gate later without changing anything else.
 - Duplex hangover 200 → 500 ms so NOVA doesn't hear the tail of its own voice.
 - Two tests broken by T2.4's required `SkillSpec.description`, and two M0
   tests that spawned the real `claude` CLI, were updated.
+
+## Follow-up the same day: NOVA heard nothing in the first real test
+
+Manav's first run: window open 26 minutes, zero utterances detected.
+Root cause, measured: `nova/audio/vad.py` fed Silero bare 480-sample frames.
+The real model only works the way Silero's own wrapper feeds it — 512-sample
+chunks, each prefixed with the previous chunk's last 64 samples. Fed wrongly
+it scored clear speech at ~0.002 (0 of 205 frames over 0.5); fed correctly,
+96 of 193. `Vad.process()` now re-buffers internally. This also silently
+affected the older wake-word mode's end-of-speech detection (it always ran
+to the 15 s timeout). Pinned by a real-model test and an end-to-end test
+that pushes a recorded "Nova, what time is it?" through the real capture
+loop and VAD; both fail with the old `vad.py` and pass with the fix.
+
+Also: the window now pre-loads Whisper and the voice in the background
+("Starting up…"), so the first command isn't stuck behind ~10 s of loading.

@@ -60,6 +60,7 @@ STAR_HI = "#FFF0D2"
 MUTED = "#5B6B72"
 
 STATE_LABEL = {
+    "loading": "Starting up…",
     "idle": "Ready",
     "listening": "Listening…",
     "thinking": "Thinking…",
@@ -67,6 +68,7 @@ STATE_LABEL = {
     "muted": "Mic off",
 }
 STATE_COLOR = {
+    "loading": MUTED,
     "idle": TEAL,
     "listening": TEAL,
     "thinking": STAR,

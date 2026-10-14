@@ -148,113 +148,92 @@ def test_process_after_a_failed_load_returns_zero(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# process(): returns the model's score, with the correct shapes/dtypes fed in
+# process(): the model must be fed exactly as Silero's own wrapper feeds it --
+# 512-sample chunks, each prefixed with the previous chunk's last 64 samples.
+# Before 2026-10-14 NOVA fed bare 480-sample frames; the real model then
+# scored clear speech ~0.002 (0 of 205 frames over 0.5) and NOVA never
+# detected speech at all. These tests pin the corrected contract.
 # ---------------------------------------------------------------------------
 
 
-def test_process_returns_the_models_score(model_file, monkeypatch):
-    fake_session = _FakeVadSession(score_fn=lambda feeds: 0.73)
+def _loaded(model_file, monkeypatch, **session_kw):
+    fake_session = _FakeVadSession(accepted_sizes=(576,), **session_kw)
     _install_fake_ort(monkeypatch, session=fake_session)
     vad = Vad(model_path=model_file)
     vad.load()
+    return vad, fake_session
+
+
+def test_model_input_is_512_samples_plus_64_of_context(model_file, monkeypatch):
+    vad, sess = _loaded(model_file, monkeypatch)
+    vad.process(_frame(480))
+    assert sess.run_calls == []  # 480 < 512: buffered, not yet run
+    vad.process(_frame(480))
+    fed = sess.run_calls[0]["input"]
+    assert fed.shape == (1, 576)
+    assert fed.dtype == np.float32
+
+
+def test_context_is_the_tail_of_the_previous_chunk(model_file, monkeypatch):
+    vad, sess = _loaded(model_file, monkeypatch)
+    audio = np.arange(512 * 3, dtype=np.float32)
+    for i in range(0, len(audio), 480):
+        vad.process(audio[i:i + 480])
+    first, second = sess.run_calls[0]["input"][0], sess.run_calls[1]["input"][0]
+    assert np.array_equal(first[:64], np.zeros(64, dtype=np.float32))  # nothing before the first chunk
+    assert np.array_equal(first[64:], audio[:512])
+    assert np.array_equal(second[:64], audio[448:512])  # last 64 of chunk 1
+    assert np.array_equal(second[64:], audio[512:1024])
+
+
+def test_no_audio_is_dropped_or_duplicated_across_frames(model_file, monkeypatch):
+    vad, sess = _loaded(model_file, monkeypatch)
+    audio = np.arange(480 * 32, dtype=np.float32)  # 30 model chunks exactly
+    for i in range(0, len(audio), 480):
+        vad.process(audio[i:i + 480])
+    fed = np.concatenate([c["input"][0][64:] for c in sess.run_calls])
+    assert np.array_equal(fed, audio[: len(fed)])
+    assert len(fed) == 512 * (len(audio) // 512)
+
+
+def test_process_returns_the_latest_models_score(model_file, monkeypatch):
+    vad, _ = _loaded(model_file, monkeypatch, score_fn=lambda feeds: 0.73)
+    assert vad.process(_frame(480)) == 0.0  # no chunk complete yet
     assert vad.process(_frame(480)) == pytest.approx(0.73)
 
 
-def test_process_reshapes_the_frame_to_batch_one(model_file, monkeypatch):
-    fake_session = _FakeVadSession()
-    _install_fake_ort(monkeypatch, session=fake_session)
-    vad = Vad(model_path=model_file)
-    vad.load()
-    vad.process(_frame(480))
-    fed = fake_session.run_calls[0]["input"]
-    assert fed.shape == (1, 480)
-    assert fed.dtype == np.float32
-
-
 def test_process_passes_the_configured_samplerate(model_file, monkeypatch):
-    fake_session = _FakeVadSession()
+    fake_session = _FakeVadSession(accepted_sizes=(576,))
     _install_fake_ort(monkeypatch, session=fake_session)
     vad = Vad(model_path=model_file, samplerate=8000)
     vad.load()
-    vad.process(_frame(480))
-    fed = fake_session.run_calls[0]["sr"]
-    assert int(fed) == 8000
-
-
-# ---------------------------------------------------------------------------
-# process()/reset(): recurrent state is threaded, never silently reset
-# ---------------------------------------------------------------------------
+    vad.process(_frame(512))
+    assert int(fake_session.run_calls[0]["sr"]) == 8000
 
 
 def test_process_threads_recurrent_state_from_one_call_into_the_next(model_file, monkeypatch):
-    fake_session = _FakeVadSession()
-    _install_fake_ort(monkeypatch, session=fake_session)
-    vad = Vad(model_path=model_file)
-    vad.load()
-
-    vad.process(_frame(480))
-    fed_state_call1 = fake_session.run_calls[0]["state"]
-    assert np.array_equal(fed_state_call1, np.zeros((2, 1, 128), dtype=np.float32))
-
-    vad.process(_frame(480))
-    fed_state_call2 = fake_session.run_calls[1]["state"]
-    # call 2 must receive exactly what call 1's session returned as the new
-    # state (the fake's marker: input state + 1) -- not a fresh zero state.
-    assert np.array_equal(fed_state_call2, np.ones((2, 1, 128), dtype=np.float32))
+    vad, sess = _loaded(model_file, monkeypatch)
+    vad.process(_frame(1024))  # two chunks
+    assert np.array_equal(sess.run_calls[0]["state"], np.zeros((2, 1, 128), dtype=np.float32))
+    assert np.array_equal(sess.run_calls[1]["state"], np.ones((2, 1, 128), dtype=np.float32))
 
 
-def test_reset_clears_recurrent_state_back_to_zero(model_file, monkeypatch):
-    fake_session = _FakeVadSession()
-    _install_fake_ort(monkeypatch, session=fake_session)
-    vad = Vad(model_path=model_file)
-    vad.load()
-
-    vad.process(_frame(480))  # state becomes non-zero (ones, per the fake's marker)
+def test_reset_clears_state_context_and_buffered_audio(model_file, monkeypatch):
+    vad, sess = _loaded(model_file, monkeypatch)
+    vad.process(np.full(512 + 300, 5.0, dtype=np.float32))  # one chunk run, 300 samples pending
     vad.reset()
-    vad.process(_frame(480))
-
-    fed_after_reset = fake_session.run_calls[-1]["state"]
-    assert np.array_equal(fed_after_reset, np.zeros((2, 1, 128), dtype=np.float32))
+    vad.process(_frame(512))
+    last = sess.run_calls[-1]
+    assert np.array_equal(last["state"], np.zeros((2, 1, 128), dtype=np.float32))
+    assert np.array_equal(last["input"][0], np.zeros(576, dtype=np.float32))  # no stale context/pending audio
 
 
 def test_state_shape_and_dtype_match_the_silero_recurrent_state_contract(model_file, monkeypatch):
-    fake_session = _FakeVadSession()
-    _install_fake_ort(monkeypatch, session=fake_session)
-    vad = Vad(model_path=model_file)
-    vad.load()
-    vad.process(_frame(480))
-    fed = fake_session.run_calls[0]["state"]
+    vad, sess = _loaded(model_file, monkeypatch)
+    vad.process(_frame(512))
+    fed = sess.run_calls[0]["state"]
     assert fed.shape == (2, 1, 128)
     assert fed.dtype == np.float32
-
-
-# ---------------------------------------------------------------------------
-# The chunk-size claim: 480/512 accepted; anything else fails inside the
-# model, and process() must swallow that -- never raise, treat as silence.
-# ---------------------------------------------------------------------------
-
-
-@pytest.mark.parametrize("n", [480, 512])
-def test_process_accepts_the_documented_chunk_sizes(model_file, monkeypatch, n):
-    fake_session = _FakeVadSession(accepted_sizes=(480, 512), score_fn=lambda feeds: 0.42)
-    _install_fake_ort(monkeypatch, session=fake_session)
-    vad = Vad(model_path=model_file)
-    vad.load()
-    assert vad.process(_frame(n)) == pytest.approx(0.42)
-
-
-@pytest.mark.parametrize("n", [1024, 1536])
-def test_process_swallows_the_internal_shape_error_for_rejected_chunk_sizes(
-    model_file, monkeypatch, caplog, n
-):
-    fake_session = _FakeVadSession(accepted_sizes=(480, 512))
-    _install_fake_ort(monkeypatch, session=fake_session)
-    vad = Vad(model_path=model_file)
-    vad.load()
-    with caplog.at_level("WARNING"):
-        result = vad.process(_frame(n))  # must not raise
-    assert result == 0.0
-    assert any("inference failed" in r.message.lower() for r in caplog.records)
 
 
 def test_process_never_raises_even_on_a_completely_broken_session(model_file, monkeypatch):
@@ -265,7 +244,7 @@ def test_process_never_raises_even_on_a_completely_broken_session(model_file, mo
     _install_fake_ort(monkeypatch, session=_BrokenSession())
     vad = Vad(model_path=model_file)
     vad.load()
-    assert vad.process(_frame(480)) == 0.0  # never raises out of process()
+    assert vad.process(_frame(512)) == 0.0  # never raises out of process()
 
 
 def test_process_inference_failure_log_names_only_the_exception_type(model_file, monkeypatch, caplog):
@@ -281,7 +260,7 @@ def test_process_inference_failure_log_names_only_the_exception_type(model_file,
     vad = Vad(model_path=model_file)
     vad.load()
     with caplog.at_level("WARNING"):
-        vad.process(_frame(480))
+        vad.process(_frame(512))
     joined = " ".join(r.message for r in caplog.records)
     assert "SUPER_SECRET_DETAIL" not in joined
     assert "ValueError" in joined
@@ -294,23 +273,42 @@ def test_process_inference_failure_log_names_only_the_exception_type(model_file,
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.skipif(
-    os.environ.get("NOVA_TEST_REAL_HARDWARE") != "1",
-    reason="set NOVA_TEST_REAL_HARDWARE=1 to load the real silero_vad.onnx model",
-)
-class TestRealSileroVadModel:
-    def test_480_and_512_sample_chunks_are_accepted(self):
-        vad = Vad()
-        vad.load()
-        assert vad.available is True
-        for n in (480, 512):
-            prob = vad.process(_frame(n))
-            assert 0.0 <= prob <= 1.0
+_REAL_MODEL = vad_mod.VAD_MODEL_PATH
+_SPEECH = Path(__file__).parent / "fixtures" / "speech_espeak_16k.wav"
 
-    def test_1024_and_1536_sample_chunks_are_rejected_but_do_not_crash(self, caplog):
+
+@pytest.mark.skipif(not _REAL_MODEL.exists(), reason="real silero_vad.onnx not on this machine")
+class TestRealSileroVadModel:
+    """Against the real model file. This is the test that would have caught
+    the 2026-10-14 bug: fed incorrectly, the real model scored clear speech
+    at ~0.002, so NOVA never heard anyone."""
+
+    def _frames(self, audio):
+        return [audio[i:i + 480] for i in range(0, len(audio) - 480, 480)]
+
+    def test_detects_real_speech_in_30ms_capture_frames(self):
+        import soundfile as sf
+
+        speech, sr = sf.read(str(_SPEECH), dtype="float32")
+        assert sr == 16000
+        rng = np.random.default_rng(0)
+        audio = np.concatenate([np.zeros(16000, np.float32), speech, np.zeros(16000, np.float32)])
+        audio = audio + (rng.standard_normal(len(audio)) * 0.003).astype(np.float32)
         vad = Vad()
         vad.load()
-        with caplog.at_level("WARNING"):
-            for n in (1024, 1536):
-                assert vad.process(_frame(n)) == 0.0
-        assert any("inference failed" in r.message.lower() for r in caplog.records)
+        probs = [vad.process(f) for f in self._frames(audio)]
+        assert sum(p > 0.5 for p in probs) > 40  # ~4 s of speech
+        assert max(probs[:20]) < 0.5            # the leading quiet isn't speech
+
+    def test_silence_is_not_speech(self):
+        vad = Vad()
+        vad.load()
+        rng = np.random.default_rng(1)
+        audio = (rng.standard_normal(16000 * 3) * 0.003).astype(np.float32)
+        assert max(vad.process(f) for f in self._frames(audio)) < 0.5
+
+    def test_any_frame_size_works(self):
+        vad = Vad()
+        vad.load()
+        for n in (160, 480, 512, 1024, 1536):
+            assert 0.0 <= vad.process(_frame(n)) <= 1.0
