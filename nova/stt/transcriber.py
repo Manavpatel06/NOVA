@@ -27,7 +27,9 @@ class Transcriber:
     """Loads large-v3-turbo on the best verified device/compute type and
     transcribes 16 kHz mono float32 PCM to text."""
 
-    def __init__(self, gpu_profile: GpuProfile | None = None, language: str | None = "en") -> None:
+    def __init__(
+        self, gpu_profile: GpuProfile | None = None, language: str | None = "en", hotwords: str | None = None,
+    ) -> None:
         ensure_dll_directories()
         self._profile = gpu_profile or probe_gpu()
         self._model = None
@@ -36,6 +38,11 @@ class Transcriber:
         # language of every clip -- a 0.8 s near-silent clip came back as
         # Spanish ("¡Gracias!"). None = auto-detect, kept as an escape hatch.
         self._language = language or None
+        # Words Whisper should expect (NOVA's own name). Without this hint the
+        # decoder is free to hear "Nova" as a commoner word, and a prefix-wake
+        # sentence then never starts with the name (first live test,
+        # 2026-10-14: every utterance came back "not addressed to NOVA").
+        self._hotwords = hotwords or None
         # background pre-load (window mode) and a first utterance can race
         # to load(); without this both would build a model and double VRAM
         self._load_lock = threading.Lock()
@@ -154,6 +161,7 @@ class Transcriber:
             # each utterance stands alone; carrying context across calls is
             # what lets one hallucination seed the next
             condition_on_previous_text=False,
+            hotwords=self._hotwords,
         )
         return "".join(seg.text for seg in segments if not _is_silence_hallucination(seg)).strip()
 

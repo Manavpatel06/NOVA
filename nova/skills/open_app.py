@@ -31,12 +31,85 @@ from __future__ import annotations
 import subprocess
 from pathlib import Path
 
+import asyncio
+import json
+import re
+import time
+
 from nova.config import orphaned_app_names
 from nova.log import get_logger
 from nova.security.tiers import Tier
 from nova.skills.registry import Reply, SkillCtx, skill
 
 logger = get_logger("skills.open_app")
+
+# --- installed apps from the Start menu (2026-10-15) -----------------------
+# Apps outside the curated allowlist (Spotify, Discord, VS Code, Store apps)
+# are launched by the AppUserModelID Windows itself reports in Get-StartApps
+# (shell:AppsFolder\<id>) -- the same thing clicking the Start-menu entry
+# does. Speech only *selects* an entry from Windows' own list; it never
+# becomes a path or a command.
+_START_APPS_PS = "Get-StartApps | Select-Object Name, AppID | ConvertTo-Json -Compress"
+_START_APPS_TTL_S = 300.0
+_start_apps_cache: tuple[float, list[tuple[str, str]]] | None = None
+_SKIP_WORDS = (
+    "uninstall", "readme", "help", "documentation", "release notes", "website", "license",
+    "repair", "reset", "setup", "modify", "remove", "update",
+)
+
+
+def _words(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]+", text.lower())
+
+
+async def _start_apps() -> list[tuple[str, str]]:
+    global _start_apps_cache
+    now = time.monotonic()
+    if _start_apps_cache is not None and now - _start_apps_cache[0] < _START_APPS_TTL_S:
+        return _start_apps_cache[1]
+    from nova.system import winops
+
+    raw = await asyncio.to_thread(winops.powershell, _START_APPS_PS, timeout=20.0)
+    data = json.loads(raw) if raw else []
+    if isinstance(data, dict):
+        data = [data]
+    apps = [
+        (str(d.get("Name", "")), str(d.get("AppID", "")))
+        for d in data if isinstance(d, dict) and d.get("Name") and d.get("AppID")
+    ]
+    _start_apps_cache = (now, apps)
+    return apps
+
+
+_ALIASES = {
+    "vs code": "visual studio code", "vscode": "visual studio code", "code": "visual studio code",
+    "edge": "microsoft edge", "teams": "microsoft teams", "store": "microsoft store",
+    "terminal": "terminal", "powershell": "windows powershell", "outlook app": "outlook",
+}
+
+
+def best_start_app(spoken: str, apps: list[tuple[str, str]]) -> tuple[str, str] | None:
+    """Pick the Start-menu entry the spoken name means, or None. Exact name
+    first, then every spoken word present in the entry's name (shortest
+    such name wins: "spotify" -> "Spotify", not "Spotify Uninstaller")."""
+    want = _words(_ALIASES.get(" ".join(_words(spoken)), spoken))
+    if not want:
+        return None
+    usable = [(n, i) for n, i in apps if not any(w in n.lower() for w in _SKIP_WORDS)]
+    joined = " ".join(want)
+    for name, app_id in usable:
+        if " ".join(_words(name)) == joined:
+            return name, app_id
+    squashed = "".join(want)
+    candidates = [
+        (name, app_id) for name, app_id in usable
+        if all(w in _words(name) for w in want) or "".join(_words(name)) == squashed
+    ]
+    if not candidates:
+        candidates = [(n, i) for n, i in usable if "".join(_words(n)).startswith(squashed) and len(squashed) >= 4]
+    if not candidates:
+        return None
+    return min(candidates, key=lambda c: len(c[0]))
 
 
 def _is_url_or_unc_shaped(raw: str) -> bool:
@@ -108,10 +181,44 @@ async def _resolve_for_confirm(ctx: SkillCtx, params: dict) -> dict:
     if _is_url_or_unc_shaped(app):
         return {"app": f"{app!r} (would be refused: looks like a URL or network path)"}
 
-    resolved, reason = _resolve_and_verify(app.strip().lower(), ctx)
+    name = app.strip().lower()
+    resolved, reason = _resolve_and_verify(name, ctx)
     if resolved is None:
+        if name not in orphaned_app_names():
+            # The handler falls back to the Start menu for anything off the
+            # allowlist, so consent must be to THAT entry (and the post-
+            # decision re-check must see a different entry as a change) --
+            # not to a "would be refused" the handler then ignores.
+            from nova.system import winops
+
+            try:
+                found = best_start_app(app, await _start_apps())
+            except (winops.WinOpsUnavailable, winops.WinOpsError, ValueError) as exc:
+                return {"app": f"{app!r} (would be refused: Start-menu apps unavailable: {type(exc).__name__})"}
+            if found is not None:
+                return {"app": found[0], "start_menu_app_id": found[1]}
         return {"app": f"{app!r} (would be refused: {reason})"}
     return {"app": str(resolved)}
+
+
+async def _open_from_start_menu(app: str) -> Reply:
+    from nova.system import winops
+
+    try:
+        found = best_start_app(app, await _start_apps())
+    except (winops.WinOpsUnavailable, winops.WinOpsError, ValueError) as exc:
+        logger.error("open_app: could not list Start-menu apps (%s)", exc)
+        return Reply(text=f"I don't know how to open '{app}'.", success=False)
+    if found is None:
+        return Reply(text=f"I couldn't find an app called {app}.", success=False)
+    title, app_id = found
+    logger.info("open_app: launching Start-menu app %r (%s)", title, app_id)
+    try:
+        await asyncio.to_thread(winops.launch_start_app, app_id)
+    except (winops.WinOpsUnavailable, winops.WinOpsError, ValueError, OSError) as exc:
+        logger.error("open_app: launching %r failed (%s)", title, exc)
+        return Reply(text=f"Couldn't open {title}.", success=False)
+    return Reply(text=f"Opening {title}.", success=True)
 
 
 @skill(
@@ -131,6 +238,13 @@ async def _resolve_for_confirm(ctx: SkillCtx, params: dict) -> dict:
     ),
     trusts_input=False,
     resolve_for_confirm=_resolve_for_confirm,
+    confirm_phrase="open {app}",
+    catch_all_patterns=[
+        # The verb alternation must be unambiguous: "start up" used to match
+        # both as "start up" and as "start" + " up", so a sentence repeating
+        # it backtracked 2^n ways (~50 s for 22 repeats, on the event loop).
+        r"(?:(?:(?:open|launch|start|run|load)(?: up)?|fire up|boot up) )+(?:the |my )?(?P<app>(?!.*\b(?:settings|website|site|tab|page|file|folder)$)[a-z0-9][a-z0-9 '&+.-]{0,40}?)(?: app| application| program)?",
+    ],
 )
 async def open_app(ctx: SkillCtx, app: str) -> Reply:
     """Launch a known Windows application by name. `app` is resolved only
@@ -159,7 +273,7 @@ async def open_app(ctx: SkillCtx, app: str) -> Reply:
                 text=f"I have '{app}' on file, but no record of ever approving it — try adding it again.",
                 success=False,
             )
-        return Reply(text=f"I don't know how to open '{app}'.", success=False)
+        return await _open_from_start_menu(app)
 
     logger.info("open_app: launching %r -> %s", app, resolved)
     try:

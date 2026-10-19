@@ -431,3 +431,67 @@ def test_fetch_blocks_a_real_redirect_even_when_it_lands_on_an_allowlisted_host(
     assert server.request_count == 0, "the redirect landed on an allowlisted host and was followed anyway"
     assert audit.records[-1]["kind"] == "egress.fetch_redirect_blocked"
     assert audit.records[-1]["redirect_target_host"] == "allowlisted.test"
+
+
+# 2026-10-15: fetch() takes an optional timeout and hands it to urlopen, so a
+# hung host can't stall a voice turn forever.
+
+
+def test_fetch_passes_a_default_timeout_to_urlopen(audit, monkeypatch):
+    seen = []
+
+    def fake(url, *a, **kw):
+        seen.append(kw.get("timeout"))
+        return _FakeResponse(b"ok")
+
+    monkeypatch.setattr(egress_mod.urllib.request, "urlopen", fake)
+    eg = Egress(["example.com"], audit=audit)
+    eg.fetch("https://example.com/")
+    eg.fetch("https://example.com/", timeout=2.5)
+    assert seen == [10.0, 2.5]
+
+
+def test_fetch_timeout_propagates_and_was_audited_first(audit, monkeypatch):
+    def slow(url, *a, **kw):
+        raise TimeoutError("timed out")
+
+    monkeypatch.setattr(egress_mod.urllib.request, "urlopen", slow)
+    eg = Egress(["example.com"], audit=audit)
+    with pytest.raises(TimeoutError):
+        eg.fetch("https://example.com/", timeout=0.01)
+    assert audit.records[-1] == {"kind": "egress.fetch", "host": "example.com", "allowed": True}
+
+
+# 2026-10-15 security review: post_json (the Claude API call) -- refusal,
+# what the audit log may contain, and the blocked-redirect path.
+
+_KEY = "sk-ant-api03-SECRETSECRETSECRETSECRET"
+
+
+def test_post_json_refuses_non_allowlisted_and_plain_http_before_any_network(audit, monkeypatch, restore_urllib_opener):
+    def _boom(*a, **k):
+        raise AssertionError("urlopen must not be reached")
+
+    monkeypatch.setattr(egress_mod.urllib.request, "urlopen", _boom)
+    eg = Egress(["api.anthropic.com"], audit=audit)
+    for url in ("https://evil.test/v1/messages", "http://api.anthropic.com/v1/messages"):
+        with pytest.raises(EgressError) as ei:
+            eg.post_json(url, {"q": "hello"}, headers={"x-api-key": _KEY})
+        assert _KEY not in str(ei.value)
+    assert [r["allowed"] for r in audit.records] == [False, False]
+
+
+def test_post_json_audit_never_holds_body_or_key_and_redirects_are_audited(audit, monkeypatch, restore_urllib_opener):
+    def _redirect(req, timeout):
+        raise EgressRedirectBlocked(original_url=req.full_url, redirect_url="https://evil.test/x", status=307)
+
+    monkeypatch.setattr(egress_mod.urllib.request, "urlopen", _redirect)
+    eg = Egress(["api.anthropic.com"], audit=audit)
+    with pytest.raises(EgressRedirectBlocked) as ei:
+        eg.post_json("https://api.anthropic.com/v1/messages", {"messages": "my secret sentence"},
+                     headers={"x-api-key": _KEY})
+    assert _KEY not in str(ei.value)
+    dumped = repr(audit.records)
+    assert _KEY not in dumped and "my secret sentence" not in dumped
+    assert audit.records[-1]["kind"] == "egress.post_redirect_blocked"
+    assert audit.records[-1]["redirect_target_host"] == "evil.test"

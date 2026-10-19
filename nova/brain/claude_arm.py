@@ -478,3 +478,169 @@ async def ask(
         )
 
     return _parse_output(out)
+
+
+# ---------------------------------------------------------------------------
+# ClaudeSession: one long-lived `claude` process for the Max-plan brain
+# (Manav, 2026-10-15: "link with my Claude Max plan" -- no API key).
+#
+# Same discipline as ask() above: the official, unmodified CLI signed in with
+# Manav's own subscription (OAuth handled entirely by `claude` -- NOVA never
+# sees or stores a credential), API-key env vars scrubbed so nothing reroutes
+# to metered billing, --safe-mode, no session files, no local tools: only
+# Anthropic's server-side WebSearch when web search is on. Text goes in on
+# stdin through Egress.release_for_process (redacted + audited), one JSON
+# line per message (--input-format stream-json), so the process -- and the
+# conversation -- stays warm between sentences instead of paying ~8 s of
+# start-up every time.
+# ---------------------------------------------------------------------------
+
+_CREATE_NO_WINDOW = 0x08000000
+_STREAM_LIMIT = 16 * 1024 * 1024
+
+
+@dataclass
+class SessionReply:
+    text: str
+    used_tools: list[str]       # tool names the model used inside the CLI (e.g. WebSearch)
+    is_error: bool = False
+
+
+class ClaudeSession:
+    def __init__(self, *, egress: Egress, audit: AuditLog, model: str, system_prompt: str,
+                 web_search: bool, cwd: str | None = None) -> None:
+        self._egress = egress
+        self._audit = audit
+        self._model = model
+        self._system_prompt = system_prompt
+        self._web = web_search
+        self._cwd = cwd
+        self._proc: asyncio.subprocess.Process | None = None
+        self._stderr_task: asyncio.Task | None = None
+        self._lock = asyncio.Lock()
+        self.turns = 0
+
+    def _argv(self, cli_path: str) -> list[str]:
+        tools = "WebSearch" if self._web else ""
+        argv = [
+            cli_path, "-p",
+            "--input-format", "stream-json",
+            "--output-format", "stream-json", "--verbose",
+            "--tools", tools,
+            "--safe-mode",
+            "--strict-mcp-config",
+            "--no-session-persistence",
+            "--model", self._model,
+            "--system-prompt", self._system_prompt,
+        ]
+        if self._web:
+            argv += ["--allowedTools", "WebSearch"]
+        return argv
+
+    @property
+    def running(self) -> bool:
+        return self._proc is not None and self._proc.returncode is None
+
+    async def start(self) -> None:
+        if self.running:
+            return
+        cli_path = find_cli()
+        self._audit.record({"kind": "claude_arm.session_start", "cli_path": cli_path, "model": self._model})
+        kwargs: dict[str, Any] = {}
+        if os.name == "nt":
+            kwargs["creationflags"] = _CREATE_NO_WINDOW
+        self._proc = await asyncio.create_subprocess_exec(
+            *self._argv(cli_path),
+            stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+            env=_child_env(), cwd=self._cwd, limit=_STREAM_LIMIT, **kwargs,
+        )
+        self.turns = 0
+        self._stderr_task = asyncio.create_task(self._drain_stderr(self._proc))
+        _log.info("Claude session started (pid %s, model %s, web search %s)", self._proc.pid, self._model,
+                  "on" if self._web else "off")
+
+    @staticmethod
+    async def _drain_stderr(proc: asyncio.subprocess.Process) -> None:
+        try:
+            while True:
+                line = await proc.stderr.readline()
+                if not line:
+                    return
+                _log.debug("claude stderr: %d bytes", len(line))
+        except Exception:  # noqa: BLE001
+            return
+
+    async def send(self, text: str, *, timeout_s: float) -> SessionReply:
+        """One user message -> the CLI's final result for it. Raises
+        ClaudeSessionError on any failure (the session is then closed)."""
+        async with self._lock:
+            if not self.running:
+                await self.start()
+            assert self._proc is not None and self._proc.stdin is not None and self._proc.stdout is not None
+            released = self._egress.release_for_process("claude_session", text)
+            line = json.dumps({"type": "user", "message": {"role": "user", "content": released}}) + "\n"
+            try:
+                self._proc.stdin.write(line.encode("utf-8"))
+                await self._proc.stdin.drain()
+                reply = await asyncio.wait_for(self._read_result(self._proc), timeout=timeout_s)
+            except asyncio.TimeoutError as exc:
+                await self._close_locked()
+                raise ClaudeSessionError(f"no reply within {timeout_s:.0f}s") from exc
+            except (OSError, ConnectionError, ValueError) as exc:
+                await self._close_locked()
+                raise ClaudeSessionError(f"session broke: {exc}") from exc
+            self.turns += 1
+            return reply
+
+    @staticmethod
+    async def _read_result(proc: asyncio.subprocess.Process) -> SessionReply:
+        used: list[str] = []
+        assert proc.stdout is not None
+        while True:
+            raw = await proc.stdout.readline()
+            if not raw:
+                raise ConnectionError("claude exited")
+            try:
+                event = json.loads(raw.decode("utf-8", "replace"))
+            except json.JSONDecodeError:
+                continue
+            kind = event.get("type")
+            if kind == "assistant":
+                for block in (event.get("message") or {}).get("content") or []:
+                    if isinstance(block, dict) and block.get("type") in ("tool_use", "server_tool_use"):
+                        used.append(str(block.get("name", "?")))
+            elif kind == "result":
+                result = event.get("result")
+                is_error = bool(event.get("is_error")) or event.get("subtype") not in (None, "success")
+                return SessionReply(text=result if isinstance(result, str) else "", used_tools=used,
+                                    is_error=is_error)
+
+    async def close(self) -> None:
+        async with self._lock:
+            await self._close_locked()
+
+    async def _close_locked(self) -> None:
+        proc, self._proc = self._proc, None
+        if proc is None:
+            return
+        if proc.returncode is None:
+            try:
+                if proc.stdin is not None:
+                    proc.stdin.close()
+            except Exception:  # noqa: BLE001
+                pass
+            proc.kill()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=_POST_KILL_WAIT_S)
+            except asyncio.TimeoutError:
+                pass
+            if os.name == "nt":
+                await asyncio.to_thread(_kill_tree, proc.pid)
+        if self._stderr_task is not None:
+            self._stderr_task.cancel()
+            self._stderr_task = None
+        _log.info("Claude session closed")
+
+
+class ClaudeSessionError(RuntimeError):
+    pass

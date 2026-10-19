@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import importlib
 import inspect
+import re
 import pkgutil
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Awaitable, Callable
@@ -201,6 +202,9 @@ class SkillCtx:
     ladder: "Ladder"
     armed_by: ArmedBy = ArmedBy.PTT
     origin: Origin = Origin.ROUTER
+    # 2026-10-15: the app's one nova.security.egress.Egress, for skills that
+    # fetch from an allowlisted host (weather). None outside the real app.
+    egress: Any = None
 
 
 @dataclass(frozen=True)
@@ -242,6 +246,20 @@ class SkillSpec:
     # open_app.py's handler still resolves and verifies independently,
     # every call, exactly as before this existed.
     resolve_for_confirm: ResolveForConfirm | None = None
+    # Exact command shapes (2026-10-15): regexes matched against the whole
+    # normalized sentence before fuzzy example matching. Named groups become
+    # handler params, so a skill can take several ("set volume to 40").
+    patterns: tuple["re.Pattern[str]", ...] = ()
+    # Broad patterns ("open X") that only count when no other skill's
+    # `patterns` matched -- so "open youtube" goes to open_website and
+    # "open wifi settings" to open_settings, and only the rest is an app.
+    catch_all_patterns: tuple["re.Pattern[str]", ...] = ()
+    # The reply text can carry outside-world text (a geocoded place name, a
+    # window title). The agent brain treats it like web content: later tool
+    # calls in that conversation need approval.
+    untrusted_output: bool = False
+    # How NOVA asks out loud for approval, e.g. "close {app}" -> "Should I close spotify?"
+    confirm_phrase: str | None = None
 
     async def invoke(self, ctx: SkillCtx, **params: Any) -> Reply:
         # Layer 2 of docs/SECURITY_SPEC.md §1.3: the skill-parameter binder's
@@ -395,6 +413,10 @@ def skill(
     description: str,
     trusts_input: bool,
     resolve_for_confirm: ResolveForConfirm | None = None,
+    patterns: list[str] | None = None,
+    confirm_phrase: str | None = None,
+    catch_all_patterns: list[str] | None = None,
+    untrusted_output: bool = False,
 ) -> Callable[[Handler], Handler]:
     """Decorator: registers `name` in the module-level registry at import
     time. Raises SkillError on a duplicate name, an empty examples list, an
@@ -421,6 +443,23 @@ def skill(
             raise SkillError(f"skill '{name}': must declare at least one example")
         if not description or not description.strip():
             raise SkillError(f"skill '{name}': must declare a non-empty description")
+        param_names = [p for p in inspect.signature(handler).parameters if p != "ctx"]
+
+        def _compile(pats):
+            out: list[re.Pattern[str]] = []
+            for pat in pats or ():
+                try:
+                    rx = re.compile(pat, re.IGNORECASE)
+                except re.error as exc:
+                    raise SkillError(f"skill '{name}': bad pattern {pat!r}: {exc}") from exc
+                unknown = set(rx.groupindex) - set(param_names)
+                if unknown:
+                    raise SkillError(f"skill '{name}': pattern {pat!r} names groups {sorted(unknown)} the handler doesn't accept")
+                out.append(rx)
+            return out
+
+        catch_all = _compile(catch_all_patterns)
+        compiled = _compile(patterns)
         if name in _REGISTRY:
             existing = _REGISTRY[name]
             raise SkillError(
@@ -436,6 +475,10 @@ def skill(
             trusts_input=trusts_input,
             handler=handler,
             resolve_for_confirm=resolve_for_confirm,
+            patterns=tuple(compiled),
+            confirm_phrase=confirm_phrase,
+            catch_all_patterns=tuple(catch_all),
+            untrusted_output=untrusted_output,
         )
         return handler
 

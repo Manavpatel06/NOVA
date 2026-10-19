@@ -237,7 +237,9 @@ async def test_low_confidence_text_invokes_zero_skills_and_produces_zero_audit_r
 async def test_unanswerable_request_is_spoken_not_silently_dropped(app):
     """Claude unreachable (the fixture's stub) -> NOVA still says something
     out loud rather than going silent."""
-    app.transcriber = _FakeTranscriber(text="what is the weather today")
+    # Was "what is the weather today" -- weather became a real skill on
+    # 2026-10-15, so the stand-in for "nothing local can answer this" changed.
+    app.transcriber = _FakeTranscriber(text="write me a poem about the ocean")
 
     await app.run_turn(np.zeros(16000, dtype=np.float32))
 

@@ -21,6 +21,7 @@ module does not reimplement any of it.
 from __future__ import annotations
 
 import re
+import urllib.error
 import urllib.request
 from collections.abc import Sequence
 from urllib.parse import urlsplit
@@ -142,8 +143,12 @@ class Egress:
     def allowed_hosts(self) -> frozenset[str]:
         return self._allowed_hosts
 
-    def fetch(self, url: str) -> bytes:
+    def fetch(self, url: str, timeout: float = 10.0) -> bytes:
         """Fetch `url` if, and only if, its host is on the allowlist.
+
+        `timeout` (seconds, 2026-10-15) bounds the connect and each read, so a
+        hung server can't stall a voice turn forever; it reaches urlopen()
+        unchanged and its expiry surfaces as the usual OSError/TimeoutError.
 
         Exact set membership against the fully-normalized host — never a
         substring/endswith check (`"evil-notion.so".endswith("notion.so")`
@@ -163,7 +168,7 @@ class Egress:
             raise EgressError(f"host {host!r} (from {url!r}) is not on the egress allowlist")
 
         try:
-            with urllib.request.urlopen(url) as response:  # noqa: S310 — the one sanctioned transport call
+            with urllib.request.urlopen(url, timeout=timeout) as response:  # noqa: S310 — the one sanctioned transport call
                 return response.read()
         except EgressRedirectBlocked as exc:
             # A blocked redirect is exactly the event someone will want in
@@ -176,6 +181,54 @@ class Egress:
                 "status": exc.status,
             })  # raises on write failure — propagates, same discipline as everywhere else in this module
             raise
+
+    def post_json(self, url: str, body: dict, *, headers: dict[str, str], timeout: float = 20.0) -> dict:
+        """POST JSON to an allowlisted https host and return the decoded
+        JSON reply (2026-10-15, for nova.brain.agent's Claude API calls).
+
+        Same rules as fetch(): exact-host allowlist, every call audited
+        (host, sizes, status -- never the body), redirects refused. HTTP
+        errors come back as EgressError carrying the status and the
+        service's error message (which never contains our request)."""
+        import json
+
+        parts = urlsplit(url)
+        host = normalize_host(parts.hostname or "")
+        allowed = host is not None and host in self._allowed_hosts and parts.scheme == "https"
+        data = json.dumps(body).encode("utf-8")
+        self._audit.record({"kind": "egress.post", "host": host, "allowed": allowed, "bytes_out": len(data)})
+        if not allowed:
+            raise EgressError(f"host {host!r} (from {url!r}) is not on the egress allowlist (or not https)")
+        req = urllib.request.Request(url, data=data, method="POST",
+                                     headers={"content-type": "application/json", **headers})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310 -- the sanctioned transport
+                raw = response.read()
+                status = response.status
+        except EgressRedirectBlocked as exc:
+            # Not an HTTPError/URLError: without this it escaped unaudited.
+            self._audit.record({
+                "kind": "egress.post_redirect_blocked",
+                "host": host,
+                "redirect_target_host": normalize_host(urlsplit(exc.redirect_url).hostname or ""),
+                "status": exc.status,
+            })
+            raise
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = json.loads(exc.read().decode("utf-8", "replace")).get("error", {}).get("message", "")
+            except Exception:  # noqa: BLE001
+                pass
+            self._audit.record({"kind": "egress.post_result", "host": host, "status": exc.code})
+            err = EgressError(f"HTTP {exc.code} from {host}: {detail}".strip())
+            err.status = exc.code  # type: ignore[attr-defined]
+            raise err from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            self._audit.record({"kind": "egress.post_result", "host": host, "status": "unreachable"})
+            raise EgressError(f"{host} unreachable: {exc}") from exc
+        self._audit.record({"kind": "egress.post_result", "host": host, "status": status, "bytes_in": len(raw)})
+        return json.loads(raw.decode("utf-8"))
 
     def release_for_process(self, purpose: str, payload: str) -> str:
         """Redact `payload`, audit lengths and a boolean (never the text),

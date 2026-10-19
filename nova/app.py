@@ -111,7 +111,7 @@ from nova.audio.player import Player
 from nova.audio.utterance import UtteranceSegmenter
 from nova.audio.vad import Vad
 from nova.audio.wake import TOPIC_WAKE_END, TOPIC_WAKE_START, WakeEvent, WakeWord
-from nova.brain.address import strip_address
+from nova.brain.address import load_learned_names, strip_address
 from nova.brain import claude_arm
 from nova.brain.claude_arm import ClaudeAnswer, ClaudeFailure, ClaudeProposal
 from nova.brain.router import Router
@@ -119,10 +119,11 @@ from nova.config import Config, load_config
 from nova.governor import TOPIC_TURN_END, TOPIC_TURN_START, Governor
 from nova.interfaces.hotkey import TOPIC_PTT_END, TOPIC_PTT_START, Hotkey, PTTEvent
 from nova.interfaces.tray import TOPIC_SPEAK_END, TOPIC_SPEAK_START, Tray
-from nova.interfaces.window import TOPIC_UI_HEARD, TOPIC_UI_SAID, TOPIC_UI_STATE
+from nova.interfaces.window import TOPIC_UI_HEARD, TOPIC_UI_LEVEL, TOPIC_UI_SAID, TOPIC_UI_STATE
 from nova.log import get_logger
 from nova.security.audit import AuditLog
 from nova.security.confirm import DialogConfirmChannel
+from nova.security.voice_confirm import VOICE_UNAVAILABLE, VoiceConfirmChannel
 from nova.security.egress import Egress
 from nova.security.ladder import Ladder
 from nova.security.tiers import ArmedBy, Origin
@@ -214,9 +215,23 @@ class NovaApp:
         # channel. M0 still ships zero CONFIRM skills, so this wiring is
         # exercised today only by the ladder's own dormant-but-ready branch,
         # not by any live skill yet.
+        # 2026-10-15: approvals are spoken ("Should I open Notepad?" -> "yes";
+        # risky ones need "Nova, confirm"). The dialog is only the fallback
+        # for when the mic is off. See nova/security/voice_confirm.py.
+        self._confirm_future: asyncio.Future[str] | None = None
+        # Answers are transcribed one at a time, in the order they were
+        # heard: two utterances in one confirm window must never let the
+        # later (faster-to-transcribe) one decide (security review 2026-10-15).
+        self._confirm_stt_lock = asyncio.Lock()
+        self._confirm_timeout_s = max(4.0, self.config.wake.follow_up_ms / 1000.0)
         self.ladder = Ladder(
             self.audit,
-            confirm_channel=DialogConfirmChannel(redact_terms=self.config.security.redact_terms),
+            confirm_channel=VoiceConfirmChannel(
+                self._ask_by_voice,
+                fallback=DialogConfirmChannel(redact_terms=self.config.security.redact_terms),
+                names_provider=lambda: list(getattr(self, "_wake_names", None) or self.config.wake.names),
+                strict_provider=lambda: getattr(self, "_confirm_strict", False),
+            ),
         )
         # T2.4: the one sanctioned egress boundary, for claude_arm.ask()'s
         # release_for_process() call. One instance, constructed here and
@@ -234,6 +249,9 @@ class NovaApp:
             audit=self.audit,
             redact_terms=self.config.security.redact_terms,
         )
+        # 2026-10-15: the agent brain -- Claude with every skill as a tool.
+        # The router below stays as the offline / no-key fallback.
+        self.agent = self._make_brain()
 
         # --- brain: router reads the live skill registry, populated by the
         # `import nova.skills` above.
@@ -245,7 +263,10 @@ class NovaApp:
         # --- speech I/O. Constructing these does not load a model; both
         # classes lazy-load on first real use (Transcriber.transcribe(),
         # Synthesizer.say()).
-        self.transcriber = Transcriber(language=self.config.stt.language)
+        self.transcriber = Transcriber(
+            language=self.config.stt.language,
+            hotwords=_hotwords(self.config.wake.names),
+        )
         self.synth = Synthesizer()
         self.player = Player()
         self.hotkey = Hotkey(self.bus)
@@ -291,6 +312,12 @@ class NovaApp:
         if self.config.wake.mode not in ("prefix", "model"):
             _log.warning("wake.mode %r is not 'prefix' or 'model' -- using the restrictive 'model' mode", self.config.wake.mode)
         self._prefix_mode = self.config.wake.mode == "prefix"
+        from nova import WAKE_NAMES_PATH
+
+        learned = load_learned_names(WAKE_NAMES_PATH)
+        self._wake_names = list(dict.fromkeys([*self.config.wake.names, *learned]))
+        if learned:
+            _log.info("Also answering to %s (taught with scripts/teach_name.py)", ", ".join(repr(n) for n in learned))
         self.vad = Vad()
         self.segmenter = UtteranceSegmenter(
             self.vad,
@@ -302,6 +329,14 @@ class NovaApp:
         self._stopping = False
         self._follow_up_until = 0.0     # monotonic deadline after a bare "Nova"
         self._utterance_tasks: set[asyncio.Task[None]] = set()
+        # mic health: a live level for the window's meter, and a numbers-only
+        # log line every 30 s so "does NOVA hear me?" is answerable from the log
+        self._level_peak = 0.0
+        self._level_next_ui = 0.0
+        self._health_next_log = 0.0
+        self._health_frames = 0
+        self._health_speech = 0
+        self._health_peak = 0.0
 
         # --- governor (T1.2): drives existing load()/unload() lifecycle,
         # never calls load() itself. typical_rss_mb hints are measured, not
@@ -438,6 +473,14 @@ class NovaApp:
         """
         self._stopping = True
         self._listening = False
+        closer = getattr(getattr(self, "agent", None), "close", None)
+        if closer is not None:
+            try:
+                await closer()
+            except Exception as exc:  # noqa: BLE001
+                _log.warning("Closing the Claude session failed (%s)", exc)
+        if self._confirm_future is not None and not self._confirm_future.done():
+            self._confirm_future.set_result("")  # a pending "Should I ...?" ends now, declined
         self.hotkey.stop()
         if not self._prefix_mode:
             self.wake_word.stop()
@@ -510,6 +553,7 @@ class NovaApp:
             frame = await asyncio.to_thread(_blocking_read)
             if frame is None:
                 continue
+            await self._track_mic_level(frame)
             if self._capturing:
                 self._ptt_frames.append(frame)
             elif self._prefix_mode:
@@ -616,6 +660,30 @@ class NovaApp:
 
     # -- prefix wake + window -------------------------------------------
 
+    async def _track_mic_level(self, frame: np.ndarray) -> None:
+        """Numbers only -- never audio content."""
+        try:
+            rms = float(np.sqrt(np.mean(np.square(frame, dtype=np.float64))))
+        except Exception:  # noqa: BLE001
+            return
+        self._level_peak = max(self._level_peak, rms)
+        self._health_peak = max(self._health_peak, rms)
+        self._health_frames += 1
+        now = time.monotonic()
+        if self.window is not None and now >= self._level_next_ui:
+            self._level_next_ui = now + 0.1
+            await self.bus.publish(TOPIC_UI_LEVEL, self._level_peak)
+            self._level_peak = 0.0
+        if now >= self._health_next_log:
+            if self._health_next_log:
+                _log.info(
+                    "Mic health (30 s): %d frames, loudest %.4f, %d frames the speech detector called speech",
+                    self._health_frames, self._health_peak, self._health_speech,
+                )
+            self._health_next_log = now + 30.0
+            self._health_frames = self._health_speech = 0
+            self._health_peak = 0.0
+
     def _feed_prefix_listener(self, frame: np.ndarray) -> None:
         """Called for every mic frame in prefix mode (from the capture loop).
         Frames are not even segmented while the mic is muted from the
@@ -623,11 +691,20 @@ class NovaApp:
         own voice), or while a turn is running."""
         if not self._listening or not self.vad.available:
             return
-        if not self.duplex_gate.mic_open() or self._turn_lock.locked():
+        confirming = self._confirm_future is not None and not self._confirm_future.done()
+        if not self.duplex_gate.mic_open() or (self._turn_lock.locked() and not confirming):
             if self.segmenter.in_speech:
                 self.segmenter.reset()
             return
         utterance = self.segmenter.process(frame)
+        if utterance is not None and confirming:
+            # the answer to "Should I ...?" -- the asking turn holds the lock
+            task = asyncio.create_task(self._on_confirm_utterance(utterance))
+            self._utterance_tasks.add(task)
+            task.add_done_callback(self._utterance_tasks.discard)
+            return
+        if self.segmenter.in_speech:
+            self._health_speech += 1
         if utterance is not None:
             task = asyncio.create_task(self._on_utterance(utterance))
             self._utterance_tasks.add(task)
@@ -657,7 +734,7 @@ class NovaApp:
             return
 
         text = (text or "").strip()
-        command = strip_address(text, self.config.wake.names)
+        command = strip_address(text, self._wake_names)
 
         if time.monotonic() < self._follow_up_until:
             # Follow-up after a bare "Nova": the next real sentence is the
@@ -674,12 +751,64 @@ class NovaApp:
             return
 
         if command is None:
-            _log.debug("Prefix listener: speech not addressed to NOVA -- ignored")
+            if self.config.wake.calibrate:
+                first = next(iter(text.split()), "")
+                first = "".join(ch for ch in first.lower() if ch.isalpha() or ch == "'")
+                _log.info("Prefix listener (calibrate): ignored speech whose first word was %r", first)
+            else:
+                _log.debug("Prefix listener: speech not addressed to NOVA -- ignored")
             return
         if command == "":
             await self._acknowledge_bare_name()
             return
         await self.run_text(command, source="voice", armed_by=ArmedBy.VOICE)
+
+    async def _on_confirm_utterance(self, pcm: np.ndarray) -> None:
+        fut = self._confirm_future
+        if fut is None or fut.done():
+            return
+        async with self._confirm_stt_lock:
+            if fut.done():
+                return
+            try:
+                text = await asyncio.to_thread(self.transcriber.transcribe, pcm)
+            except Exception as exc:  # noqa: BLE001
+                _log.error("Voice confirm: transcription failed (%s)", exc)
+                return
+            text = (text or "").strip()
+            if text and not fut.done():
+                # Not shown in the window: anyone in the room can speak during
+                # this window, and un-addressed speech is never displayed.
+                fut.set_result(text)
+
+    async def _ask_by_voice(self, prompt: str) -> "str | None | object":
+        """VoiceConfirmChannel's ask(): say `prompt`, then return the next
+        sentence heard (or typed into the window). Runs inside the turn that
+        needs approval, so it already holds the turn lock."""
+        if not self._prefix_mode or not self._listening or not self.vad.available or self._stopping:
+            return VOICE_UNAVAILABLE
+        await self._speak(prompt)
+        await self._ui_state("listening")
+        self.segmenter.reset()
+        loop = asyncio.get_running_loop()
+        self._confirm_future = loop.create_future()
+        timeout_s = self._confirm_timeout_s
+        try:
+            return await asyncio.wait_for(asyncio.shield(self._confirm_future), timeout=timeout_s)
+        except asyncio.TimeoutError:
+            # still mid-sentence when time ran out: give the sentence a moment to finish
+            if self.segmenter.in_speech:
+                try:
+                    return await asyncio.wait_for(asyncio.shield(self._confirm_future), timeout=6.0)
+                except asyncio.TimeoutError:
+                    pass
+            return None
+        finally:
+            fut, self._confirm_future = self._confirm_future, None
+            if fut is not None and not fut.done():
+                fut.cancel()
+            self.segmenter.reset()
+            await self._ui_state("thinking")
 
     async def _acknowledge_bare_name(self) -> None:
         """Bare "Nova": say "Yes?" and open the follow-up window. Spoken
@@ -709,11 +838,26 @@ class NovaApp:
             except Exception as exc:  # noqa: BLE001 -- lazy load on first use still works
                 _log.warning("Pre-loading %s failed (%s); it will load on first use instead.", name, exc)
         _log.info("Models pre-loaded -- NOVA is ready")
+        warm = getattr(getattr(self, "agent", None), "warm_up", None)
+        if warm is not None and not self._stopping:
+            await warm()
         await self._ui_state("idle")
+        if self.config.ui.greet and not self._turn_lock.locked() and not self._stopping:
+            async with self._turn_lock:
+                await self.bus.publish(TOPIC_TURN_START, None)
+                try:
+                    await self._speak("NOVA's ready.")
+                finally:
+                    await self.bus.publish(TOPIC_TURN_END, None)
+            await self._ui_state("idle")
 
     async def _on_typed_text(self, text: str) -> None:
         """Window text box -> a turn. Typing is the same as asking."""
         text = (text or "").strip()
+        fut = self._confirm_future
+        if text and fut is not None and not fut.done():
+            fut.set_result(text)  # typed answer to "Should I ...?"
+            return
         if text:
             await self.run_text(text, source="typed", armed_by=ArmedBy.TYPED)
 
@@ -860,6 +1004,23 @@ class NovaApp:
     async def _handle_text(
         self, text: str, *, source: str, armed_by: ArmedBy, turn_id: str,
     ) -> Reply | None:
+        """_handle_text_inner() plus NOVA's journal (nova/memory, 2026-10-19):
+        every answered sentence that was addressed to NOVA is appended to
+        memory/journal/<day>.md. Wake-armed turns are never journaled."""
+        self._turn_actions: list[str] = []
+        reply = await self._handle_text_inner(text, source=source, armed_by=armed_by, turn_id=turn_id)
+        if reply is not None and armed_by is not ArmedBy.WAKE and self.config.brain.journal and text.strip():
+            try:
+                from nova.memory.store import default_store
+
+                await asyncio.to_thread(default_store().log_turn, text.strip(), reply.text, self._turn_actions)
+            except Exception as exc:  # noqa: BLE001 -- memory is best-effort
+                _log.warning("Journal write failed (%s)", exc)
+        return reply
+
+    async def _handle_text_inner(
+        self, text: str, *, source: str, armed_by: ArmedBy, turn_id: str,
+    ) -> Reply | None:
         """Everything after speech has become text: route, act, reply.
         Caller holds `_turn_lock` and brackets TOPIC_TURN_START/END."""
 
@@ -891,6 +1052,25 @@ class NovaApp:
             _log.info("Turn (%s): heard %d chars (wake-armed; content withheld from the log)", source, len(text))
         else:
             _log.info("Turn (%s): heard %r", source, text)
+
+        # --- agent brain (Claude + skills as tools) ---------------
+        agent = getattr(self, "agent", None)
+        if agent is not None and armed_by is not ArmedBy.WAKE and agent.available():
+            instant = self._instant_match(text)
+            if instant is not None:
+                # two-speed brain: an unambiguous simple command runs now
+                reply = await self._run_instant(instant, text, source=source, armed_by=armed_by, turn_id=turn_id)
+                if reply is _INSTANT_CRASHED:
+                    return None
+                if reply is not None:
+                    note = getattr(agent, "note", None)
+                    if note is not None:
+                        note(text, reply.text)
+                    return reply
+            result = await self._run_agent(text, source=source, armed_by=armed_by, turn_id=turn_id)
+            if result is not None:
+                return result
+            _log.info("Turn (%s): brain unreachable -- using the built-in commands instead", source)
 
         # --- router ------------------------------------------------
         try:
@@ -935,7 +1115,7 @@ class NovaApp:
 
         # --- skill, through the ladder's one entry point ----------
         assert match.spec is not None
-        ctx = SkillCtx(config=self.config, ladder=self.ladder, armed_by=armed_by)
+        ctx = SkillCtx(config=self.config, ladder=self.ladder, egress=getattr(self, "egress", None), armed_by=armed_by)
         try:
             reply = await match.spec.invoke(ctx, **match.params)
         except Exception as exc:
@@ -946,6 +1126,125 @@ class NovaApp:
         await self._mark(turn_id, "skill_returned")
 
         # --- TTS + playback ----------------------------------------
+        await self._speak_and_mark(reply.text, turn_id)
+        return reply
+
+    def _make_brain(self):
+        from nova.brain.agent import Agent, default_context
+
+        mode = self.config.brain.mode
+        if mode == "api":
+            return Agent(self.config, self.egress, context_provider=lambda: default_context(self.config))
+        if mode == "max":
+            from nova import DATA_DIR
+            from nova.brain.claude_arm import ClaudeCliNotFound, ClaudeSession, find_cli
+            from nova.brain.max_brain import MaxBrain
+
+            brain_dir = DATA_DIR / "brain"  # empty working dir: nothing for the CLI to read
+
+            def _session(system_prompt: str) -> ClaudeSession:
+                brain_dir.mkdir(parents=True, exist_ok=True)
+                return ClaudeSession(
+                    egress=self.egress, audit=self.audit, model=self.config.brain.model,
+                    system_prompt=system_prompt, web_search=self.config.brain.web_search, cwd=str(brain_dir),
+                )
+
+            def _cli_ok() -> bool:
+                try:
+                    find_cli()
+                    return True
+                except ClaudeCliNotFound:
+                    return False
+
+            return MaxBrain(self.config, session_factory=_session, cli_available=_cli_ok,
+                            context_provider=lambda: default_context(self.config))
+        return None
+
+    _JOINERS = frozenset({"and", "then", "also", "but", "after", "before", "while", "unless", "if"})
+
+    def _instant_match(self, text: str):
+        """The router's exact-pattern match when this sentence is a short,
+        single, unambiguous command for an instant-safe skill; else None."""
+        allowed = set(self.config.brain.instant_skills)
+        words = text.lower().replace(",", " ").split()
+        if not allowed or not words or len(words) > 8 or self._JOINERS & set(words):
+            return None
+        try:
+            match = self.router.route(text)
+        except Exception:  # noqa: BLE001
+            return None
+        if match.spec is None or match.clarification is not None or match.confidence < 1.0:
+            return None
+        if match.spec.name not in allowed:
+            return None
+        return match
+
+    async def _run_instant(self, match, text: str, *, source: str, armed_by: ArmedBy, turn_id: str) -> Reply | None:
+        await self._mark(turn_id, "route_decided")
+        ctx = SkillCtx(config=self.config, ladder=self.ladder, egress=getattr(self, "egress", None), armed_by=armed_by)
+        try:
+            reply = await match.spec.invoke(ctx, **match.params)
+        except Exception as exc:  # noqa: BLE001 -- never retried: it may have half-run
+            _log.error("Turn (%s): instant %s raised (%s)", source, match.spec.name, exc)
+            await self._mark(turn_id, "abort:skill")
+            await self._speak_and_mark(f"Sorry, something went wrong with {match.spec.name}.", turn_id)
+            return _INSTANT_CRASHED  # handled (apologized), same contract as the router path
+        await self._mark(turn_id, "skill_returned")
+        _log.info("Turn (%s): instant %s -> %s", source, match.spec.name, "ok" if reply.success else "failed")
+        if reply.success:
+            getattr(self, "_turn_actions", []).append(match.spec.name)
+        await self._speak_and_mark(reply.text, turn_id)
+        return reply
+
+    async def _run_agent(self, text: str, *, source: str, armed_by: ArmedBy, turn_id: str) -> Reply | None:
+        """One sentence through the agent brain. Every tool call it makes
+        goes through SkillSpec.invoke() -- the ladder, audit and spoken
+        approval are exactly the router path's. Tool calls made after web
+        content entered the conversation carry the Claude-origin floor."""
+        from nova.skills.registry import get_skill
+
+        tools_ran: list[str] = []
+
+        async def invoke_tool(name: str, params: dict[str, Any], tainted: bool) -> tuple[str, bool]:
+            spec = get_skill(name)
+            if spec is None:
+                return f"no such tool: {name}", False
+            ctx = SkillCtx(
+                config=self.config, ladder=self.ladder, egress=getattr(self, "egress", None),
+                armed_by=armed_by, origin=Origin.CLAUDE if tainted else Origin.ROUTER,
+            )
+            await self.bus.publish(TOPIC_UI_STATE, "thinking")
+            tools_ran.append(name)
+            self._confirm_strict = tainted
+            try:
+                reply = await spec.invoke(ctx, **params)
+            except TypeError as exc:  # wrong/missing params: tell the model, let it retry
+                return f"bad parameters for {name}: {exc}", False
+            except Exception as exc:  # noqa: BLE001
+                _log.error("Turn (%s): tool %r raised (%s)", source, name, exc)
+                return f"{name} failed", False
+            finally:
+                self._confirm_strict = False
+            _log.info("Turn (%s): brain used %s -> %s", source, name, "ok" if reply.success else "failed")
+            if reply.success:
+                getattr(self, "_turn_actions", []).append(name)
+            return reply.text, reply.success
+
+        await self._mark(turn_id, "route_decided")
+        try:
+            result = await self.agent.respond(text, invoke_tool)
+        except Exception as exc:  # noqa: BLE001 -- never let the brain take the turn down
+            _log.error("Turn (%s): brain crashed (%s)", source, exc)
+            result = None
+        if result is None:
+            if tools_ran:
+                # something already happened -- never let the router do it twice
+                reply = Reply(text="Something went wrong partway through that.", success=False)
+                await self._speak_and_mark(reply.text, turn_id)
+                return reply
+            return None
+        await self._mark(turn_id, "skill_returned")
+        reply = Reply(text=result.text, success=True)
         await self._speak_and_mark(reply.text, turn_id)
         return reply
 
@@ -1069,7 +1368,7 @@ class NovaApp:
             await self._speak("Sorry, I can't do that.")
             return None
 
-        ctx = SkillCtx(config=self.config, ladder=self.ladder, armed_by=armed_by, origin=Origin.CLAUDE)
+        ctx = SkillCtx(config=self.config, ladder=self.ladder, egress=getattr(self, "egress", None), armed_by=armed_by, origin=Origin.CLAUDE)
         try:
             reply = await spec.invoke(ctx, **result.params)
         except Exception as exc:
@@ -1138,12 +1437,35 @@ class NovaApp:
                 if self._last_first_audio_t is None:
                     self._last_first_audio_t = time.monotonic()
 
+            seconds = (len(pcm) / samplerate) if samplerate else 0.0
+            _log.info("Speaking %d chars (%.1f s of audio at %d Hz)", len(text), seconds, samplerate or 0)
             try:
                 await self.player.play(pcm, samplerate, on_first_frame=_on_first_frame)
             except Exception as exc:
                 _log.error("Player.play() failed (%s); the reply was %r", exc, text)
+            else:
+                if self._last_first_audio_t is None and seconds > 0.2:
+                    _log.warning("Speech finished but no audio frame reached the speakers")
         finally:
             await self.bus.publish(TOPIC_SPEAK_END, None)
+
+
+#: Words NOVA's commands use that Whisper otherwise mishears ("open notepad"
+#: once came out as "obernotek"). Biases recognition toward them without
+#: forcing anything; the wake name always comes first.
+_COMMAND_VOCAB = (
+    "Notepad, Spotify, Chrome, YouTube, Gmail, Discord, VS Code, File Explorer, "
+    "volume, mute, brightness, Wi-Fi, Bluetooth, screenshot, weather"
+)
+
+
+def _hotwords(names) -> str:
+    wake = ", ".join(n.strip().capitalize() for n in names if n and n.strip()) or "Nova"
+    return f"{wake}, {_COMMAND_VOCAB}"
+
+
+#: _run_instant()'s "the skill crashed and NOVA already apologized" result
+_INSTANT_CRASHED = object()
 
 
 async def _run() -> None:

@@ -80,6 +80,9 @@ def _run_nvidia_smi(query: str) -> str | None:
             capture_output=True,
             text=True,
             timeout=10,
+            # NOVA runs windowless (pythonw); without this Windows flashes a
+            # console for nvidia-smi on every start.
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
         )
     except (FileNotFoundError, subprocess.SubprocessError):
         return None
@@ -223,9 +226,28 @@ def probe_gpu(force: bool = False) -> GpuProfile:
             )
             return cached
 
-    if gpu_name is None or ctranslate2.get_cuda_device_count() == 0:
+    cuda_devices = ctranslate2.get_cuda_device_count()
+    cached_any = _load_cache()
+    if gpu_name is None and cuda_devices > 0 and cached_any is not None and cached_any.device == "cuda":
+        # 2026-10-14: nvidia-smi failed on one start while CUDA itself was
+        # fine; the old code then re-probed, fell back to CPU and OVERWROTE
+        # the verified GPU profile, so speech-to-text silently ran on the
+        # CPU. A missing nvidia-smi answer is not evidence the GPU is gone
+        # when CUDA still reports a device.
+        logger.warning(
+            "nvidia-smi gave no answer but CUDA reports %d device(s); keeping the verified GPU profile",
+            cuda_devices,
+        )
+        return cached_any
+
+    if gpu_name is None or cuda_devices == 0:
         profile = _probe_cpu(ct2_version, dll_dirs)
-        _save_cache(profile)
+        if cached_any is not None and cached_any.device == "cuda" and cached_any.verified:
+            # GPU unavailable right now (e.g. the laptop switched it off):
+            # use CPU for this run, but never forget the GPU that works.
+            logger.warning("GPU not available this start; using CPU for this run only")
+        else:
+            _save_cache(profile)
         return profile
 
     candidates = list(_GPU_CANDIDATES)

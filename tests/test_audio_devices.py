@@ -9,7 +9,7 @@ and streams digital zeros. Rules under test:
   - a quiet-but-non-zero buffer from a real mic in a silent room must be
     ACCEPTED (verified=True) — the RMS floor must not be so aggressive that
     genuine quiet speech gets treated as silence;
-  - host-API ranking is WDM-KS -> MME -> DirectSound -> WASAPI;
+  - host-API ranking is MME -> DirectSound -> WASAPI -> WDM-KS (ADR 0014);
   - verified is only ever True after real (measured, non-zero) audio arrived;
   - the cache invalidates when the device list changes.
 
@@ -253,37 +253,37 @@ def test_all_candidates_zero_never_falsely_reports_verified(probe):
 
 
 # ---------------------------------------------------------------------------
-# Host-API ranking: WDM-KS -> MME -> DirectSound -> WASAPI
+# Host-API ranking: MME -> DirectSound -> WASAPI -> WDM-KS (ADR 0014)
 # ---------------------------------------------------------------------------
 
 
 def test_hostapi_ranking_full_ladder(probe):
     devices = [
+        _device("via WDM-KS", _HOSTAPI_IDX["Windows WDM-KS"]),
         _device("via WASAPI", _HOSTAPI_IDX["Windows WASAPI"]),
         _device("via DirectSound", _HOSTAPI_IDX["Windows DirectSound"]),
         _device("via MME", _HOSTAPI_IDX["MME"]),
-        _device("via WDM-KS", _HOSTAPI_IDX["Windows WDM-KS"]),
     ]
     same_rms = {i: _quiet_real(QUIET_REAL_RMS, seed=i) for i in range(4)}
 
     probe.configure(devices, same_rms)
     winner = probe_input_devices(force=True)
-    assert winner.hostapi == "Windows WDM-KS"
-
-    # Remove WDM-KS: MME should win next.
-    probe.configure(devices[:3], {i: same_rms[i] for i in range(3)})
-    winner = probe_input_devices(force=True)
     assert winner.hostapi == "MME"
 
-    # Remove MME too: DirectSound should win.
-    probe.configure(devices[:2], {i: same_rms[i] for i in range(2)})
+    # Remove MME: DirectSound should win next.
+    probe.configure(devices[:3], {i: same_rms[i] for i in range(3)})
     winner = probe_input_devices(force=True)
     assert winner.hostapi == "Windows DirectSound"
 
-    # Only WASAPI left.
-    probe.configure(devices[:1], {0: same_rms[0]})
+    # Remove DirectSound too: WASAPI should win.
+    probe.configure(devices[:2], {i: same_rms[i] for i in range(2)})
     winner = probe_input_devices(force=True)
     assert winner.hostapi == "Windows WASAPI"
+
+    # Only WDM-KS left: still usable as the last resort.
+    probe.configure(devices[:1], {0: same_rms[0]})
+    winner = probe_input_devices(force=True)
+    assert winner.hostapi == "Windows WDM-KS"
 
 
 def test_unrecognized_hostapi_is_ranked_last(probe):
@@ -314,8 +314,8 @@ def test_unrecognized_hostapi_is_ranked_last(probe):
 
 
 def test_pure_reorder_resolves_the_same_device_not_a_different_one_at_the_old_index(probe):
-    device_a = _device("mic A", _HOSTAPI_IDX["Windows WDM-KS"])
-    device_b = _device("mic B", _HOSTAPI_IDX["MME"])
+    device_a = _device("mic A", _HOSTAPI_IDX["MME"])
+    device_b = _device("mic B", _HOSTAPI_IDX["Windows WDM-KS"])
     probe.configure(
         [device_a, device_b],
         {0: _quiet_real(QUIET_REAL_RMS, seed=0), 1: _quiet_real(QUIET_REAL_RMS, seed=1)},
@@ -343,8 +343,8 @@ def test_pure_reorder_resolves_the_same_device_not_a_different_one_at_the_old_in
 def test_reorder_resolution_self_heals_the_on_disk_cached_index(probe):
     import json
 
-    device_a = _device("mic A", _HOSTAPI_IDX["Windows WDM-KS"])
-    device_b = _device("mic B", _HOSTAPI_IDX["MME"])
+    device_a = _device("mic A", _HOSTAPI_IDX["MME"])
+    device_b = _device("mic B", _HOSTAPI_IDX["Windows WDM-KS"])
     probe.configure(
         [device_a, device_b],
         {0: _quiet_real(QUIET_REAL_RMS, seed=0), 1: _quiet_real(QUIET_REAL_RMS, seed=1)},
@@ -429,21 +429,21 @@ def test_cache_invalidates_when_a_new_device_appears(probe):
 
 def test_cache_invalidates_when_the_winning_device_disappears(probe):
     devices = [
-        _device("mic A (WDM-KS)", _HOSTAPI_IDX["Windows WDM-KS"]),
-        _device("mic B (MME)", _HOSTAPI_IDX["MME"]),
+        _device("mic A (MME)", _HOSTAPI_IDX["MME"]),
+        _device("mic B (WDM-KS)", _HOSTAPI_IDX["Windows WDM-KS"]),
     ]
     probe.configure(
         devices,
         {0: _quiet_real(QUIET_REAL_RMS, seed=0), 1: _quiet_real(QUIET_REAL_RMS, seed=1)},
     )
     first = probe_input_devices(force=False)
-    assert first.name == "mic A (WDM-KS)"
+    assert first.name == "mic A (MME)"
 
     # Unplug mic A. Cached winner no longer exists among current devices.
     probe.configure(devices[1:], {0: _quiet_real(QUIET_REAL_RMS, seed=1)})
     second = probe_input_devices(force=False)  # must re-probe, not crash on stale index
 
-    assert second.name == "mic B (MME)"
+    assert second.name == "mic B (WDM-KS)"
 
 
 def test_cache_survives_process_boundary_via_disk(probe):

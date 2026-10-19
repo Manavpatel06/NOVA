@@ -245,3 +245,9 @@ def test_confident_speech_is_kept_even_with_some_no_speech_probability(fake_whis
         _FakeSegment(" Nova, what time is it?", no_speech_prob=0.7, avg_logprob=-0.3),
     ]
     assert t.transcribe(np.zeros(16000, dtype=np.float32)) == "Nova, what time is it?"
+
+
+def test_hotwords_are_passed_so_whisper_expects_novas_name(fake_whisper_model, cuda_profile, no_probe):
+    t = Transcriber(gpu_profile=cuda_profile, hotwords="Nova")
+    t.transcribe(np.zeros(16000, dtype=np.float32))
+    assert _FakeWhisperModel.instances[-1].transcribe_kwargs[-1]["hotwords"] == "Nova"

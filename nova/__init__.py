@@ -51,6 +51,11 @@ HF_HUB_DIR: Path = HF_CACHE_DIR / "hub"
 LOG_PATH: Path = DATA_DIR / "nova.log"
 AUDIO_PROFILE_PATH: Path = DATA_DIR / "audio_profile.json"
 GPU_PROFILE_PATH: Path = DATA_DIR / "gpu_profile.json"
+#: How the speech model spells "Nova" in Manav's voice, taught by scripts/teach_name.py.
+WAKE_NAMES_PATH: Path = DATA_DIR / "wake_names.json"
+#: NOVA's long-term memory (2026-10-19): facts.json, journal/, from_chat.md.
+#: Plain files, one folder, portable between Windows and Linux.
+MEMORY_DIR: Path = DATA_DIR / "memory"
 AUDIT_LOG_PATH: Path = DATA_DIR / "audit.log"
 
 #: T2.3a's machine-written allowlist additions (nova.skills.add_app) --

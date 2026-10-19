@@ -50,7 +50,7 @@ _OS_BANNED_ATTRS = {
     "spawnl", "spawnle", "spawnlp", "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe",
 }
 _ASYNCIO_BANNED_ATTRS = {"create_subprocess_exec", "create_subprocess_shell"}
-PROCESS_ALLOWLIST = {"stt/gpu.py", "skills/open_app.py", "brain/claude_arm.py", "skills/add_app.py"}
+PROCESS_ALLOWLIST = {"stt/gpu.py", "skills/open_app.py", "brain/claude_arm.py", "skills/add_app.py", "system/winops.py"}
 
 
 def _rel(path: Path) -> str:
@@ -133,7 +133,7 @@ def test_process_spawn_allowlist_is_exactly_four_named_files_today():
     which pin the exact argv shape rather than trusting the module
     docstring's claim. A change to this number must be a conscious edit to
     this test, not a silently-growing set."""
-    assert len(PROCESS_ALLOWLIST) == 4
+    assert len(PROCESS_ALLOWLIST) == 5
     for rel in PROCESS_ALLOWLIST:
         assert (NOVA_ROOT / rel).is_file(), f"process-spawn allowlist entry {rel} does not exist"
 

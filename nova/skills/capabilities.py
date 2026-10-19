@@ -44,7 +44,35 @@ def _speakable_examples() -> list[str]:
     return [spec.examples[0] for spec in others]
 
 
+#: Spoken summary per skill module (2026-10-15). Only modules actually
+#: registered are mentioned, so the reply stays true as skills come and go.
+_AREAS: tuple[tuple[str, str], ...] = (
+    ("open_app", "open any app"),
+    ("windows_apps", "close, minimize or switch between apps"),
+    ("volume", "control the volume"),
+    ("display", "the brightness"),
+    ("radios", "Wi-Fi and Bluetooth"),
+    ("web", "search Google and YouTube or open websites"),
+    ("media", "play, pause and skip music"),
+    ("weather", "check the weather"),
+    ("battery", "your battery"),
+    ("screenshot", "take screenshots"),
+    ("power", "lock, sleep or shut down the computer"),
+)
+
+
+def _area_summary() -> str | None:
+    modules = {spec.handler.__module__.rsplit(".", 1)[-1] for spec in all_skills().values()}
+    parts = [text for mod, text in _AREAS if mod in modules]
+    if len(parts) < 3:
+        return None
+    return "I can " + ", ".join(parts[:-1]) + f", and {parts[-1]}. Just start with \"Nova\"."
+
+
 def _build_reply() -> str:
+    summary = _area_summary()
+    if summary is not None:
+        return summary
     examples = _speakable_examples()
     if not examples:
         # Only reachable with a fixture registry that registers nothing but

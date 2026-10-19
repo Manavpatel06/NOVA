@@ -46,6 +46,7 @@ _log = get_logger(__name__)
 TOPIC_UI_HEARD = "ui.heard"   # payload: str -- a request NOVA is acting on
 TOPIC_UI_SAID = "ui.said"     # payload: str -- what NOVA said back
 TOPIC_UI_STATE = "ui.state"   # payload: str -- idle | listening | thinking | speaking | muted
+TOPIC_UI_LEVEL = "ui.level"   # payload: float -- microphone RMS level (numbers only)
 
 # Palette taken from the icon (assets/nova.png).
 INK = "#0D171C"
@@ -106,6 +107,8 @@ class NovaWindow:
         bus.subscribe(TOPIC_UI_STATE, self._bus_state)
         bus.subscribe(TOPIC_SPEAK_START, self._bus_speak_start)
         bus.subscribe(TOPIC_SPEAK_END, self._bus_speak_end)
+        bus.subscribe(TOPIC_UI_LEVEL, self._bus_level)
+        self.level = 0.0
 
     # -- bus side (asyncio thread) -----------------------------------------
 
@@ -117,6 +120,12 @@ class NovaWindow:
 
     async def _bus_state(self, state: Any) -> None:
         self._inbox.put(("state", str(state)))
+
+    async def _bus_level(self, level: Any) -> None:
+        try:
+            self.level = float(level)  # read by the Tk thread; a float write is atomic
+        except (TypeError, ValueError):
+            pass
 
     async def _bus_speak_start(self, _payload: Any) -> None:
         self._inbox.put(("state", "speaking"))
@@ -386,6 +395,15 @@ class NovaWindow:
                 rad = radius_long if k % 2 == 0 else radius_short
                 pts += [cx + rad * math.sin(ang), cy - rad * math.cos(ang)]
             return pts
+
+        # microphone level meter: proves at a glance that NOVA hears the room
+        lvl = min(1.0, (self.level / 0.08) ** 0.5) if self.level > 0 else 0.0
+        bar_w = 120
+        bx, by = cx - bar_w / 2, h - 14
+        c.create_rectangle(bx, by, bx + bar_w, by + 4, fill=LINE, outline="")
+        if state != "muted":
+            c.create_rectangle(bx, by, bx + bar_w * lvl, by + 4, fill=TEAL, outline="")
+        c.create_text(cx, h - 26, text="mic", fill=TEXT_DIM, font=self._f_small)
 
         s = 38 * star_scale
         fill = MUTED if state == "muted" else STAR

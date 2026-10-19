@@ -648,3 +648,57 @@ def test_window_closed_by_app_shutdown_does_not_request_close_again():
 
     _asyncio.run(main())
     assert closed == []
+
+
+async def test_calibrate_logs_only_the_first_word_of_ignored_speech(tmp_path, monkeypatch, clock, caplog):
+    monkeypatch.setattr(
+        app_mod, "AuditLog",
+        lambda **kw: AuditLog(path=tmp_path / "audit.log", redact_terms=kw.get("redact_terms", ())),
+    )
+
+    async def _no_real_claude(*_a, **_kw):
+        return app_mod.ClaudeFailure(reason="cli_not_found")
+
+    monkeypatch.setattr(app_mod.claude_arm, "ask", _no_real_claude)
+    application = app_mod.NovaApp(config=_prefix_config(calibrate=True))
+    application.transcriber = _FakeTranscriber(text="Noah, what time is it")
+    application.synth = _FakeSynth()
+    application.player = _FakePlayer()
+    try:
+        with caplog.at_level(logging.DEBUG):
+            await application._on_utterance(_pcm())
+        logged = " ".join(r.getMessage() for r in caplog.records)
+        assert "'noah'" in logged
+        assert "what time" not in logged
+    finally:
+        import nova.security.untrusted as untrusted_mod
+
+        untrusted_mod._AUDIT = None
+
+
+def test_app_hints_whisper_with_novas_name():
+    import nova.app as _m
+
+    seen = {}
+
+    class _T:
+        def __init__(self, **kw):
+            seen.update(kw)
+
+    orig = _m.Transcriber
+    _m.Transcriber = _T
+    try:
+        a = _m.NovaApp(config=_prefix_config())
+    finally:
+        _m.Transcriber = orig
+        import nova.security.untrusted as untrusted_mod
+
+        untrusted_mod._AUDIT = None
+    assert seen["hotwords"].startswith("Nova, ")  # the name always first
+    assert "Notepad" in seen["hotwords"]  # plus command vocabulary (2026-10-15)
+
+
+async def test_window_greets_out_loud_once_models_are_loaded(app):
+    app.config = dataclasses.replace(app.config, ui=dataclasses.replace(app.config.ui, greet=True))
+    await app._prewarm()
+    assert app.synth.said == ["NOVA's ready."]

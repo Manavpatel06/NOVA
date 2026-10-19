@@ -180,18 +180,21 @@ def test_claude_arm_child_env_result_is_used_only_as_the_spawn_calls_env_kwarg()
         node for node in ast.walk(tree)
         if isinstance(node, ast.Call) and isinstance(node.func, ast.Name) and node.func.id == "_child_env"
     ]
-    assert len(call_sites) == 1, f"expected exactly one _child_env() call site, found {len(call_sites)}"
+    # 2026-10-15: two sanctioned spawns now -- ask() (one-shot) and
+    # ClaudeSession.start() (the Max-plan brain). The rule is unchanged:
+    # EVERY call site is directly an env= keyword value, never bound first.
+    assert 1 <= len(call_sites) <= 2, f"expected one or two _child_env() call sites, found {len(call_sites)}"
 
-    found_as_env_kwarg = False
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call):
-            for kw in node.keywords:
-                if kw.arg == "env" and kw.value is call_sites[0]:
-                    found_as_env_kwarg = True
-    assert found_as_env_kwarg, (
-        "_child_env()'s call site is not directly the env= keyword argument of a spawn call — "
-        "it may be getting assigned to a variable first, which the ruling doesn't permit"
-    )
+    env_values = {
+        id(kw.value)
+        for node in ast.walk(tree) if isinstance(node, ast.Call)
+        for kw in node.keywords if kw.arg == "env"
+    }
+    for site in call_sites:
+        assert id(site) in env_values, (
+            f"_child_env() at line {site.lineno} is not directly the env= keyword argument of a spawn call — "
+            "it may be getting assigned to a variable first, which the ruling doesn't permit"
+        )
 
 
 @pytest.mark.parametrize("path", _all_nova_source_files(), ids=lambda p: str(p.relative_to(NOVA_PKG)))

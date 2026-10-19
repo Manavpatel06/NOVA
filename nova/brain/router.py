@@ -213,6 +213,10 @@ class Router:
         if not isinstance(text, str):
             raise TypeError(f"Router.route() requires str, got {type(text).__name__}")
 
+        exact = self._match_patterns(text)
+        if exact is not None:
+            return exact
+
         scored: list[tuple[float, SkillSpec, str]] = []
         for spec in self._skills.values():
             best_score = 0.0
@@ -243,6 +247,54 @@ class Router:
             return Match(spec=None, params={}, confidence=top_score, clarification=self._ask_missing_param(top_spec))
 
         return Match(spec=top_spec, params=params, confidence=top_score, clarification=None)
+
+    # -- exact command shapes (skill `patterns`) --------------------------
+
+    @staticmethod
+    def normalize(text: str) -> str:
+        """Lower-case, punctuation-free, polite padding removed -- what a
+        skill's `patterns` are matched against."""
+        t = text.strip().lower()
+        t = re.sub(r"[\u2019`]", "'", t)
+        t = re.sub(r"[^a-z0-9' %:/-]+", " ", t)  # drop , . ! ? etc.
+        t = re.sub(r"\s+", " ", t).strip()
+        for _ in range(3):
+            t = re.sub(r"^(?:please|can you|could you|would you|will you|hey|ok|okay) ", "", t)
+            t = re.sub(r" (?:please|for me|now|thanks|thank you)$", "", t)
+        return t.strip()
+
+    def _match_patterns(self, text: str) -> Match | None:
+        """Every skill's `patterns` against the whole sentence. One hit is
+        certain (confidence 1.0); hits from two different skills are a
+        clarification, never a guess."""
+        norm = self.normalize(text)
+        if not norm:
+            return None
+        hits: list[tuple[SkillSpec, dict[str, object]]] = []
+        for attr in ("patterns", "catch_all_patterns"):
+            for spec in self._skills.values():
+                for rx in getattr(spec, attr, ()) or ():
+                    m = rx.fullmatch(norm)
+                    if m is None:
+                        continue
+                    params = {k: v.strip() for k, v in m.groupdict().items() if v is not None and v.strip()}
+                    hits.append((spec, params))
+                    break
+            if hits:
+                break
+        if not hits:
+            return None
+        if len({h[0].name for h in hits}) > 1:
+            return Match(spec=None, params={}, confidence=1.0,
+                         clarification=self._ask_ambiguous(hits[0][0], hits[1][0]))
+        spec, params = hits[0]
+        required = [
+            n for n, p in inspect.signature(spec.handler).parameters.items()
+            if n != "ctx" and p.default is inspect.Parameter.empty
+        ]
+        if any(n not in params for n in required):
+            return Match(spec=None, params={}, confidence=1.0, clarification=self._ask_missing_param(spec))
+        return Match(spec=spec, params=params, confidence=1.0, clarification=None)
 
     # -- clarifying questions -------------------------------------------
 

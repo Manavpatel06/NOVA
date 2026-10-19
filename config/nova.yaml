@@ -24,7 +24,11 @@ tts:
   speed: 1.0
 
 security:
-  egress_allowlist: []   # domains nova.security.Egress may reach; empty until a skill needs one
+  # Domains nova.security.Egress may reach (exact host match, no wildcards).
+  egress_allowlist:
+    - api.open-meteo.com            # nova.skills.weather -- forecast (free, no key)
+    - geocoding-api.open-meteo.com  # nova.skills.weather -- "weather in Mumbai" place lookup
+    - api.anthropic.com             # nova.brain.agent -- Claude, NOVA's brain
 
   # Closed allowlist for nova.skills.open_app (docs/THREAT_MODEL.md #1.1).
   # Symbolic name -> absolute executable path. open_app never accepts a raw
@@ -78,6 +82,10 @@ wake:
   follow_up_ms: 8000        # after a bare "Nova", how long to wait for the command
   max_utterance_ms: 15000
   min_speech_ms: 300
+  # TEMPORARY (2026-10-14): log only the FIRST WORD of speech NOVA ignores,
+  # to find how the speech model spells "Nova" in Manav's voice. Set false
+  # once calibrated -- then nothing about ignored speech is kept.
+  calibrate: true
   model_path: hey_jarvis_v0.1.onnx   # resolved against models/wake/; swap for hey_nova.onnx later, zero code changes
   # The one knob Manav will actually tune -- this is the access-control gate
   # for hands-free arming, not a comfort setting.
@@ -110,6 +118,18 @@ brain:
   # measured score gap these two numbers sit inside.
   confidence_floor: 0.42
   ambiguity_margin: 0.08
+  # The brain (2026-10-15): Claude understands every "Nova, ..." and uses
+  # NOVA's skills as tools. max = through the signed-in `claude` program on
+  # Manav's Max plan (no API key); api = Anthropic API key
+  # (scripts\set_api_key.py); router = fixed commands only.
+  mode: max              # max | api | router
+  model: claude-haiku-5-5
+  max_tokens: 600
+  max_steps: 6
+  history_turns: 8
+  history_idle_s: 600
+  web_search: true
+  request_timeout_s: 20
 
 governor:
   # Measured, not modelled -- see docs/GOVERNOR_MEASUREMENTS.md for the
@@ -124,3 +144,12 @@ ui:
   # true: NOVA is a windowed app -- open it to use it, close the window to
   # quit (mic off). false: the older background tray-icon mode.
   window: true
+  greet: true    # NOVA says "NOVA's ready." when it finishes starting up
+
+weather:
+  # Where a bare "what's the weather" is about (nova.skills.weather, Open-Meteo).
+  location_name: Tempe
+  latitude: 33.4255
+  longitude: -111.9400
+  timezone: America/Phoenix
+  temperature_unit: fahrenheit   # or celsius

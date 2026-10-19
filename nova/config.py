@@ -376,6 +376,10 @@ class WakeConfig:
     max_utterance_ms: int = field(default=15000, metadata={"bounds": Bounds(lo=1000, hi=60000)})
     #: Speech shorter than this is treated as noise (coughs, clicks) and dropped.
     min_speech_ms: int = field(default=300, metadata={"bounds": Bounds(lo=0, hi=5000)})
+    #: Calibration aid. When true, for speech NOT addressed to NOVA the log
+    #: records only its FIRST WORD (e.g. 'noah'), so a mis-heard name can be
+    #: diagnosed. Off by default: normally nothing about such speech is kept.
+    calibrate: bool = False
 
 
 @dataclass(frozen=True)
@@ -386,6 +390,9 @@ class UiConfig:
     #: window and starts listening; closing the window quits NOVA and turns
     #: the microphone off. False: the older background tray-icon mode.
     window: bool = False  # config/nova.yaml sets true -- the shipped behaviour
+    #: Speak a short "ready" line once the window has finished loading, so
+    #: it is obvious at a glance (and by ear) that voice output works.
+    greet: bool = False
 
 
 @dataclass(frozen=True)
@@ -419,6 +426,44 @@ class BrainConfig:
     #: floor.
     ambiguity_margin: float = 0.08
 
+    # --- the agent brain (nova.brain.agent, 2026-10-15) -------------------
+    #: "max": every addressed sentence goes to Claude through the signed-in
+    #: `claude` program on Manav's Max plan (nova.brain.max_brain) -- no API
+    #: key. "api": same, through the Anthropic API with a key
+    #: (nova.brain.agent). "router": the old deterministic router first,
+    #: Claude only when it misses. In every mode the router is the fallback.
+    mode: str = "max"
+    #: Claude model (a full id, or "haiku"/"sonnet" for the max mode).
+    #: Haiku is the fastest current model.
+    model: str = "claude-haiku-5-5"
+    max_tokens: int = field(default=600, metadata={"bounds": Bounds(lo=64, hi=4096)})
+    #: tool-use rounds per sentence ("open YouTube in Brave and play lofi" = 2-3)
+    max_steps: int = field(default=6, metadata={"bounds": Bounds(lo=1, hi=12)})
+    #: conversation memory: last N exchanges, forgotten after this much silence
+    history_turns: int = field(default=8, metadata={"bounds": Bounds(lo=0, hi=40)})
+    history_idle_s: float = field(default=600.0, metadata={"bounds": Bounds(lo=0.0, hi=86400.0)})
+    #: let Claude search the web for questions it can't answer from memory
+    #: ($10 per 1,000 searches on top of tokens; results are untrusted input)
+    web_search: bool = True
+    request_timeout_s: float = field(default=20.0, metadata={"bounds": Bounds(lo=2.0, hi=120.0)})
+    #: NOVA's journal (nova/memory): append each answered, addressed sentence
+    #: to data/memory/journal/<day>.md. Never wake-armed turns.
+    journal: bool = True
+    #: Two-speed brain (Manav, 2026-10-16): a short sentence that exactly
+    #: matches one of these skills' command patterns runs instantly, without
+    #: a round trip to Claude. Only skills whose commands can't be misheard
+    #: into something else belong here -- nothing that takes a free-text
+    #: name (apps, sites, searches): those go to Claude, which also catches
+    #: mishearings. Empty list = everything goes to Claude.
+    instant_skills: list[str] = field(default_factory=lambda: [
+        "time", "date", "battery",
+        "mute", "unmute", "volume_up", "volume_down", "set_volume", "get_volume",
+        "brightness_up", "brightness_down", "set_brightness", "get_brightness",
+        "media_play_pause", "media_next", "media_previous", "media_stop",
+        "screenshot", "lock_computer", "show_desktop", "minimize_window", "maximize_window",
+        "cancel_shutdown", "set_radio",
+    ])
+
 
 @dataclass(frozen=True)
 class GovernorConfig:
@@ -443,6 +488,22 @@ class GovernorConfig:
 
 
 @dataclass(frozen=True)
+class WeatherConfig:
+    """Consumed by nova.skills.weather (2026-10-15). The default place a
+    bare "what's the weather" is about -- Manav's home, not a guess from
+    his IP. Fetched from Open-Meteo through nova.security.egress (host
+    api.open-meteo.com must be on security.egress_allowlist)."""
+
+    location_name: str = "Tempe"  # spoken in replies: "... in Tempe"
+    latitude: float = field(default=33.4255, metadata={"bounds": Bounds(lo=-90.0, hi=90.0)})
+    longitude: float = field(default=-111.9400, metadata={"bounds": Bounds(lo=-180.0, hi=180.0)})
+    timezone: str = "America/Phoenix"  # IANA name; decides what "today"/"tomorrow" mean
+    #: "fahrenheit" or "celsius" (checked by the weather skill, which says so
+    #: out loud rather than silently picking one).
+    temperature_unit: str = "fahrenheit"
+
+
+@dataclass(frozen=True)
 class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     stt: SttConfig = field(default_factory=SttConfig)
@@ -454,6 +515,7 @@ class Config:
     brain: BrainConfig = field(default_factory=BrainConfig)
     governor: GovernorConfig = field(default_factory=GovernorConfig)
     ui: UiConfig = field(default_factory=UiConfig)
+    weather: WeatherConfig = field(default_factory=WeatherConfig)
 
 
 _SECTIONS: dict[str, type] = {
@@ -467,6 +529,7 @@ _SECTIONS: dict[str, type] = {
     "brain": BrainConfig,
     "governor": GovernorConfig,
     "ui": UiConfig,
+    "weather": WeatherConfig,
 }
 
 

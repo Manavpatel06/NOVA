@@ -66,3 +66,39 @@ def strip_address(text: str, names: list[str] | tuple[str, ...] = ("nova",)) -> 
     # drop the punctuation/spacing that follows the name: "Nova, ..." / "Nova. ..."
     rest = rest.lstrip(" \t,.;:!?-—–")
     return rest.strip()
+
+
+# Words that may never become an accepted name even if the speech model
+# hears "Nova" as them: they start ordinary sentences far too often.
+UNSAFE_NAMES = frozenset({
+    "a", "an", "and", "are", "but", "can", "could", "do", "for", "go", "hey", "hi", "hmm", "how",
+    "i", "if", "is", "it", "know", "let", "no", "not", "now", "oh", "ok", "okay", "on", "or",
+    "please", "so", "that", "the", "then", "this", "uh", "um", "we", "well", "what", "when",
+    "where", "why", "yeah", "yes", "you",
+    "all", "at", "be", "did", "does", "has", "have", "he", "in", "just", "look", "maybe", "me",
+    "my", "of", "one", "right", "she", "sure", "thank", "thanks", "there", "they", "to", "was",
+    "with", "wait", "hello", "yo", "hm", "mm", "huh", "ah", "er",
+})
+
+
+def first_name_word(text: str) -> str | None:
+    """The word in the name position: the first word, or the second if the
+    first is a greeting ("Hey Nova ..."). Lower-case letters only."""
+    words = [w.group().lower() for w in _WORD.finditer(text or "")]
+    if not words:
+        return None
+    if words[0] in _GREETINGS and len(words) > 1:
+        return words[1]
+    return words[0]
+
+
+def load_learned_names(path) -> list[str]:
+    """Names taught by scripts/teach_name.py; [] if none or unreadable."""
+    import json
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        names = [str(n).strip().lower() for n in data.get("names", [])]
+    except Exception:  # noqa: BLE001 -- a broken file must never stop NOVA
+        return []
+    return [n for n in names if n and n.isalpha() and n not in UNSAFE_NAMES]

@@ -31,17 +31,23 @@ _log = get_logger(__name__)
 
 PROFILE_PATH = AUDIO_PROFILE_PATH
 
-# Lower number = tried first. WDM-KS talks to the driver directly, bypassing
-# the Windows audio engine (APOs, AGC, noise suppression) that on this
-# hardware silently squashes real mic signal down to near-nothing on the
-# WASAPI/MME/DirectSound endpoints for the same physical device. MME and
-# DirectSound are old but honest. WASAPI goes last: on this hardware it is
-# where "opens fine, delivers near-nothing" lives most often.
+# Lower number = tried first.
+#
+# Reordered 2026-10-14 (ADR 0014, supersedes ADR 0004's order). ADR 0004 put
+# WDM-KS first because in August the Windows audio engine squashed this
+# laptop's mic to ~1e-4 RMS on every other host API. Re-measured today with a
+# real voice (scripts/mic_check.py, "Nova, what time is it?", 5 s per
+# endpoint): MME mic array -- speech peak 0.061, voice-to-room 66 dB, 75% of
+# frames speech; WDM-KS mic array -- 0.034, 24 dB, 54% (a ~0.002 noise floor
+# the engine endpoints don't have). The engine path is now the cleaner one,
+# and it is also the only one Windows can see: WDM-KS bypasses the audio
+# engine, so the taskbar microphone indicator never lit while NOVA listened.
+# WDM-KS stays as the last resort for when the engine path is broken again.
 HOSTAPI_PRIORITY: dict[str, int] = {
-    "Windows WDM-KS": 0,
-    "MME": 1,
-    "Windows DirectSound": 2,
-    "Windows WASAPI": 3,
+    "MME": 0,
+    "Windows DirectSound": 1,
+    "Windows WASAPI": 2,
+    "Windows WDM-KS": 3,
 }
 
 #: Substrings identifying an input device that is not a microphone at all —

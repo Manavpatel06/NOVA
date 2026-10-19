@@ -381,7 +381,8 @@ def test_stacked_trigger_words_are_both_stripped_not_just_the_first():
     match = router.route("launch open notepad")
     assert match.spec is not None and match.spec.name == "open_app"
     assert match.params == {"app": "notepad"}
-    assert match.confidence == pytest.approx(0.720, abs=0.001)
+    # 2026-10-15: open_app's catch-all pattern now matches this exactly
+    assert match.confidence == 1.0
     assert match.clarification is None
 
 
@@ -391,18 +392,17 @@ def test_stacked_trigger_words_are_both_stripped_not_just_the_first():
 # a fixture artifact that merely happens to look the same.
 
 
-def test_documented_param_leak_is_real_against_the_live_registry_not_just_the_fixture():
+def test_documented_param_leak_is_fixed_by_open_app_patterns():
+    """The crude-extraction leak ("start" left in the param) the router's
+    docstring documents still exists in fuzzy extraction, but against the
+    live registry open_app's catch-all pattern (2026-10-15) now takes the
+    sentence first, so production no longer leaks."""
     router = _real_router()
     match = router.route("please start notepad for me")
-    assert match.spec is not None and match.spec.name == "open_app"  # skill selection: correct
-    assert match.clarification is None  # confidently proceeds...
-    assert match.params == {"app": "start notepad"}  # ...with "start" leaked into the param
-    assert match.confidence == pytest.approx(0.487, abs=0.001)
-    assert match.params != {"app": "notepad"}, (
-        "if this now passes, the crude-extraction limitation the module's own "
-        "docstring documents has been fixed against production -- update this "
-        "test's framing, don't just relax the assertion"
-    )
+    assert match.spec is not None and match.spec.name == "open_app"
+    assert match.clarification is None
+    assert match.params == {"app": "notepad"}
+    assert match.confidence == 1.0
 
 
 # ---------------------------------------------------------------------------
