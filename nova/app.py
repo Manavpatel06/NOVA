@@ -244,11 +244,20 @@ class NovaApp:
         # today, but Egress is meant to be the one instance this app ever
         # constructs, and a real caller should never hand it a fake
         # allowlist "because this particular call doesn't need it".
+        hub_host = self.config.hub.host.strip().lower()
         self.egress = Egress(
-            self.config.security.egress_allowlist,
+            # the hub (docs/decisions/0019) joins the allowlist only when
+            # nova.yaml names it -- still fixed at start, never at runtime
+            list(self.config.security.egress_allowlist) + ([hub_host] if hub_host else []),
             audit=self.audit,
             redact_terms=self.config.security.redact_terms,
         )
+        # 2026-11-22: the hub's local model, between the instant lane and Claude
+        self.hub = None
+        if hub_host:
+            from nova.brain.hub_tier import HubTier
+
+            self.hub = HubTier(self.config, self.egress)
         # 2026-10-15: the agent brain -- Claude with every skill as a tool.
         # The router below stays as the offline / no-key fallback.
         self.agent = self._make_brain()
@@ -481,6 +490,14 @@ class NovaApp:
                 _log.warning("Closing the Claude session failed (%s)", exc)
         if self._confirm_future is not None and not self._confirm_future.done():
             self._confirm_future.set_result("")  # a pending "Should I ...?" ends now, declined
+        hub = getattr(self, "hub", None)
+        if hub is not None:
+            from nova import MEMORY_DIR
+
+            try:  # today's journal reaches the hub too; never holds up closing
+                await hub.push_memory(MEMORY_DIR, timeout_s=4.0)
+            except Exception:  # noqa: BLE001
+                pass
         self.hotkey.stop()
         if not self._prefix_mode:
             self.wake_word.stop()
@@ -841,6 +858,11 @@ class NovaApp:
         warm = getattr(getattr(self, "agent", None), "warm_up", None)
         if warm is not None and not self._stopping:
             await warm()
+        hub = getattr(self, "hub", None)
+        if hub is not None and not self._stopping:
+            from nova import MEMORY_DIR
+
+            self._hub_backup_task = asyncio.create_task(hub.push_memory(MEMORY_DIR))  # backup; never delays "ready"
         await self._ui_state("idle")
         if self.config.ui.greet and not self._turn_lock.locked() and not self._stopping:
             async with self._turn_lock:
@@ -1067,6 +1089,14 @@ class NovaApp:
                     if note is not None:
                         note(text, reply.text)
                     return reply
+            reply = await self._run_hub_lane(text, source=source, armed_by=armed_by, turn_id=turn_id)
+            if reply is _INSTANT_CRASHED:
+                return None
+            if reply is not None:
+                note = getattr(agent, "note", None)
+                if note is not None:
+                    note(text, reply.text)
+                return reply
             result = await self._run_agent(text, source=source, armed_by=armed_by, turn_id=turn_id)
             if result is not None:
                 return result
@@ -1193,6 +1223,41 @@ class NovaApp:
         _log.info("Turn (%s): instant %s -> %s", source, match.spec.name, "ok" if reply.success else "failed")
         if reply.success:
             getattr(self, "_turn_actions", []).append(match.spec.name)
+        await self._speak_and_mark(reply.text, turn_id)
+        return reply
+
+    async def _run_hub_lane(self, text: str, *, source: str, armed_by: ArmedBy, turn_id: str) -> Reply | None:
+        """The hub's local model takes the sentence if it's sure (small talk
+        or one simple command); None hands it to Claude. Checks live in
+        nova.brain.hub_tier; the skill runs through the same invoke path
+        as every other lane."""
+        hub = getattr(self, "hub", None)
+        if hub is None or not hub.enabled():
+            return None
+        decision = await hub.decide(text)
+        if decision is None:
+            return None
+        if decision.kind == "chat":
+            await self._mark(turn_id, "route_decided")
+            reply = Reply(text=decision.say, success=True)
+            await self._speak_and_mark(reply.text, turn_id)
+            return reply
+        spec = get_skill(decision.tool)
+        if spec is None:
+            return None
+        await self._mark(turn_id, "route_decided")
+        ctx = SkillCtx(config=self.config, ladder=self.ladder, egress=getattr(self, "egress", None), armed_by=armed_by)
+        try:
+            reply = await spec.invoke(ctx, **(decision.params or {}))
+        except Exception as exc:  # noqa: BLE001 -- never retried by Claude: it may have half-run
+            _log.error("Turn (%s): hub-chosen %s raised (%s)", source, spec.name, exc)
+            await self._mark(turn_id, "abort:skill")
+            await self._speak_and_mark(f"Sorry, something went wrong with {spec.name}.", turn_id)
+            return _INSTANT_CRASHED
+        await self._mark(turn_id, "skill_returned")
+        _log.info("Turn (%s): hub lane %s -> %s", source, spec.name, "ok" if reply.success else "failed")
+        if reply.success:
+            getattr(self, "_turn_actions", []).append(spec.name)
         await self._speak_and_mark(reply.text, turn_id)
         return reply
 

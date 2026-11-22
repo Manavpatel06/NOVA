@@ -115,6 +115,7 @@ class Egress:
         *,
         audit: AuditLog,
         redact_terms: Sequence[str] = (),
+        loopback_ports: Sequence[int] = (),
     ) -> None:
         normalized: set[str] = set()
         for raw in allowlist:
@@ -128,6 +129,14 @@ class Egress:
                 )
             normalized.add(host)
         self._allowed_hosts: frozenset[str] = frozenset(normalized)
+        ports: set[int] = set()
+        for port in loopback_ports:
+            if isinstance(port, bool) or not isinstance(port, int) or not 1024 <= port <= 65535:
+                raise ConfigError(f"loopback port {port!r} must be an int in 1024..65535")
+            ports.add(port)
+        #: Services on THIS machine NOVA may talk to (2026-11-22: the hub's
+        #: Ollama). Fixed at construction, like the host allowlist.
+        self._loopback_ports: frozenset[int] = frozenset(ports)
         self._audit = audit
         self._redact_terms = tuple(redact_terms)
 
@@ -182,7 +191,8 @@ class Egress:
             })  # raises on write failure — propagates, same discipline as everywhere else in this module
             raise
 
-    def post_json(self, url: str, body: dict, *, headers: dict[str, str], timeout: float = 20.0) -> dict:
+    def post_json(self, url: str, body: dict, *, headers: dict[str, str], timeout: float = 20.0,
+                  method: str = "POST") -> dict:
         """POST JSON to an allowlisted https host and return the decoded
         JSON reply (2026-10-15, for nova.brain.agent's Claude API calls).
 
@@ -194,12 +204,13 @@ class Egress:
 
         parts = urlsplit(url)
         host = normalize_host(parts.hostname or "")
-        allowed = host is not None and host in self._allowed_hosts and parts.scheme == "https"
+        allowed = (host is not None and host in self._allowed_hosts and parts.scheme == "https"
+                   and method in ("POST", "PUT"))
         data = json.dumps(body).encode("utf-8")
         self._audit.record({"kind": "egress.post", "host": host, "allowed": allowed, "bytes_out": len(data)})
         if not allowed:
             raise EgressError(f"host {host!r} (from {url!r}) is not on the egress allowlist (or not https)")
-        req = urllib.request.Request(url, data=data, method="POST",
+        req = urllib.request.Request(url, data=data, method=method,
                                      headers={"content-type": "application/json", **headers})
         try:
             with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310 -- the sanctioned transport
@@ -228,6 +239,44 @@ class Egress:
             self._audit.record({"kind": "egress.post_result", "host": host, "status": "unreachable"})
             raise EgressError(f"{host} unreachable: {exc}") from exc
         self._audit.record({"kind": "egress.post_result", "host": host, "status": status, "bytes_in": len(raw)})
+        return json.loads(raw.decode("utf-8"))
+
+    def local_json(self, port: int, path: str, body: dict | None = None, *, timeout: float = 30.0) -> dict:
+        """GET (body None) or POST JSON to a service on this machine
+        (http://127.0.0.1:<port><path>) and return its JSON reply
+        (2026-11-22, for the hub's local model). Only ports named at
+        construction; the host is never a parameter, so this can't be
+        pointed anywhere else. Audited (port, path, sizes, status -- never
+        the body); redirects refused like every other call here."""
+        import json
+
+        allowed = (
+            isinstance(port, int) and port in self._loopback_ports
+            and isinstance(path, str) and re.fullmatch(r"/[A-Za-z0-9/_.-]{0,100}", path) is not None
+            and ".." not in path and "//" not in path
+        )
+        data = None if body is None else json.dumps(body).encode("utf-8")
+        self._audit.record({"kind": "egress.loopback", "port": port, "path": path if allowed else "<refused>",
+                            "allowed": allowed, "bytes_out": len(data or b"")})
+        if not allowed:
+            raise EgressError(f"loopback port {port!r} / path is not allowed")
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{port}{path}", data=data, method="GET" if data is None else "POST",
+            headers={"content-type": "application/json"},
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310 -- the sanctioned transport
+                raw = response.read()
+        except EgressRedirectBlocked:
+            self._audit.record({"kind": "egress.loopback_result", "port": port, "status": "redirect_blocked"})
+            raise
+        except urllib.error.HTTPError as exc:
+            self._audit.record({"kind": "egress.loopback_result", "port": port, "status": exc.code})
+            raise EgressError(f"HTTP {exc.code} from local port {port}") from exc
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            self._audit.record({"kind": "egress.loopback_result", "port": port, "status": "unreachable"})
+            raise EgressError(f"local port {port} unreachable: {exc}") from exc
+        self._audit.record({"kind": "egress.loopback_result", "port": port, "status": 200, "bytes_in": len(raw)})
         return json.loads(raw.decode("utf-8"))
 
     def release_for_process(self, purpose: str, payload: str) -> str:

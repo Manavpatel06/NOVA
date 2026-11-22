@@ -1,0 +1,14 @@
+[Unit]
+Description=NOVA hub (local model lane + memory mirror)
+
+[Service]
+WorkingDirectory=%h/NOVA
+ExecStart=%h/NOVA/.venv/bin/python -m nova.hub serve
+Restart=always
+RestartSec=5
+# its own memory budget, so it can never starve the laptop's other jobs
+MemoryHigh=600M
+MemoryMax=1G
+
+[Install]
+WantedBy=default.target

@@ -153,3 +153,16 @@ weather:
   longitude: -111.9400
   timezone: America/Phoenix
   temperature_unit: fahrenheit   # or celsius
+
+hub:
+  # nova-hub, the always-on old laptop (docs/decisions/0019). `host` is its
+  # Tailscale name, printed by `nova-hub login` -- empty = no hub, NOVA works
+  # as before. local_tier: let the hub's local model take simple commands
+  # and small talk before Claude does (saves Max-plan usage).
+  host: ""
+  local_tier: true
+  timeout_s: 8.0
+  # hub side: its service port (127.0.0.1 only) and the Ollama model
+  port: 8765
+  model: qwen3.5:2b
+  ollama_port: 11434

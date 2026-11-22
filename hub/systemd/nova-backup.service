@@ -1,0 +1,6 @@
+[Unit]
+Description=NOVA hub nightly memory backup
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/nova-hub backup

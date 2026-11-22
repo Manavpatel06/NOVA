@@ -1,0 +1,147 @@
+#!/usr/bin/env bash
+# nova-hub -- everyday commands for NOVA's hub (docs/decisions/0019).
+#
+#   nova-hub login     sign in to Tailscale + Claude, publish the hub, check everything  (run once)
+#   nova-hub status    checklist: is every part of the hub working?
+#   nova-hub test      ask the local model ten sample sentences and time it
+#   nova-hub update    pull the latest NOVA from GitHub and restart
+#   nova-hub logs      the hub service's recent log
+#   nova-hub backup    snapshot NOVA's memory now (also runs every night at 03:30)
+set -uo pipefail
+
+NOVA_DIR="${NOVA_DIR:-$HOME/NOVA}"
+DATA_DIR="$NOVA_DIR/data"
+PORT=8765
+MODEL="qwen3.5:2b"
+PY="$NOVA_DIR/.venv/bin/python"
+
+say()  { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
+good() { printf '   \033[32m[ok]\033[0m %s\n' "$*"; }
+bad()  { printf '   \033[31m[!!]\033[0m %s\n' "$*"; FAILED=$((FAILED+1)); }
+FAILED=0
+
+ts_json()  { tailscale status --json 2>/dev/null; }
+ts_name()  { ts_json | jq -r '.Self.DNSName // empty' | sed 's/\.$//'; }
+ts_owner() { ts_json | jq -r '(.Self.UserID|tostring) as $u | .User[$u].LoginName // empty'; }
+health()   { curl -fsS --max-time 5 "http://127.0.0.1:$PORT/v1/health" 2>/dev/null; }
+
+cmd_status() {
+  FAILED=0
+  say "NOVA hub status"
+  [[ "$(systemctl is-enabled sleep.target 2>/dev/null)" == "masked" ]] && good "never sleeps" || bad "sleep isn't off -- run setup_hub.sh again"
+  sudo -n true 2>/dev/null && { sudo ufw status | grep -q "Status: active" && good "firewall on (Tailscale only)" || bad "firewall is off -- run setup_hub.sh again"; }
+  if [[ "$(ts_json | jq -r '.BackendState // empty')" == "Running" ]]; then
+    good "Tailscale online as $(ts_name)"
+  else
+    bad "Tailscale not signed in -- run: nova-hub login"
+  fi
+  tailscale serve status 2>/dev/null | grep -q "127.0.0.1:$PORT" && good "hub published on https://$(ts_name)" || bad "hub not published -- run: nova-hub login"
+  systemctl is-active --quiet ollama && good "Ollama running" || bad "Ollama not running: sudo systemctl restart ollama"
+  ollama list 2>/dev/null | grep -q "^$MODEL" && good "local model $MODEL installed" || bad "model missing: ollama pull $MODEL"
+  systemctl --user is-active --quiet nova-hub && good "nova-hub service running" || bad "nova-hub service down -- nova-hub logs"
+  local h; h="$(health)"
+  if [[ -n "$h" ]]; then
+    [[ "$(jq -r .ok <<<"$h")" == "true" ]] && good "hub healthy (model loaded: $(jq -r .model_loaded <<<"$h"), memory files mirrored: $(jq -r .memory_files <<<"$h"))" \
+      || bad "hub unhealthy: $h"
+    [[ "$(jq -r .owner_set <<<"$h")" == "true" ]] && good "owner: $(cat "$DATA_DIR/hub_owner" 2>/dev/null)" || bad "no owner set -- run: nova-hub login"
+  else
+    bad "hub not answering on 127.0.0.1:$PORT -- nova-hub logs"
+  fi
+  [[ -s "$HOME/.claude/.credentials.json" ]] && good "Claude Code signed in" || bad "Claude Code not signed in -- run: nova-hub login"
+  systemctl --user is-active --quiet nova-backup.timer && good "nightly memory backup on" || bad "backup timer off: systemctl --user enable --now nova-backup.timer"
+  [[ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" == "yes" ]] && good "keeps running with nobody logged in" || bad "linger off: sudo loginctl enable-linger $USER"
+  echo
+  if (( FAILED == 0 )); then
+    printf '\033[1;32mAll good. The hub is up.\033[0m\n'
+    local name; name="$(ts_name)"
+    [[ -n "$name" ]] && printf '\nOn your main laptop, NOVA needs this hub name (Claude can set it for you):\n    hub.host: "%s"\n\n' "$name"
+  else
+    printf '\033[1;31m%d thing(s) to fix above.\033[0m\n' "$FAILED"
+  fi
+  return $(( FAILED > 0 ))
+}
+
+cmd_login() {
+  say "1/4  Tailscale"
+  if [[ "$(ts_json | jq -r '.BackendState // empty')" != "Running" ]]; then
+    echo "   A sign-in link appears below: open it, sign in with the same account as your laptop and phone."
+    sudo tailscale up --ssh --operator="$USER" || { echo "Tailscale sign-in didn't finish; run nova-hub login again."; return 1; }
+  fi
+  sudo tailscale set --operator="$USER" --ssh >/dev/null 2>&1 || true
+  local owner; owner="$(ts_owner)"
+  [[ -n "$owner" ]] || { echo "Couldn't read your Tailscale account; run nova-hub login again."; return 1; }
+  mkdir -p "$DATA_DIR"
+  printf '%s\n' "$owner" > "$DATA_DIR/hub_owner"
+  chmod 600 "$DATA_DIR/hub_owner"
+  good "signed in as $owner (only this account can use the hub)"
+
+  say "2/4  Publishing the hub to your devices (HTTPS, Tailscale only)"
+  while [[ "$(ts_json | jq -r '(.CertDomains // []) | length')" == "0" ]]; do
+    echo "   Tailscale needs HTTPS turned on for your account (one click):"
+    echo "     https://login.tailscale.com/admin/dns  ->  make sure MagicDNS is on, then 'Enable HTTPS'"
+    read -rp "   Press Enter once that's done (Ctrl+C to stop)... " _
+  done
+  # output stays visible: if Tailscale still wants something, it says so here
+  timeout 60 sudo tailscale serve --bg "$PORT" || { echo "Publishing didn't finish; run nova-hub login again."; return 1; }
+  ts_name > "$DATA_DIR/hub_name"
+  good "https://$(ts_name)"
+  echo "   Also: login.tailscale.com/admin/machines -> nova-hub -> ... -> Disable key expiry"
+
+  say "3/4  Claude (your Max plan)"
+  if [[ ! -s "$HOME/.claude/.credentials.json" ]]; then
+    echo "   Claude opens next: choose 'Claude account with subscription', sign in with your Max account,"
+    echo "   then type /exit to come back here."
+    read -rp "   Press Enter to start... " _
+    claude || true
+  fi
+  [[ -s "$HOME/.claude/.credentials.json" ]] && good "Claude Code signed in" || bad "Claude sign-in not found; run nova-hub login again later"
+
+  say "4/4  Starting the hub"
+  systemctl --user restart nova-hub
+  sleep 3
+  cmd_status
+  local ok=$?
+  echo
+  read -rp "Restart now so everything starts the way it will every day? [Y/n] " ans
+  [[ "${ans:-Y}" =~ ^[Yy] ]] && sudo reboot
+  return $ok
+}
+
+cmd_test() {
+  "$PY" -m nova.hub selftest
+}
+
+cmd_update() {
+  say "Updating NOVA"
+  git -C "$NOVA_DIR" pull --ff-only || { echo "Couldn't update (local changes?)."; return 1; }
+  "$PY" -m pip install -q --no-deps -e "$NOVA_DIR"
+  install -m 755 "$NOVA_DIR/hub/nova-hub" "$HOME/.local/bin/nova-hub"
+  cp "$NOVA_DIR"/hub/systemd/nova-*.{service,timer} "$HOME/.config/systemd/user/" && systemctl --user daemon-reload
+  ollama pull "$MODEL" >/dev/null
+  systemctl --user restart nova-hub
+  good "updated to $(git -C "$NOVA_DIR" log -1 --format='%h %s')"
+}
+
+cmd_logs() {
+  journalctl --user -u nova-hub -n "${1:-60}" --no-pager
+}
+
+cmd_backup() {
+  local src="$DATA_DIR/memory-mirror" dest="$DATA_DIR/backups"
+  [[ -d "$src" ]] || { echo "Nothing to back up yet (the laptop hasn't sent NOVA's memory)."; return 0; }
+  mkdir -p "$dest"
+  local file="$dest/memory-$(date +%Y-%m-%d).tar.gz"
+  tar -czf "$file.tmp" -C "$DATA_DIR" memory-mirror && mv "$file.tmp" "$file"
+  ls -1t "$dest"/memory-*.tar.gz 2>/dev/null | tail -n +31 | xargs -r rm --   # keep 30 days
+  good "backed up to $file"
+}
+
+case "${1:-status}" in
+  login)  cmd_login ;;
+  status) cmd_status ;;
+  test)   cmd_test ;;
+  update) cmd_update ;;
+  logs)   shift; cmd_logs "$@" ;;
+  backup) cmd_backup ;;
+  *) sed -n '2,10p' "$0"; exit 1 ;;
+esac

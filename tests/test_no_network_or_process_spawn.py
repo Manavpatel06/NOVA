@@ -40,7 +40,7 @@ TRANSPORT_MODULES = {
     "pycurl", "requests", "socketserver", "urllib3", "websocket", "websockets",
     "aiohttp",
 }
-TRANSPORT_ALLOWLIST = {"security/egress.py"}
+TRANSPORT_ALLOWLIST = {"security/egress.py", "hub/listener.py"}
 
 # --- §3.2: process spawn -----------------------------------------------------
 
@@ -115,8 +115,10 @@ def _parse(path: Path) -> ast.AST:
 # ---------------------------------------------------------------------------
 
 
-def test_transport_allowlist_is_exactly_one_named_file():
-    assert len(TRANSPORT_ALLOWLIST) == 1
+def test_transport_allowlist_is_exactly_two_named_files():
+    """egress.py reaches out; hub/listener.py (docs/decisions/0019) is the
+    hub's one listening socket, pinned to loopback by the test below."""
+    assert len(TRANSPORT_ALLOWLIST) == 2
     for rel in TRANSPORT_ALLOWLIST:
         assert (NOVA_ROOT / rel).is_file(), f"transport allowlist entry {rel} does not exist"
 
@@ -393,3 +395,15 @@ def test_add_app_popen_target_is_the_freshest_third_resolution_not_an_earlier_on
         "decision — the whole point of re-resolving before the write is "
         "defeated if the launch doesn't use that fresh value"
     )
+
+
+def test_hub_listener_binds_loopback_only():
+    """The hub's listener earns its transport exemption only by never
+    listening on a LAN/Tailscale address: the bind host is the literal
+    127.0.0.1 and make_server passes nothing else."""
+    from nova.hub import listener
+
+    assert listener.BIND_HOST == "127.0.0.1"
+    src = (NOVA_ROOT / "hub/listener.py").read_text(encoding="utf-8")
+    assert "ThreadingHTTPServer((BIND_HOST, port)" in src
+    assert src.count("ThreadingHTTPServer(") == 1

@@ -504,6 +504,27 @@ class WeatherConfig:
 
 
 @dataclass(frozen=True)
+class HubConfig:
+    """nova-hub, the always-on old laptop (2026-11-22, docs/decisions/0019).
+
+    Laptop side: `host` is the hub's Tailscale name (nova-hub.<tailnet>.ts.net,
+    printed by `nova-hub login`); empty means no hub and NOVA works exactly as
+    before. With `local_tier` on, a sentence the instant lane didn't take is
+    first offered to the hub's local model, and goes to Claude only when that
+    model isn't sure (saves Max-plan usage). Hub side: the port its service
+    listens on (127.0.0.1 only; `tailscale serve` publishes it) and the Ollama
+    model it runs."""
+
+    host: str = ""
+    local_tier: bool = True
+    #: how long a sentence may wait for the hub before going to Claude
+    timeout_s: float = field(default=8.0, metadata={"bounds": Bounds(lo=1.0, hi=60.0)})
+    port: int = field(default=8765, metadata={"bounds": Bounds(lo=1024, hi=65535)})
+    model: str = "qwen3.5:2b"
+    ollama_port: int = field(default=11434, metadata={"bounds": Bounds(lo=1024, hi=65535)})
+
+
+@dataclass(frozen=True)
 class Config:
     audio: AudioConfig = field(default_factory=AudioConfig)
     stt: SttConfig = field(default_factory=SttConfig)
@@ -516,6 +537,7 @@ class Config:
     governor: GovernorConfig = field(default_factory=GovernorConfig)
     ui: UiConfig = field(default_factory=UiConfig)
     weather: WeatherConfig = field(default_factory=WeatherConfig)
+    hub: HubConfig = field(default_factory=HubConfig)
 
 
 _SECTIONS: dict[str, type] = {
@@ -530,6 +552,7 @@ _SECTIONS: dict[str, type] = {
     "governor": GovernorConfig,
     "ui": UiConfig,
     "weather": WeatherConfig,
+    "hub": HubConfig,
 }
 
 
