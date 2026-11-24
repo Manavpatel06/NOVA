@@ -166,3 +166,5 @@ hub:
   port: 8765
   model: qwen3.5:2b
   ollama_port: 11434
+  # reminders: false keeps their words off Bark/Apple's servers (tap to read)
+  alert_text: false

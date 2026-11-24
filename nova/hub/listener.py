@@ -17,6 +17,7 @@ Requests and replies are small JSON. Sentence text is never logged here.
 from __future__ import annotations
 
 import json
+import re
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -72,7 +73,21 @@ def make_server(service: HubService, port: int) -> ThreadingHTTPServer:
             self._send(HTTPStatus.FORBIDDEN, {"error": "only the hub's owner may do this"})
             return False
 
+        def _send_html(self, page: str) -> None:
+            data = page.encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("content-type", "text/html; charset=utf-8")
+            self.send_header("content-length", str(len(data)))
+            self.send_header("content-security-policy", "default-src 'none'; style-src 'unsafe-inline'")
+            self.end_headers()
+            self.wfile.write(data)
+
         def do_GET(self) -> None:  # noqa: N802
+            ack = re.fullmatch(r"/v1/ack/([0-9a-f]{8})\?t=([A-Za-z0-9_-]{8,40})", self.path)
+            if ack:
+                if self._owner_only():
+                    self._send_html(service.ack_page(ack.group(1), ack.group(2)))
+                return
             if self.path == "/v1/health":
                 local = self.headers.get(OWNER_HEADER) is None and service.host_ok(self.headers.get("host"), port_bound)
                 self._send(HTTPStatus.OK, service.health(full=local or self._is_owner()))
@@ -93,6 +108,12 @@ def make_server(service: HubService, port: int) -> ThreadingHTTPServer:
         def do_POST(self) -> None:  # noqa: N802
             if self.path == "/v1/route":
                 self._handle(service.route)
+            elif self.path == "/v1/reminders":
+                self._handle(service.add_reminder)
+            elif self.path == "/v1/reminders/list":
+                self._handle(service.list_reminders)
+            elif self.path == "/v1/reminders/cancel":
+                self._handle(service.cancel_reminder)
             else:
                 self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})
 

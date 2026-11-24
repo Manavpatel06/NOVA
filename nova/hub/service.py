@@ -11,6 +11,7 @@ does (fail closed). /v1/health is open to the hub itself and the tailnet.
 """
 from __future__ import annotations
 
+import html
 import json
 import os
 import re
@@ -20,6 +21,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from nova.hub.local_model import MAX_TEXT, MAX_TOOLS
+from nova.hub.reminders import ReminderError, ReminderStore
 from nova.log import get_logger
 
 _log = get_logger("hub.service")
@@ -44,8 +46,12 @@ class HubService:
         data_dir: Path,
         owner_path: Path | None = None,
         clock: Callable[[], float] = time.time,
+        reminders: ReminderStore | None = None,
+        notifier: Any = None,
     ) -> None:
         self._model = model
+        self.reminders = reminders or ReminderStore(Path(data_dir) / "reminders.json", clock=clock)
+        self._notifier = notifier
         self._data_dir = Path(data_dir)
         self._owner_path = Path(owner_path) if owner_path is not None else self._data_dir / "hub_owner"
         self._clock = clock
@@ -106,6 +112,8 @@ class HubService:
             out.update(ok=False, ollama=False, model_installed=False, model_loaded=False, ollama_error=str(exc)[:120])
         if not out.get("model_installed"):
             out["ok"] = False
+        out["reminders_pending"] = len(self.reminders.pending())
+        out["alerts_ready"] = bool(self._notifier is not None and self._notifier.configured())
         state = self._read_state()
         out["memory_files"] = state.get("memory_files", 0)
         out["memory_synced_at"] = state.get("memory_synced_at", "")
@@ -132,6 +140,50 @@ class HubService:
         _log.info("route -> %s%s (%s ms)", decision.get("route"),
                   f" {decision.get('tool')}" if decision.get("route") == "tool" else "", decision.get("ms", "?"))
         return decision
+
+    # --- /v1/reminders ------------------------------------------------------
+
+    def add_reminder(self, body: Any) -> dict[str, Any]:
+        if not isinstance(body, dict):
+            raise HubError("body must be a JSON object")
+        try:
+            r = self.reminders.add(body.get("text"), body.get("due"), urgent=body.get("urgent") is True)
+        except ReminderError as exc:
+            raise HubError(str(exc)) from None
+        _log.info("reminder %s added (%s)", r["id"], "urgent" if r["urgent"] else "normal")
+        return {"ok": True, "id": r["id"], "due": r["due"], "alerts_ready": bool(
+            self._notifier is not None and self._notifier.configured())}
+
+    def list_reminders(self, body: Any = None) -> dict[str, Any]:
+        return {"reminders": [{"id": r["id"], "text": r["text"], "due": r["due"], "urgent": r["urgent"]}
+                              for r in self.reminders.pending()]}
+
+    def cancel_reminder(self, body: Any) -> dict[str, Any]:
+        which = body.get("id") if isinstance(body, dict) else None
+        if not isinstance(which, str) or not which:
+            raise HubError('body must be {"id": "<id>"} or {"id": "all"}')
+        return {"ok": True, "cancelled": self.reminders.cancel(which)}
+
+    def ack_page(self, rid: str, token: str) -> str:
+        """The page a reminder notification opens: shows the text (escaped)
+        and marks it done, so an urgent one stops ringing."""
+        r = self.reminders.ack(rid, token)
+        if r is None:
+            title, text = "Not found", "This reminder is already done or the link is wrong."
+        else:
+            title, text = "Got it", r["text"]
+        return (
+            "<!doctype html><meta charset=utf-8><meta name=viewport content='width=device-width'>"
+            "<title>NOVA</title><body style='font:20px -apple-system,sans-serif;margin:32px;"
+            "background:#111;color:#eee'>"
+            f"<h2>{html.escape(title)}</h2><p>{html.escape(text)}</p></body>"
+        )
+
+    def tick(self) -> int:
+        """Fire due reminders (the scheduler thread calls this)."""
+        if self._notifier is None:
+            return 0
+        return self.reminders.tick(self._notifier.send)
 
     # --- /v1/memory -----------------------------------------------------------
 

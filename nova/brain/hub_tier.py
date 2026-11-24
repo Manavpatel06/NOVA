@@ -248,3 +248,22 @@ class HubTier:
             return False
         _log.info("Memory mirrored to the hub (%d files)", len(files))
         return True
+
+
+async def hub_post(config: Any, egress: Any, path: str, body: dict[str, Any], *, timeout_s: float = 8.0) -> dict[str, Any]:
+    """One owner-only call to the hub (reminders and the like). Raises
+    HubUnavailable when there's no hub or it can't be reached."""
+    host = config.hub.host.strip().lower()
+    if not host or egress is None:
+        raise HubUnavailable("no hub configured")
+    try:
+        return await asyncio.wait_for(
+            asyncio.to_thread(egress.post_json, f"https://{host}{path}", body, headers={}, timeout=timeout_s),
+            timeout=timeout_s + 1.0,
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise HubUnavailable(type(exc).__name__) from exc
+
+
+class HubUnavailable(RuntimeError):
+    pass

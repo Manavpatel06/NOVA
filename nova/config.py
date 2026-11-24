@@ -522,6 +522,10 @@ class HubConfig:
     port: int = field(default=8765, metadata={"bounds": Bounds(lo=1024, hi=65535)})
     model: str = "qwen3.5:2b"
     ollama_port: int = field(default=11434, metadata={"bounds": Bounds(lo=1024, hi=65535)})
+    #: put the reminder's words in the iPhone notification itself (they then
+    #: pass through Bark's and Apple's servers). Off: "Reminder -- tap to see
+    #: it", and the words stay on the hub, shown when tapped over Tailscale.
+    alert_text: bool = False
 
 
 @dataclass(frozen=True)
