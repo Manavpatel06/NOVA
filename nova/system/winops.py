@@ -132,6 +132,39 @@ def run_program(exe: str, *program_args: str, timeout: float = 15.0) -> str:
     return (proc.stdout or "").strip()
 
 
+def git_update(repo: str, commit: str, *, timeout: float = 90.0) -> None:
+    """Install exactly `commit` in NOVA's own folder (ADR 0021): fetch, check
+    that GitHub's master IS that commit (nothing extra rode along), then
+    fast-forward to it. git is found on PATH and realpath-resolved; fixed
+    arguments; hooks off; never a shell; never a merge commit."""
+    import shutil
+
+    if not re.fullmatch(r"[0-9a-f]{40}", commit or ""):
+        raise ValueError("not a commit id")
+    _require_windows()
+    git = shutil.which("git")
+    if git is None:
+        raise WinOpsError("git is not installed")
+    path = os.path.realpath(git)
+    _clean_arg("REPO", repo)
+    safe = ["-c", "core.hooksPath=NUL", "-c", "core.fsmonitor=false"]
+
+    def git_run(*args: str) -> str:
+        try:
+            proc = subprocess.run([path, *safe, "-C", repo, *args], capture_output=True, text=True,
+                                  timeout=timeout, creationflags=_NO_WINDOW, shell=False)
+        except (OSError, subprocess.TimeoutExpired) as exc:
+            raise WinOpsError(f"git failed: {exc}") from exc
+        if proc.returncode != 0:
+            raise WinOpsError((proc.stderr or proc.stdout or f"git exit {proc.returncode}").strip()[-300:])
+        return (proc.stdout or "").strip()
+
+    git_run("fetch", "--quiet", "origin", "master")
+    if git_run("rev-parse", "FETCH_HEAD") != commit:
+        raise WinOpsError("GitHub's NOVA isn't the upgrade you approved; not installing")
+    git_run("merge", "--ff-only", "--quiet", commit)
+
+
 _URL = re.compile(r"^https://(?P<host>[^/?#:@\\]+)(?::443)?(?P<rest>[/?#][^\\\s]*)?$", re.IGNORECASE)
 
 

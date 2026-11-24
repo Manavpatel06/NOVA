@@ -32,6 +32,19 @@ MAX_BODY = 6_000_000
 OWNER_HEADER = "Tailscale-User-Login"
 
 
+#: owner-only JSON routes -> HubService method
+_POST_ROUTES = {
+    "/v1/brain/start": "brain_start",
+    "/v1/brain/send": "brain_send",
+    "/v1/brain/close": "brain_close",
+    "/v1/forge/request": "forge_request",
+    "/v1/forge/list": "forge_list",
+    "/v1/forge/ready": "forge_ready",
+    "/v1/forge/apply": "forge_apply",
+    "/v1/forge/discard": "forge_discard",
+}
+
+
 def make_server(service: HubService, port: int) -> ThreadingHTTPServer:
     """The hub's server, bound to loopback. port 0 = any free port (tests)."""
 
@@ -114,6 +127,8 @@ def make_server(service: HubService, port: int) -> ThreadingHTTPServer:
                 self._handle(service.list_reminders)
             elif self.path == "/v1/reminders/cancel":
                 self._handle(service.cancel_reminder)
+            elif self.path in _POST_ROUTES:
+                self._handle(getattr(service, _POST_ROUTES[self.path]))
             else:
                 self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})
 

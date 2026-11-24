@@ -1172,7 +1172,7 @@ class NovaApp:
 
             brain_dir = DATA_DIR / "brain"  # empty working dir: nothing for the CLI to read
 
-            def _session(system_prompt: str) -> ClaudeSession:
+            def _local(system_prompt: str) -> ClaudeSession:
                 brain_dir.mkdir(parents=True, exist_ok=True)
                 return ClaudeSession(
                     egress=self.egress, audit=self.audit, model=self.config.brain.model,
@@ -1186,7 +1186,23 @@ class NovaApp:
                 except ClaudeCliNotFound:
                     return False
 
-            return MaxBrain(self.config, session_factory=_session, cli_available=_cli_ok,
+            # 2026-11-24 (ADR 0021): the conversation runs on the hub when
+            # there is one; tools still run here, through the ladder.
+            on_hub = bool(self.config.hub.host.strip()) and self.config.brain.where in ("auto", "hub")
+
+            def _session(system_prompt: str):
+                if not on_hub:
+                    return _local(system_prompt)
+                from nova.brain.remote_session import AutoSession, RemoteSession
+
+                remote = RemoteSession(self.config, self.egress, system_prompt=system_prompt,
+                                       web_search=self.config.brain.web_search, model=self.config.brain.model)
+                local = ((lambda: _local(system_prompt))
+                         if self.config.brain.where == "auto" and _cli_ok() else None)
+                return AutoSession(remote, local)
+
+            return MaxBrain(self.config, session_factory=_session,
+                            cli_available=(lambda: True) if on_hub else _cli_ok,
                             context_provider=lambda: default_context(self.config))
         return None
 

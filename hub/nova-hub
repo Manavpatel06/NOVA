@@ -9,6 +9,8 @@
 #   nova-hub backup    snapshot NOVA's memory now (also runs every night at 03:30)
 #   nova-hub bark KEY  save your Bark key (iPhone alerts), then send a test alert
 #   nova-hub ping      send a test alert to your iPhone
+#   nova-hub github    sign the hub in to GitHub, so approved upgrades reach your laptop
+#   nova-hub upgrades  NOVA's self-upgrades: what's building, ready, installed
 set -uo pipefail
 
 NOVA_DIR="${NOVA_DIR:-$HOME/NOVA}"
@@ -51,6 +53,12 @@ cmd_status() {
     bad "hub not answering on 127.0.0.1:$PORT -- nova-hub logs"
   fi
   [[ -s "$HOME/.claude/.credentials.json" ]] && good "Claude Code signed in" || bad "Claude Code not signed in -- run: nova-hub login"
+  if [[ -x "$HOME/NOVA-forge/.venv/bin/python" ]] && bwrap --ro-bind / / --unshare-all --dev /dev --proc /proc true 2>/dev/null; then
+    good "upgrade workshop ready (sandboxed tests)"
+  else
+    note "upgrade workshop not ready: run setup_hub.sh again"
+  fi
+  gh auth status >/dev/null 2>&1 && good "GitHub connected (upgrades reach your laptop)" || note "GitHub not connected: nova-hub github"
   [[ -s "$DATA_DIR/bark_key" ]] && good "iPhone alerts set up (Bark)" || note "iPhone alerts not set up yet (optional): install Bark, then  nova-hub bark <your key>"
   systemctl --user is-active --quiet nova-backup.timer && good "nightly memory backup on" || bad "backup timer off: systemctl --user enable --now nova-backup.timer"
   [[ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" == "yes" ]] && good "keeps running with nobody logged in" || bad "linger off: sudo loginctl enable-linger $USER"
@@ -66,7 +74,7 @@ cmd_status() {
 }
 
 cmd_login() {
-  say "1/4  Tailscale"
+  say "1/5  Tailscale"
   if [[ "$(ts_json | jq -r '.BackendState // empty')" != "Running" ]]; then
     echo "   A sign-in link appears below: open it, sign in with the same account as your laptop and phone."
     sudo tailscale up --ssh --operator="$USER" || { echo "Tailscale sign-in didn't finish; run nova-hub login again."; return 1; }
@@ -79,7 +87,7 @@ cmd_login() {
   chmod 600 "$DATA_DIR/hub_owner"
   good "signed in as $owner (only this account can use the hub)"
 
-  say "2/4  Publishing the hub to your devices (HTTPS, Tailscale only)"
+  say "2/5  Publishing the hub to your devices (HTTPS, Tailscale only)"
   while [[ "$(ts_json | jq -r '(.CertDomains // []) | length')" == "0" ]]; do
     echo "   Tailscale needs HTTPS turned on for your account (one click):"
     echo "     https://login.tailscale.com/admin/dns  ->  make sure MagicDNS is on, then 'Enable HTTPS'"
@@ -91,7 +99,7 @@ cmd_login() {
   good "https://$(ts_name)"
   echo "   Also: login.tailscale.com/admin/machines -> nova-hub -> ... -> Disable key expiry"
 
-  say "3/4  Claude (your Max plan)"
+  say "3/5  Claude (your Max plan)"
   if [[ ! -s "$HOME/.claude/.credentials.json" ]]; then
     echo "   Claude opens next: choose 'Claude account with subscription', sign in with your Max account,"
     echo "   then type /exit to come back here."
@@ -100,7 +108,10 @@ cmd_login() {
   fi
   [[ -s "$HOME/.claude/.credentials.json" ]] && good "Claude Code signed in" || bad "Claude sign-in not found; run nova-hub login again later"
 
-  say "4/4  Starting the hub"
+  say "4/5  GitHub (so upgrades you approve reach your laptop)"
+  cmd_github || bad "GitHub sign-in didn't finish; run nova-hub github later"
+
+  say "5/5  Starting the hub"
   systemctl --user restart nova-hub
   sleep 3
   cmd_status
@@ -144,6 +155,24 @@ cmd_ping() {
   "$PY" -m nova.hub ping
 }
 
+cmd_github() {
+  command -v gh >/dev/null || { echo "gh isn't installed: run setup_hub.sh again"; return 1; }
+  if ! gh auth status >/dev/null 2>&1; then
+    echo "   A code and a link appear below: open the link on any device, enter the code, approve."
+    gh auth login --hostname github.com --git-protocol https --web || return 1
+  fi
+  gh auth setup-git >/dev/null 2>&1
+  git -C "$NOVA_DIR" ls-remote --exit-code origin HEAD >/dev/null 2>&1 && good "GitHub connected" || { bad "can't reach your NOVA repo on GitHub"; return 1; }
+}
+
+cmd_upgrades() {
+  local owner; owner="$(cat "$DATA_DIR/hub_owner" 2>/dev/null)"
+  curl -fsS --max-time 10 -H "Tailscale-User-Login: $owner" -H "Content-Type: application/json" \
+    -d '{}' "http://127.0.0.1:$PORT/v1/forge/list" \
+    | jq -r '.jobs[]? | "\(.status)\t\(.request)\t\(.detail)"' 2>/dev/null \
+    || echo "No upgrades (or the hub isn't running: nova-hub logs)"
+}
+
 cmd_logs() {
   journalctl --user -u nova-hub -n "${1:-60}" --no-pager
 }
@@ -167,5 +196,7 @@ case "${1:-status}" in
   backup) cmd_backup ;;
   bark)   shift; cmd_bark "$@" ;;
   ping)   cmd_ping ;;
-  *) sed -n '2,12p' "$0"; exit 1 ;;
+  github) cmd_github ;;
+  upgrades) cmd_upgrades ;;
+  *) sed -n '2,14p' "$0"; exit 1 ;;
 esac

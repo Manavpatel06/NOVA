@@ -433,6 +433,10 @@ class BrainConfig:
     #: (nova.brain.agent). "router": the old deterministic router first,
     #: Claude only when it misses. In every mode the router is the fallback.
     mode: str = "max"
+    #: where the max-mode conversation runs (ADR 0021): "auto" = on the hub
+    #: when hub.host is set, this laptop's `claude` if the hub can't be
+    #: reached; "hub" = hub only; "laptop" = never the hub.
+    where: str = "auto"
     #: Claude model (a full id, or "haiku"/"sonnet" for the max mode).
     #: Haiku is the fastest current model.
     model: str = "claude-haiku-5-5"

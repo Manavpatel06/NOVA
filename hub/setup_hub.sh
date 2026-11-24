@@ -19,6 +19,7 @@
 #   8. installs Claude Code and keeps NOVA running even when nobody is logged in
 #   9. installs Ollama and NOVA's local model (qwen3.5:2b, on this machine only)
 #  10. downloads NOVA, starts the hub service and the nightly memory backup
+#  11. sets up the workshop where NOVA builds and tests its own upgrades
 set -euo pipefail
 
 say()  { printf '\n\033[1;36m== %s\033[0m\n' "$*"; }
@@ -33,7 +34,7 @@ if ! grep -qi ubuntu /etc/os-release; then
 fi
 sudo -v
 
-say "1/10  Updating Ubuntu and installing basics (a few minutes)"
+say "1/11  Updating Ubuntu and installing basics (a few minutes)"
 export DEBIAN_FRONTEND=noninteractive
 sudo apt-get update -qq
 sudo apt-get -y -qq full-upgrade
@@ -41,13 +42,13 @@ sudo apt-get -y -qq install openssh-server git curl ca-certificates python3 pyth
   tlp tlp-rdw unattended-upgrades ufw jq htop zstd
 ok "packages installed"
 
-say "2/10  Naming this machine nova-hub"
+say "2/11  Naming this machine nova-hub"
 if [[ "$(hostnamectl --static)" != "nova-hub" ]]; then
   sudo hostnamectl set-hostname nova-hub
 fi
 ok "hostname: $(hostnamectl --static)"
 
-say "3/10  Never sleep (idle or lid closed)"
+say "3/11  Never sleep (idle or lid closed)"
 sudo systemctl mask --quiet sleep.target suspend.target hibernate.target hybrid-sleep.target
 sudo mkdir -p /etc/systemd/logind.conf.d
 sudo tee /etc/systemd/logind.conf.d/90-nova-hub.conf >/dev/null <<'CONF'
@@ -64,7 +65,7 @@ if command -v gsettings >/dev/null 2>&1 && [[ -n "${DBUS_SESSION_BUS_ADDRESS:-}"
 fi
 ok "sleep disabled; lid can be closed (applies after the reboot at the end)"
 
-say "4/10  Battery care"
+say "4/11  Battery care"
 sudo tee /etc/tlp.d/90-nova-hub.conf >/dev/null <<'CONF'
 # Plugged in 24/7: hold the battery between 75% and 80% (where supported).
 START_CHARGE_THRESH_BAT0=75
@@ -79,7 +80,7 @@ else
   warn "couldn't confirm an 80% charge limit -- if the BIOS has a 'battery care' or 'charge limit' option, turn it on"
 fi
 
-say "5/10  Automatic security updates"
+say "5/11  Automatic security updates"
 sudo tee /etc/apt/apt.conf.d/52nova-hub >/dev/null <<'CONF'
 Unattended-Upgrade::Automatic-Reboot "true";
 Unattended-Upgrade::Automatic-Reboot-Time "04:30";
@@ -89,13 +90,13 @@ CONF
 sudo systemctl enable --now unattended-upgrades >/dev/null 2>&1 || true
 ok "security updates on; reboots only when an update needs it, at 4:30 am"
 
-say "6/10  Tailscale (private link between your devices)"
+say "6/11  Tailscale (private link between your devices)"
 if ! command -v tailscale >/dev/null 2>&1; then
   curl -fsSL https://tailscale.com/install.sh | sh
 fi
 ok "tailscale installed"
 
-say "7/10  Firewall: only your own devices (via Tailscale) can reach this machine"
+say "7/11  Firewall: only your own devices (via Tailscale) can reach this machine"
 sudo ufw --force reset >/dev/null
 sudo ufw default deny incoming >/dev/null
 sudo ufw default allow outgoing >/dev/null
@@ -103,7 +104,7 @@ sudo ufw allow in on tailscale0 >/dev/null
 sudo ufw --force enable >/dev/null
 ok "firewall on"
 
-say "8/10  Claude Code + always-on background jobs"
+say "8/11  Claude Code + always-on background jobs"
 if ! command -v claude >/dev/null 2>&1 && [[ ! -x "$HOME/.local/bin/claude" ]]; then
   curl -fsSL https://claude.ai/install.sh | bash
 fi
@@ -112,7 +113,7 @@ sudo loginctl enable-linger "$USER"
 ok "claude installed: $("$HOME/.local/bin/claude" --version 2>/dev/null || claude --version 2>/dev/null || echo '?')"
 ok "background jobs keep running without a login"
 
-say "9/10  Ollama + NOVA's local model (a few minutes: ~2.7 GB download)"
+say "9/11  Ollama + NOVA's local model (a few minutes: ~2.7 GB download)"
 if ! command -v ollama >/dev/null 2>&1; then
   curl -fsSL https://ollama.com/install.sh | sh
 fi
@@ -133,7 +134,7 @@ for _ in $(seq 1 30); do curl -fsS http://127.0.0.1:11434/api/version >/dev/null
 ollama pull qwen3.5:2b
 ok "Ollama running on this machine only (127.0.0.1), model qwen3.5:2b ready"
 
-say "10/10  NOVA: download, hub service, nightly backup"
+say "10/11  NOVA: download, hub service, nightly backup"
 if [[ -d "$HOME/NOVA/.git" ]]; then
   git -C "$HOME/NOVA" pull --ff-only -q || warn "couldn't update ~/NOVA (local changes?) -- using it as is"
 else
@@ -151,13 +152,29 @@ systemctl --user daemon-reload
 systemctl --user enable --now nova-hub.service nova-backup.timer >/dev/null
 ok "NOVA in ~/NOVA; hub service running; memory backup every night at 03:30"
 
+say "11/11  Workshop for NOVA's self-upgrades (a few minutes)"
+sudo apt-get -y -qq install gh bubblewrap libportaudio2 libsndfile1 >/dev/null || warn "couldn't install gh/bubblewrap/audio libraries -- upgrades may not work"
+if bwrap --ro-bind / / --unshare-all --dev /dev --proc /proc true 2>/dev/null; then
+  ok "test sandbox works (upgrades are tested with no network and no access to your files)"
+else
+  warn "the test sandbox (bubblewrap) doesn't run here -- NOVA won't build upgrades until it does"
+fi
+FORGE="$HOME/NOVA-forge"
+mkdir -p "$FORGE/work"
+python3 -m venv "$FORGE/.venv"
+"$FORGE/.venv/bin/pip" install -q --upgrade pip
+"$FORGE/.venv/bin/pip" install -q numpy PyYAML psutil pytest pytest-asyncio sounddevice soundfile \
+  onnxruntime kokoro-onnx faster-whisper || warn "some test packages failed to install -- upgrades may not test"
+ok "workshop ready in ~/NOVA-forge (NOVA's tests run here before any upgrade reaches you)"
+systemctl --user restart nova-hub.service
+
 say "Done. One more command (sign-ins, they need you):"
 cat <<'NEXT'
 
     source ~/.bashrc && nova-hub login
 
-  It signs in to Tailscale and Claude, publishes the hub to your own devices,
-  checks every part, and offers to restart. After that, any time:
+  It signs in to Tailscale, Claude and GitHub, publishes the hub to your own
+  devices, checks every part, and offers to restart. After that, any time:
 
     nova-hub status    is everything working?
     nova-hub test      try the local model on ten sample sentences

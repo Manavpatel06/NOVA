@@ -1,14 +1,16 @@
 [Unit]
-Description=NOVA hub (local model lane + memory mirror)
+Description=NOVA hub (brain, local model lane, reminders, upgrades, memory mirror)
 
 [Service]
 WorkingDirectory=%h/NOVA
+Environment=PATH=%h/.local/bin:/usr/local/bin:/usr/bin:/bin
 ExecStart=%h/NOVA/.venv/bin/python -m nova.hub serve
 Restart=always
 RestartSec=5
-# its own memory budget, so it can never starve the laptop's other jobs
-MemoryHigh=600M
-MemoryMax=1G
+# its own memory budget (the brain's claude process and upgrade builds
+# included), leaving room for Ollama's model
+MemoryHigh=2500M
+MemoryMax=3500M
 
 [Install]
 WantedBy=default.target

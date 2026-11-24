@@ -5,6 +5,7 @@ import argparse
 import sys
 import threading
 import time
+from pathlib import Path
 
 from nova import DATA_DIR
 from nova.config import load_config
@@ -33,11 +34,46 @@ SELFTEST = [
 ]
 
 
-def _egress(config) -> Egress:
-    audit = AuditLog(DATA_DIR / "hub-audit.log", redact_terms=config.security.redact_terms)
+def _audit(config) -> AuditLog:
+    return AuditLog(DATA_DIR / "hub-audit.log", redact_terms=config.security.redact_terms)
+
+
+def _egress(config, audit: AuditLog | None = None) -> Egress:
     # the hub reaches out to exactly one internet host: Bark, for alerts
-    return Egress([BARK_HOST], audit=audit, redact_terms=config.security.redact_terms,
+    # (the `claude` and `git` programs it runs make their own connections)
+    return Egress([BARK_HOST], audit=audit or _audit(config), redact_terms=config.security.redact_terms,
                   loopback_ports=[config.hub.ollama_port])
+
+
+def _brain(config, egress: Egress, audit: AuditLog):
+    """NOVA's Claude conversation, on the hub (ADR 0021)."""
+    from nova.brain.claude_arm import ClaudeSession
+    from nova.hub.brain_host import BrainHost
+
+    brain_dir = DATA_DIR / "brain"  # empty working dir: nothing for the CLI to read
+    brain_dir.mkdir(parents=True, exist_ok=True)
+
+    def factory(system_prompt: str, web_search: bool, model: str) -> ClaudeSession:
+        return ClaudeSession(egress=egress, audit=audit, model=model, system_prompt=system_prompt,
+                             web_search=web_search, cwd=str(brain_dir))
+
+    return BrainHost(factory)
+
+
+def _forge(egress: Egress, notify):
+    """NOVA upgrading itself (ADR 0021); None until the workshop is set up."""
+    from nova import ROOT
+    from nova.hub.forge import Forge
+
+    home = Path.home() / "NOVA-forge"
+    python = home / ".venv" / "bin" / "python"
+    if not python.exists():
+        _log.warning("Upgrades are off: the workshop isn't set up (run setup_hub.sh again)")
+        return None
+    forge = Forge(repo=ROOT, work_root=home / "work", state_dir=DATA_DIR / "forge", test_python=python,
+                  notify=notify, egress=egress)
+    forge.start_worker()
+    return forge
 
 
 def _model(config, egress: Egress | None = None) -> LocalModel:
@@ -66,7 +102,8 @@ def serve(config) -> int:
     from nova.hub.listener import make_server
     from nova.hub.service import HubService
 
-    egress = _egress(config)
+    audit = _audit(config)
+    egress = _egress(config, audit)
     model = _model(config, egress)
     for attempt in range(30):  # Ollama may still be starting after a reboot
         try:
@@ -77,7 +114,9 @@ def serve(config) -> int:
             if attempt == 29:
                 _log.error("Local model not ready (%s); serving anyway, health will say so", exc)
             time.sleep(2)
-    service = HubService(model=model, data_dir=DATA_DIR, notifier=_bark(config, egress))
+    bark = _bark(config, egress)
+    service = HubService(model=model, data_dir=DATA_DIR, notifier=bark, brain=_brain(config, egress, audit),
+                         forge=_forge(egress, bark.say))
 
     def scheduler() -> None:
         while True:

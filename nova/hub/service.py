@@ -48,7 +48,11 @@ class HubService:
         clock: Callable[[], float] = time.time,
         reminders: ReminderStore | None = None,
         notifier: Any = None,
+        brain: Any = None,
+        forge: Any = None,
     ) -> None:
+        self.brain = brain
+        self.forge = forge
         self._model = model
         self.reminders = reminders or ReminderStore(Path(data_dir) / "reminders.json", clock=clock)
         self._notifier = notifier
@@ -113,6 +117,8 @@ class HubService:
         if not out.get("model_installed"):
             out["ok"] = False
         out["reminders_pending"] = len(self.reminders.pending())
+        out["brain"] = self.brain is not None
+        out["forge"] = self.forge is not None
         out["alerts_ready"] = bool(self._notifier is not None and self._notifier.configured())
         state = self._read_state()
         out["memory_files"] = state.get("memory_files", 0)
@@ -184,6 +190,69 @@ class HubService:
         if self._notifier is None:
             return 0
         return self.reminders.tick(self._notifier.send)
+
+    # --- /v1/brain (ADR 0021) ---------------------------------------------------
+
+    def _brain(self, method: str, body: Any) -> dict[str, Any]:
+        if self.brain is None:
+            raise HubError("the brain isn't running on this hub")
+        from nova.hub.brain_host import BrainError
+
+        try:
+            return getattr(self.brain, method)(body)
+        except BrainError as exc:
+            raise HubError(str(exc)) from None
+
+    def brain_start(self, body: Any) -> dict[str, Any]:
+        return self._brain("start", body)
+
+    def brain_send(self, body: Any) -> dict[str, Any]:
+        return self._brain("send", body)
+
+    def brain_close(self, body: Any) -> dict[str, Any]:
+        return self._brain("close", body)
+
+    # --- /v1/forge: NOVA upgrading itself (ADR 0021) ---------------------------------
+
+    def _need_forge(self) -> Any:
+        if self.forge is None:
+            raise HubError("upgrades aren't set up on this hub")
+        return self.forge
+
+    @staticmethod
+    def _job(job: Any) -> dict[str, Any]:
+        return {"id": job.id, "request": job.request, "status": job.status, "summary": job.summary[:600],
+                "detail": job.detail[:300], "files": job.files[:30], "issues": job.issues[:5]}
+
+    def forge_request(self, body: Any) -> dict[str, Any]:
+        forge = self._need_forge()
+        text = body.get("request") if isinstance(body, dict) else None
+        try:
+            job = forge.request(text)
+        except ValueError as exc:
+            raise HubError(str(exc)) from None
+        return {"ok": True, "id": job.id}
+
+    def forge_list(self, body: Any = None) -> dict[str, Any]:
+        return {"jobs": [self._job(j) for j in self._need_forge().jobs()[:10]]}
+
+    def forge_ready(self, body: Any = None) -> dict[str, Any]:
+        """The upgrade waiting for Manav: id, exact commit, request, files."""
+        return {"ready": self._need_forge().describe_ready()}
+
+    def forge_apply(self, body: Any) -> dict[str, Any]:
+        """Install exactly the upgrade Manav approved (id AND commit must match)."""
+        if not isinstance(body, dict) or not isinstance(body.get("id"), str) or not isinstance(body.get("commit"), str):
+            raise HubError('body must be {"id": "...", "commit": "..."}')
+        return self._need_forge().apply(body["id"], body["commit"])
+
+    def forge_discard(self, body: Any) -> dict[str, Any]:
+        forge = self._need_forge()
+        jid = body.get("id") if isinstance(body, dict) else None
+        if jid in (None, "", "latest"):
+            job = forge.latest(("ready", "failed", "blocked"))
+            jid = job.id if job else ""
+        return forge.discard(jid if isinstance(jid, str) else "")
 
     # --- /v1/memory -----------------------------------------------------------
 

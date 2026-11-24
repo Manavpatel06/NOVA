@@ -123,6 +123,7 @@ brain:
   # Manav's Max plan (no API key); api = Anthropic API key
   # (scripts\set_api_key.py); router = fixed commands only.
   mode: max              # max | api | router
+  where: auto            # auto | hub | laptop -- where the Claude conversation runs (ADR 0021)
   model: claude-haiku-5-5
   max_tokens: 600
   max_steps: 6

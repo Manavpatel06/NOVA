@@ -80,6 +80,19 @@ class Bark:
         _log.info("Bark push sent (%s)", "urgent" if reminder.get("urgent") else "normal")
         return True
 
+    def say(self, text: str) -> bool:
+        """A plain notification about NOVA itself (e.g. "upgrade ready")."""
+        if not self.configured():
+            return False
+        body = {"device_key": self.key(), "title": "NOVA", "body": str(text)[:300],
+                "group": "nova", "level": "timeSensitive"}
+        try:
+            self._egress.post_json(PUSH_URL, body, headers={}, timeout=10.0)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("Bark message failed (%s)", type(exc).__name__)
+            return False
+        return True
+
     def test(self) -> bool:
         """One plain notification, to check the key and the Bark app."""
         if not self.configured():

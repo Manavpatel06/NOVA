@@ -50,7 +50,7 @@ _OS_BANNED_ATTRS = {
     "spawnl", "spawnle", "spawnlp", "spawnlpe", "spawnv", "spawnve", "spawnvp", "spawnvpe",
 }
 _ASYNCIO_BANNED_ATTRS = {"create_subprocess_exec", "create_subprocess_shell"}
-PROCESS_ALLOWLIST = {"stt/gpu.py", "skills/open_app.py", "brain/claude_arm.py", "skills/add_app.py", "system/winops.py"}
+PROCESS_ALLOWLIST = {"stt/gpu.py", "skills/open_app.py", "brain/claude_arm.py", "skills/add_app.py", "system/winops.py", "hub/forge.py"}
 
 
 def _rel(path: Path) -> str:
@@ -135,7 +135,7 @@ def test_process_spawn_allowlist_is_exactly_four_named_files_today():
     which pin the exact argv shape rather than trusting the module
     docstring's claim. A change to this number must be a conscious edit to
     this test, not a silently-growing set."""
-    assert len(PROCESS_ALLOWLIST) == 5
+    assert len(PROCESS_ALLOWLIST) == 6  # hub/forge.py (ADR 0021): git, claude, pytest -- pinned below
     for rel in PROCESS_ALLOWLIST:
         assert (NOVA_ROOT / rel).is_file(), f"process-spawn allowlist entry {rel} does not exist"
 
@@ -407,3 +407,19 @@ def test_hub_listener_binds_loopback_only():
     src = (NOVA_ROOT / "hub/listener.py").read_text(encoding="utf-8")
     assert "ThreadingHTTPServer((BIND_HOST, port)" in src
     assert src.count("ThreadingHTTPServer(") == 1
+
+
+def test_forge_spawns_only_through_its_one_run_function_with_an_argv_list():
+    """hub/forge.py (ADR 0021) earns its spawn exemption the same way the
+    others do: exactly one subprocess call, an argv list, shell=False, and
+    no os.system/Popen anywhere."""
+    tree = _parse(NOVA_ROOT / "hub/forge.py")
+    calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+             and isinstance(n.func.value, ast.Name) and n.func.value.id == "subprocess"]
+    assert [c.func.attr for c in calls] == ["run"]
+    (call,) = calls
+    shell = {k.arg: k.value for k in call.keywords}.get("shell")
+    assert isinstance(shell, ast.Constant) and shell.value is False
+    assert isinstance(call.args[0], ast.Name) and call.args[0].id == "argv"
+    src = (NOVA_ROOT / "hub/forge.py").read_text(encoding="utf-8")
+    assert "Popen" not in src and "os.system" not in src and "shell=True" not in src
