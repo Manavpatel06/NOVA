@@ -126,8 +126,15 @@ def _talk(config, egress: Egress, audit: AuditLog, devices=None, face=None, conn
     missing = voice.missing()
     if missing:
         _log.warning("Talk page is text-only until `nova-hub voice` installs: %s", ", ".join(missing))
+    from nova.hub import hub_skills
+
+    local = {"apply_upgrade": hub_apply_upgrade(devices, _restart_soon)}
+    holder: dict = {}
+    local.update(hub_skills.make(connectors=connectors, devices=devices, restart=_restart_soon,
+                                 spend=lambda: getattr(holder.get("a"), "spend", None)))
     assistant = HubAssistant(config, audit=audit, egress=egress, devices=devices, connectors=connectors,
-                             local_skills={"apply_upgrade": hub_apply_upgrade(devices, _restart_soon)})
+                             local_skills=local)
+    holder["a"] = assistant
     judge = None
     if config.hub.conversation_s > 0:
         from nova.hub.conversation import Judge

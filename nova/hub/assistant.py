@@ -107,6 +107,8 @@ class HubAssistant:
                 out[name] = spec
             elif self.devices is not None and name not in NOT_REMOTE:
                 out[name] = self._proxy(spec)
+        for name, spec in self._extra.items():   # hub-only skills (hub_status, restart_nova)
+            out.setdefault(name, spec)
         if self.connectors is not None:
             try:
                 apps = self.connectors.skills()

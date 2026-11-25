@@ -219,6 +219,37 @@ def open_url(url: str) -> None:
     os.startfile(ok)  # noqa: S606 -- validated https URL only
 
 
+#: never opened by open_file: anything that runs code instead of showing a document
+RUNNABLE = frozenset("""exe com bat cmd ps1 psm1 psd1 vbs vbe js jse wsf wsh msi msp mst scr pif cpl hta jar
+reg lnk url scf inf sys dll ocx application appref-ms gadget msc ws ps2 ps2xml psc1 psc2 vb sct shb
+xll xlam ppam docm dotm xlsm xltm pptm potm ppsm sldm iso img vhd vhdx""".split())
+
+
+def open_document(path: str, roots: "list[str]") -> str:
+    """Open a document or folder Manav asked for (open_file skill): resolved
+    with realpath at call time, inside one of `roots`, never a program,
+    script, shortcut or macro file, never a network path. Returns the path."""
+    _require_windows()
+    if path.startswith(("\\\\", "//")) or "://" in path:
+        raise ValueError("refusing a network path")
+    real = os.path.realpath(path)
+    if not os.path.exists(real):
+        raise FileNotFoundError(real)
+    if not any(_inside(real, os.path.realpath(r)) for r in roots):
+        raise ValueError("outside your folders")
+    if os.path.isfile(real) and os.path.splitext(real)[1].lower().lstrip(".") in RUNNABLE:
+        raise ValueError("that's a program or script, not a document")
+    os.startfile(real)  # noqa: S606 -- realpath-checked document or folder inside Manav's folders
+    return real
+
+
+def _inside(path: str, root: str) -> bool:
+    try:
+        return os.path.commonpath([os.path.normcase(path), os.path.normcase(root)]) == os.path.normcase(root)
+    except ValueError:  # different drives
+        return False
+
+
 #: spoken browser name -> its executable, looked up in the Windows
 #: "App Paths" registry (where installers register them).
 BROWSERS = {
