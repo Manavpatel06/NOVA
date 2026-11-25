@@ -245,8 +245,13 @@ def test_addressed_speech_runs_as_voice_not_as_a_button_press():
     assert out["say"].startswith("did: what time is it") and "VOICE" in out["say"]
 
 
+class _EchoNoConversation(_Echo):
+    import dataclasses as _dc
+    config = _dc.replace(Config(), hub=_dc.replace(Config().hub, conversation_s=0.0))
+
+
 def test_a_bare_name_opens_a_short_follow_up():
-    talk = Talk(_Echo())
+    talk = Talk(_EchoNoConversation())   # conversation mode off: exactly one sentence (ADR 0029 covers "on")
     assert talk.hear_text("laptop", "Nova.", want_audio=False)["say"] == "Yes?"
     assert talk.hear_text("laptop", "open spotify", want_audio=False)["say"].startswith("did: open spotify")
     assert talk.hear_text("laptop", "and close it", want_audio=False) == {"ignored": True}  # only one

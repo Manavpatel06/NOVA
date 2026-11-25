@@ -113,7 +113,12 @@ def _talk(config, egress: Egress, audit: AuditLog, devices=None, face=None):
         _log.warning("Talk page is text-only until `nova-hub voice` installs: %s", ", ".join(missing))
     assistant = HubAssistant(config, audit=audit, egress=egress, devices=devices,
                              local_skills={"apply_upgrade": hub_apply_upgrade(devices, _restart_soon)})
-    talk = Talk(assistant, voice, face)
+    judge = None
+    if config.hub.conversation_s > 0:
+        from nova.hub.conversation import Judge
+
+        judge = Judge(config, egress, spend=lambda: getattr(assistant, "spend", None))
+    talk = Talk(assistant, voice, face, judge)
     talk.warm_up()
     return talk
 

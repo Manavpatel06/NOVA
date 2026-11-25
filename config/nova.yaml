@@ -185,3 +185,6 @@ hub:
   # docs/decisions/0026: think with the monthly API credit first (key set
   # with `nova-hub apikey`), the Max plan after brain.api_budget_usd
   brain: api_first
+  # docs/decisions/0029: after "Nova, ..." keep talking without the name
+  # until this many quiet seconds; Claude judges unclear sentences. 0 = off
+  conversation_s: 60.0

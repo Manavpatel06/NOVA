@@ -29,6 +29,7 @@ class Face:
         self._said = ""
         self._source = ""
         self._seq = 0
+        self._open_until = 0.0   # conversation mode (ADR 0029): still listening without the name
         self.devices: Any = None
 
     def _set(self, mode: str, **fields: Any) -> None:
@@ -49,6 +50,13 @@ class Face:
         secs = seconds if seconds is not None else max(1.5, len(said) / SAY_RATE)
         self._set("speaking", said=said, until=self._clock() + min(secs, 120))
 
+    def conversation(self, seconds: float) -> None:
+        """A conversation is open for this long: between replies the face
+        shows it's still listening. 0 closes it."""
+        with self._lock:
+            self._open_until = self._clock() + seconds if seconds > 0 else 0.0
+            self._seq += 1
+
     def idle(self) -> None:
         self._set("idle", until=0.0)
 
@@ -56,6 +64,8 @@ class Face:
         now = self._clock()
         with self._lock:
             mode = self._mode if (self._mode == "idle" or now < self._until) else "idle"
+            if mode == "idle" and now < self._open_until:
+                mode = "listening"
             out = {"mode": mode, "heard": self._heard, "said": self._said, "source": self._source,
                    "seq": self._seq}
         devices = self.devices

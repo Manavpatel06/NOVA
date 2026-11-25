@@ -80,6 +80,10 @@ class _Session:
         self.task: asyncio.Task | None = None
         self.used = time.monotonic()
         self.follow_until = 0.0
+        # conversation mode (ADR 0029): open until, when NOVA last spoke, the last few lines
+        self.convo_until = 0.0
+        self.replied_at = 0.0
+        self.recent: list[tuple[str, str]] = []
 
 
 class _PageChannel:
@@ -105,10 +109,12 @@ class _PageChannel:
 
 
 class Talk:
-    def __init__(self, assistant: Any, voice: Any | None = None, face: Any | None = None) -> None:
+    def __init__(self, assistant: Any, voice: Any | None = None, face: Any | None = None,
+                 judge: Any | None = None) -> None:
         self.assistant = assistant
         self.voice = voice
         self.face = face   # nova.hub.face.Face: the hub screen's live NOVA
+        self.judge = judge  # nova.hub.conversation.Judge: unclear sentences in a conversation
         self._sessions: dict[str, _Session] = {}
         self._speech: dict[str, dict[str, Any]] = {}
         self._guard = threading.Lock()
@@ -161,7 +167,8 @@ class Talk:
     def hear(self, body: Any) -> dict[str, Any]:
         """One sentence from a device's always-open mic (the laptop through
         NOVA Link, or the hub's own). Acted on only when it starts with
-        NOVA's name, answers NOVA's question, or follows a bare "Nova".
+        NOVA's name, answers NOVA's question, follows a bare "Nova", or comes
+        in an open conversation and is judged to be for NOVA (ADR 0029).
         Anything else is dropped: {"ignored": true}, its words never logged
         or returned."""
         from nova.hub.devices import DEVICE_RE
@@ -177,6 +184,7 @@ class Talk:
 
     def hear_text(self, device: str, heard: str, *, want_audio: Any = True) -> dict[str, Any]:
         from nova.brain.address import strip_address
+        from nova.hub.conversation import is_closer
         from nova.security.tiers import ArmedBy
 
         session = self._session(f"device-{device}")
@@ -188,23 +196,84 @@ class Talk:
         else:
             if session.task is not None and not session.task.done():
                 return {"ignored": True}  # mid-turn chatter is not a new command
-            cfg = getattr(self.assistant, "config", None)
-            names = list(cfg.wake.names) if cfg is not None else ["nova"]
+            if not heard:
+                return {"ignored": True}
+            names = self._names()
             command = strip_address(heard, names)
-            if time.monotonic() < session.follow_until:
-                session.follow_until = 0.0
-                command = heard if command is None else command
-            if command is None or not heard:
+            now = time.monotonic()
+            if command is None and now < session.follow_until:
+                command = heard
+            elif command is None and now < session.convo_until:
+                if is_closer(heard, names):
+                    return self._close(session, heard, want_audio)
+                if self._for_nova(session, heard, now):
+                    command = heard
+            session.follow_until = 0.0
+            if command is None:
                 return {"ignored": True}
             if command == "":
                 session.follow_until = time.monotonic() + FOLLOW_UP_S
                 return self._out("", "Yes?", awaiting=True, want_audio=want_audio)
+            if session.convo_until and is_closer(command, names):
+                return self._close(session, heard, want_audio)
             channel = _PageChannel(session, name=f"your {device}", armed_by=ArmedBy.VOICE)
             self._face("thinking", f"your {device}", command)
             asyncio.run_coroutine_threadsafe(self._start(session, command, channel), self._loop).result(5)
             heard = command
         kind, words = asyncio.run_coroutine_threadsafe(self._next(session), self._loop).result(REPLY_WAIT_S + 5)
+        self._converse(session, heard, words)
         return self._out(heard, words, awaiting=kind == "ask", want_audio=want_audio)
+
+    # --- conversation mode (ADR 0029) -----------------------------------------
+
+    def _names(self) -> list[str]:
+        cfg = getattr(self.assistant, "config", None)
+        return list(cfg.wake.names) if cfg is not None else ["nova"]
+
+    def _open_s(self) -> float:
+        cfg = getattr(self.assistant, "config", None)
+        return float(getattr(getattr(cfg, "hub", None), "conversation_s", 0.0) or 0.0)
+
+    def _for_nova(self, session: _Session, heard: str, now: float) -> bool:
+        """A sentence without the name, in an open conversation: for NOVA?
+        Clear cases are decided here; unclear ones by the judge. If the judge
+        can't be asked, it isn't for NOVA."""
+        from nova.hub.conversation import quick_verdict
+
+        verdict = quick_verdict(heard, now - session.replied_at)
+        if verdict is None and self.judge is not None:
+            try:
+                verdict = self.judge.decide(heard, list(session.recent))
+            except Exception as exc:  # noqa: BLE001 -- never break the mic over a judgement
+                _log.warning("conversation judge failed (%s)", type(exc).__name__)
+                verdict = None
+        return verdict is True
+
+    def _converse(self, session: _Session, heard: str, words: str) -> None:
+        """NOVA just answered: the conversation stays open OPEN_S from now."""
+        open_s = self._open_s()
+        if open_s <= 0:
+            return
+        from nova.hub.conversation import RECENT
+
+        session.recent = (session.recent + [("Manav", heard), ("NOVA", words)])[-RECENT:]
+        session.replied_at = time.monotonic()
+        session.convo_until = session.replied_at + open_s
+        if self.face is not None and hasattr(self.face, "conversation"):
+            try:
+                self.face.conversation(open_s)
+            except Exception:  # noqa: BLE001
+                pass
+
+    def _close(self, session: _Session, heard: str, want_audio: Any) -> dict[str, Any]:
+        session.convo_until = session.replied_at = 0.0
+        session.recent = []
+        if self.face is not None and hasattr(self.face, "conversation"):
+            try:
+                self.face.conversation(0)
+            except Exception:  # noqa: BLE001
+                pass
+        return self._out(heard, "Anytime.", awaiting=False, want_audio=want_audio)
 
     def _heard(self, body: dict) -> str:
         if isinstance(body.get("text"), str):

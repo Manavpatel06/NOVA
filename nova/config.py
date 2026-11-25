@@ -550,6 +550,11 @@ class HubConfig:
     #: monthly API credit while under brain.api_budget_usd (and a key is set
     #: with `nova-hub apikey`), else the Max plan; "max" = Max plan only
     brain: str = "api_first"
+    #: conversation mode on the always-open mics (ADR 0029): after "Nova, ...",
+    #: sentences need no name until this many seconds pass with nothing for
+    #: NOVA; unclear ones are judged by Claude on the API credit. 0 = off
+    #: (every sentence needs the name, as before).
+    conversation_s: float = field(default=60.0, metadata={"bounds": Bounds(lo=0.0, hi=600.0)})
 
 
 @dataclass(frozen=True)
