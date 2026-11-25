@@ -17,6 +17,7 @@
 #   nova-hub ears on|off   the hub's own mic + speaker: say "Nova, ..." in the room
 #   nova-hub phone     give NOVA a real phone number (Twilio): call it, or it calls you
 #   nova-hub apikey    use your monthly Claude API credit first (faster), Max plan after
+#   nova-hub face on|off   NOVA's live face full-screen on this laptop's display, screen kept awake
 set -uo pipefail
 
 NOVA_DIR="${NOVA_DIR:-$HOME/NOVA}"
@@ -404,6 +405,74 @@ cmd_apikey() {
   good "NOVA on the hub now thinks with your API credit first"
 }
 
+FACE_URL="http://127.0.0.1:$PORT/face"
+FACE_AUTOSTART="$HOME/.config/autostart/nova-face.desktop"
+
+face_browser() {
+  # its own profile, so it never fights a Firefox window you open yourself
+  local profile
+  if [[ -d "$HOME/snap/firefox" ]]; then profile="$HOME/snap/firefox/common/nova-face"; else profile="$HOME/.nova-face"; fi
+  mkdir -p "$profile"
+  if command -v firefox >/dev/null 2>&1; then
+    echo "firefox --new-instance --profile $profile --kiosk $FACE_URL"
+  elif command -v chromium >/dev/null 2>&1; then
+    echo "chromium --kiosk --noerrdialogs --disable-session-crashed-bubble --user-data-dir=$profile $FACE_URL"
+  fi
+}
+
+cmd_face() {
+  # ADR 0028: NOVA's face on the hub's own screen, kept awake (lid open).
+  case "${1:-}" in
+    on)
+      say "NOVA's face on this screen"
+      if [[ -z "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
+        bad "run this in a terminal on the hub's own desktop (not over SSH)"; return 1
+      fi
+      local launch; launch=$(face_browser)
+      [[ -n "$launch" ]] || { bad "no browser found -- install Firefox: sudo snap install firefox"; return 1; }
+      mkdir -p "$(dirname "$FACE_AUTOSTART")"
+      cat > "$FACE_AUTOSTART" <<DESK
+[Desktop Entry]
+Type=Application
+Name=NOVA face
+Comment=NOVA live on this screen
+Exec=sh -c "sleep 8; $launch"
+X-GNOME-Autostart-enabled=true
+DESK
+      good "opens by itself whenever you sign in"
+      gsettings set org.gnome.desktop.session idle-delay 0 2>/dev/null
+      gsettings set org.gnome.settings-daemon.plugins.power idle-dim false 2>/dev/null
+      gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing' 2>/dev/null
+      gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-battery-type 'nothing' 2>/dev/null
+      good "screen stays on (no blanking, dimming or sleep)"
+      local answer
+      read -rp "   After a restart, sign in automatically so NOVA's face comes back by itself? Anyone who opens the hub then sees your desktop. (y/n) " answer
+      if [[ "$answer" =~ ^[Yy] ]]; then
+        local conf=/etc/gdm3/custom.conf
+        sudo cp -n "$conf" "$conf.before-nova" 2>/dev/null
+        sudo sed -i -e '/^\s*#\?\s*AutomaticLoginEnable\s*=/d' -e '/^\s*#\?\s*AutomaticLogin\s*=/d' "$conf"
+        sudo sed -i "/^\[daemon\]/a AutomaticLoginEnable=true\nAutomaticLogin=$USER" "$conf"
+        good "signs in automatically after a restart"
+      else
+        note "after a restart, sign in once and the face opens"
+      fi
+      nohup sh -c "$launch" >/dev/null 2>&1 &
+      good "NOVA's face is up (Alt+F4 closes it; nova-hub face on opens it again)"
+      ;;
+    off)
+      rm -f "$FACE_AUTOSTART"
+      pkill -f "nova-face" 2>/dev/null || true
+      gsettings set org.gnome.desktop.session idle-delay 300 2>/dev/null
+      gsettings set org.gnome.settings-daemon.plugins.power idle-dim true 2>/dev/null
+      if grep -q '^AutomaticLoginEnable=true' /etc/gdm3/custom.conf 2>/dev/null; then
+        sudo sed -i -e '/^AutomaticLoginEnable=true/d' -e "/^AutomaticLogin=$USER/d" /etc/gdm3/custom.conf
+      fi
+      good "face off; the screen sleeps normally again"
+      ;;
+    *) echo "usage: nova-hub face on|off" ;;
+  esac
+}
+
 cmd_logs() {
   journalctl --user -u nova-hub -n "${1:-60}" --no-pager
 }
@@ -435,5 +504,6 @@ case "${1:-status}" in
   ears)   shift; cmd_ears "$@" ;;
   phone)  cmd_phone ;;
   apikey) cmd_apikey ;;
-  *) sed -n '2,20p' "$0"; exit 1 ;;
+  face)   shift; cmd_face "$@" ;;
+  *) sed -n '2,21p' "$0"; exit 1 ;;
 esac

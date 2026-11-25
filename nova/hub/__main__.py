@@ -97,7 +97,7 @@ def _restart_soon(delay_s: float = 15.0) -> None:
     threading.Timer(delay_s, go).start()
 
 
-def _talk(config, egress: Egress, audit: AuditLog, devices=None):
+def _talk(config, egress: Egress, audit: AuditLog, devices=None, face=None):
     """NOVA itself, on the hub (ADR 0023/0024): the assistant behind the talk
     page, the laptop link and the hub's own mic."""
     if not config.hub.assistant:
@@ -113,7 +113,7 @@ def _talk(config, egress: Egress, audit: AuditLog, devices=None):
         _log.warning("Talk page is text-only until `nova-hub voice` installs: %s", ", ".join(missing))
     assistant = HubAssistant(config, audit=audit, egress=egress, devices=devices,
                              local_skills={"apply_upgrade": hub_apply_upgrade(devices, _restart_soon)})
-    talk = Talk(assistant, voice)
+    talk = Talk(assistant, voice, face)
     talk.warm_up()
     return talk
 
@@ -135,7 +135,8 @@ def _hub_ears(config, talk) -> None:
         return talk.hear({"device": "hub", "audio": base64.b64encode(pcm16).decode("ascii")})
 
     ears = Ears(send, silence_ms=config.wake.vad_silence_ms, max_ms=config.wake.max_utterance_ms,
-                min_speech_ms=config.wake.min_speech_ms)
+                min_speech_ms=config.wake.min_speech_ms,
+                more=lambda sid, part: talk.more({"id": sid, "part": part}))
     threading.Thread(target=ears.run, args=(threading.Event(),), name="hub-ears", daemon=True).start()
 
 
@@ -218,15 +219,25 @@ def serve(config) -> int:
     bark = _bark(config, egress)
     from nova.hub.devices import Devices
 
+    from nova.hub.face import Face
+
     devices = Devices() if config.hub.assistant else None
-    talk = _talk(config, egress, audit, devices)
+    face = Face()
+    face.devices = devices
+    talk = _talk(config, egress, audit, devices, face)
     phone = None
     if talk is not None:
         from nova.hub.phone import Phone
 
         phone = Phone(talk, data_dir=DATA_DIR, hub_name=_hub_name, egress=egress)
+    from nova.hub.builder import Builder
+
+    # projects land in the shared drive (\\nova-hub\nova\Projects = H:\Projects)
+    builder = Builder(projects=Path.home() / "Shared" / "Projects", state=DATA_DIR / "builds.json",
+                      notify=bark.say, egress=egress)
+    builder.recover()
     service = HubService(model=model, data_dir=DATA_DIR, notifier=bark, brain=_brain(config, egress, audit),
-                         forge=_forge(egress, bark.say), talk=talk, devices=devices, phone=phone)
+                         forge=_forge(egress, bark.say), talk=talk, devices=devices, phone=phone, builder=builder, face=face)
     _hub_ears(config, talk)
     if service.talk is not None:
         from nova.brain.hub_tier import use_local_service

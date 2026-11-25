@@ -55,10 +55,13 @@ class HubService:
         "/v1/forge/apply": "forge_apply",
         "/v1/forge/discard": "forge_discard",
         "/v1/talk": "talk_turn",
+        "/v1/talk/more": "talk_more",
         "/v1/link/poll": "link_poll",
         "/v1/link/result": "link_result",
         "/v1/link/hear": "link_hear",
         "/v1/phone/call": "phone_call",
+        "/v1/build/start": "build_start",
+        "/v1/build/list": "build_list",
     }
 
     def __init__(
@@ -75,8 +78,12 @@ class HubService:
         talk: Any = None,
         devices: Any = None,
         phone: Any = None,
+        builder: Any = None,
+        face: Any = None,
     ) -> None:
+        self.face = face
         self.phone = phone
+        self.builder = builder
         self.brain = brain
         self.forge = forge
         self.talk = talk
@@ -97,6 +104,12 @@ class HubService:
         if name is None:
             raise HubError(f"no such call: {path}")
         return getattr(self, name)(body)
+
+    def talk_more(self, body: Any) -> dict[str, Any]:
+        """The next piece of a long reply's speech."""
+        if self.talk is None:
+            raise HubError("NOVA isn't running on the hub (see nova-hub logs)")
+        return self.talk.more(body)
 
     def talk_turn(self, body: Any) -> dict[str, Any]:
         """One thing said on the talk page (ADR 0023)."""
@@ -133,6 +146,31 @@ class HubService:
         if self.talk is None:
             raise HubError("NOVA isn't running on the hub (see nova-hub logs)")
         return self.talk.hear(body)
+
+    def face_state(self) -> dict[str, Any]:
+        """What NOVA's face on the hub's screen shows (ADR 0028)."""
+        if self.face is None:
+            return {"mode": "idle", "heard": "", "said": "", "source": "", "seq": 0, "laptop": False}
+        return self.face.state()
+
+    # --- building with Claude Code (ADR 0027) ---------------------------------------
+
+    def build_start(self, body: Any) -> dict[str, Any]:
+        if self.builder is None:
+            raise HubError("building isn't set up on the hub")
+        if not isinstance(body, dict):
+            raise HubError("body must be a JSON object")
+        name = body.get("name") if isinstance(body.get("name"), str) else ""
+        try:
+            return self.builder.start(body.get("request"), name)
+        except ValueError as exc:
+            raise HubError(str(exc)) from None
+
+    def build_list(self, body: Any = None) -> dict[str, Any]:
+        if self.builder is None:
+            return {"builds": []}
+        return {"builds": [{"project": b["slug"], "status": b["status"], "summary": b["summary"][:400],
+                            "request": b["request"][:200]} for b in self.builder.list()]}
 
     # --- phone calls (ADR 0025) -------------------------------------------------
 

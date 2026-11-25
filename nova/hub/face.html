@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NOVA</title>
+<style>
+:root { --ink:#0D171C; --ink2:#15232A; --line:#2A3F48; --text:#E6EEF0; --dim:#8FA3AB; --teal:#4AC8B8; --star:#FFD282; --muted:#5B6B72; }
+* { box-sizing:border-box; }
+html, body { margin:0; height:100%; background:var(--ink); color:var(--text); overflow:hidden; cursor:none;
+  font:18px/1.45 "Ubuntu", "Segoe UI", system-ui, sans-serif; }
+#stage { position:fixed; inset:0; }
+canvas { position:absolute; inset:0; width:100%; height:100%; }
+#top { position:absolute; top:22px; left:32px; right:32px; display:flex; justify-content:space-between; align-items:baseline; color:var(--dim); }
+#clock { font-size:44px; color:var(--text); font-weight:300; letter-spacing:.02em; }
+#date { font-size:18px; margin-left:12px; }
+#name { letter-spacing:.35em; font-size:16px; color:var(--dim); }
+#status { position:absolute; left:0; right:0; text-align:center; font-size:17px; letter-spacing:.25em; text-transform:uppercase; color:var(--dim); }
+#talk { position:absolute; left:8%; right:8%; text-align:center; }
+#heard { color:var(--dim); font-size:22px; min-height:1.5em; transition:opacity .6s; }
+#said { color:var(--text); font-size:clamp(20px, 3.6vh, 32px); line-height:1.35; margin-top:8px; overflow:hidden; transition:opacity .6s; }
+#devices { position:absolute; bottom:18px; right:32px; color:var(--dim); font-size:14px; }
+.dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--muted); margin-right:6px; vertical-align:middle; }
+.dot.on { background:var(--teal); }
+</style>
+</head>
+<body>
+<div id="stage">
+  <canvas id="orb"></canvas>
+  <div id="top"><div><span id="clock"></span><span id="date"></span></div><div id="name">NOVA</div></div>
+  <div id="status">ready</div>
+  <div id="talk"><div id="heard"></div><div id="said"></div></div>
+  <div id="devices"><span class="dot" id="laptopdot"></span>laptop</div>
+</div>
+<script nonce="__NONCE__">
+(() => {
+  const C = { teal: "#4AC8B8", star: "#FFD282", starHi: "#FFF0D2", line: "#2A3F48", muted: "#5B6B72" };
+  const canvas = document.getElementById("orb"), g = canvas.getContext("2d");
+  const talkEl = document.getElementById("talk"), statusEl = document.getElementById("status"), heardEl = document.getElementById("heard"), saidEl = document.getElementById("said");
+  const clockEl = document.getElementById("clock"), dateEl = document.getElementById("date"), dot = document.getElementById("laptopdot");
+  let state = { mode: "idle", heard: "", said: "", seq: -1, laptop: false, source: "" };
+  let lastChange = performance.now(), offline = false;
+  const LABEL = { idle: "ready", listening: "listening", thinking: "thinking", speaking: "speaking" };
+
+  function resize() {
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = innerWidth * dpr; canvas.height = innerHeight * dpr; g.setTransform(dpr, 0, 0, dpr, 0, 0);
+  }
+  addEventListener("resize", resize); resize();
+
+  function starPath(cx, cy, long, short) {
+    g.beginPath();
+    for (let k = 0; k < 8; k++) {
+      const ang = Math.PI / 4 * k, r = k % 2 === 0 ? long : short;
+      const x = cx + r * Math.sin(ang), y = cy - r * Math.cos(ang);
+      k === 0 ? g.moveTo(x, y) : g.lineTo(x, y);
+    }
+    g.closePath();
+  }
+  function arc(cx, cy, r, startDeg, extentDeg, color, width) {
+    g.beginPath(); g.strokeStyle = color; g.lineWidth = width; g.lineCap = "round";
+    g.arc(cx, cy, r, (startDeg - 90) * Math.PI / 180, (startDeg - 90 + extentDeg) * Math.PI / 180); g.stroke();
+  }
+
+  function draw(now) {
+    const t = now / 1000, w = innerWidth, h = innerHeight;
+    // the whole figure drifts very slowly so an always-on screen never holds one image
+    const base = Math.min(w / 6, h / 8.5);
+    const cx = w / 2 + Math.sin(t / 47) * w * 0.03, cy = h * 0.11 + base * 2.1 + Math.cos(t / 59) * h * 0.012;
+    g.clearRect(0, 0, w, h);
+    const mode = offline ? "offline" : state.mode;
+    let color = C.teal, pulse, scale = 1, glow = 0.18;
+    if (mode === "listening") { pulse = (Math.sin(t * 6) + 1) / 2; glow = 0.28; }
+    else if (mode === "thinking") { color = C.star; pulse = 0.5; scale = 0.95; glow = 0.22; }
+    else if (mode === "speaking") { pulse = (Math.sin(t * 9) + 1) / 2; scale = 1 + 0.08 * Math.sin(t * 9); glow = 0.35; }
+    else if (mode === "offline") { color = C.muted; pulse = 0; scale = 0.85; glow = 0.05; }
+    else { pulse = (Math.sin(t * 1.4) + 1) / 4; scale = 0.95; }
+
+    const grad = g.createRadialGradient(cx, cy, 0, cx, cy, base * 2.6);
+    grad.addColorStop(0, `rgba(74,200,184,${glow})`); grad.addColorStop(1, "rgba(74,200,184,0)");
+    g.fillStyle = grad; g.fillRect(0, 0, w, h);
+
+    [1.42, 1.95].forEach((k, i) => {
+      const r = base * k + (i === 1 ? 10 : 5) * pulse;
+      const c = (i === 0 || mode === "listening" || mode === "speaking") ? color : C.line;
+      arc(cx, cy, r, 40, 100, c, i === 0 ? 7 : 5);
+      arc(cx, cy, r, 220, 100, c, i === 0 ? 7 : 5);
+    });
+    if (mode === "thinking") arc(cx, cy, base * 2.35, (t * 240) % 360, 70, C.star, 4);
+    if (mode === "speaking") {  // ripples outward while NOVA talks
+      for (let i = 0; i < 3; i++) {
+        const p = ((t * 0.9) + i / 3) % 1;
+        g.beginPath(); g.strokeStyle = `rgba(74,200,184,${0.35 * (1 - p)})`; g.lineWidth = 2;
+        g.arc(cx, cy, base * (1.2 + p * 1.6), 0, Math.PI * 2); g.stroke();
+      }
+    }
+    const s = base * scale;
+    starPath(cx, cy, s, s * 0.29); g.fillStyle = mode === "offline" ? C.muted : C.star; g.fill();
+    starPath(cx, cy, s * 0.5, s * 0.17); g.fillStyle = mode === "offline" ? "#8FA3AB" : C.starHi; g.fill();
+
+    const below = cy + base * 2.1;
+    statusEl.style.top = below + "px";
+    talkEl.style.top = (below + 34) + "px";
+    talkEl.style.bottom = "44px";
+    requestAnimationFrame(draw);
+  }
+  requestAnimationFrame(draw);
+
+  function tickClock() {
+    const d = new Date();
+    clockEl.textContent = d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+    dateEl.textContent = d.toLocaleDateString([], { weekday: "long", month: "long", day: "numeric" });
+  }
+  setInterval(tickClock, 1000); tickClock();
+
+  async function poll() {
+    try {
+      const r = await fetch("/v1/face/state", { cache: "no-store" });
+      if (!r.ok) throw new Error("bad");
+      const s = await r.json();
+      offline = false;
+      if (s.seq !== state.seq) lastChange = performance.now();
+      state = s;
+      statusEl.textContent = LABEL[s.mode] + (s.mode !== "idle" && s.source ? " · " + s.source : "");
+      heardEl.textContent = s.heard ? "“" + s.heard + "”" : "";
+      saidEl.textContent = s.said || "";
+      // the conversation fades after a few quiet minutes; the clock and star stay
+      const quiet = s.mode === "idle" && performance.now() - lastChange > 180000;
+      heardEl.style.opacity = saidEl.style.opacity = quiet ? 0 : 1;
+      dot.classList.toggle("on", !!s.laptop);
+    } catch (e) {
+      offline = true; statusEl.textContent = "reconnecting";
+    }
+    setTimeout(poll, 300);
+  }
+  poll();
+})();
+</script>
+</body>
+</html>

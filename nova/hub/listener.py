@@ -42,6 +42,7 @@ FUNNEL_HEADER = "Tailscale-Funnel-Request"
 PHONE_ROUTE = re.compile(r"/v1/phone/(voice|pin|heard|wait|status)(?:\?([A-Za-z0-9=_&-]{0,80}))?")
 MAX_FORM = 16_000
 TALK_PAGE = Path(__file__).with_name("talk.html")
+FACE_PAGE = Path(__file__).with_name("face.html")
 MAX_BODY = 6_000_000
 OWNER_HEADER = "Tailscale-User-Login"
 
@@ -120,9 +121,15 @@ def make_server(service: HubService, port: int) -> ThreadingHTTPServer:
             self.end_headers()
             self.wfile.write(data)
 
-        def _send_talk_page(self) -> None:
+        def _hub_screen(self) -> bool:
+            """The hub's own browser (the face on its screen): loopback by
+            address, never through Tailscale (which always names a user)."""
+            return (self.headers.get(OWNER_HEADER) is None and self.headers.get(FUNNEL_HEADER) is None
+                    and (self.headers.get("host") or "").strip().lower() == f"127.0.0.1:{port_bound}")
+
+        def _send_talk_page(self, page: Path = TALK_PAGE) -> None:
             nonce = secrets.token_urlsafe(18)
-            data = TALK_PAGE.read_text(encoding="utf-8").replace("__NONCE__", nonce).encode("utf-8")
+            data = page.read_text(encoding="utf-8").replace("__NONCE__", nonce).encode("utf-8")
             self.send_response(HTTPStatus.OK)
             self.send_header("content-type", "text/html; charset=utf-8")
             self.send_header("content-length", str(len(data)))
@@ -144,6 +151,16 @@ def make_server(service: HubService, port: int) -> ThreadingHTTPServer:
             if self.path in ("/talk", "/"):
                 if self._owner_only():
                     self._send_talk_page()
+                return
+            if self.path in ("/face", "/v1/face/state"):
+                if self._cross_site():
+                    self._send(HTTPStatus.FORBIDDEN, {"error": "cross-site requests are not allowed"})
+                elif not (self._hub_screen() or self._is_owner()):
+                    self._send(HTTPStatus.FORBIDDEN, {"error": "only the hub's screen or its owner"})
+                elif self.path == "/face":
+                    self._send_talk_page(FACE_PAGE)
+                else:
+                    self._send(HTTPStatus.OK, service.face_state())
                 return
             ack = re.fullmatch(r"/v1/ack/([0-9a-f]{8})\?t=([A-Za-z0-9_-]{8,40})", self.path)
             if ack:

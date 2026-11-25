@@ -56,8 +56,10 @@ class Ears:
         max_ms: int = 15000,
         min_speech_ms: int = 300,
         play: Callable[[bytes], None] | None = None,
+        more: Callable[[str, int], dict] | None = None,
     ) -> None:
         self._send = send
+        self._more = more
         self._listening = listening
         self._seg_args = dict(silence_ms=silence_ms, max_ms=max_ms, min_speech_ms=min_speech_ms)
         self._play = play or play_wav
@@ -131,13 +133,40 @@ class Ears:
         if not isinstance(out, dict) or out.get("ignored"):
             return out if isinstance(out, dict) else {}
         audio = out.get("audio")
-        if isinstance(audio, str) and audio:
-            try:
-                self._play(base64.b64decode(audio))
-            except Exception as exc:  # noqa: BLE001
-                _log.warning("Couldn't play NOVA's reply (%s)", type(exc).__name__)
-            finally:
-                self._deaf_until = time.monotonic() + AFTER_SPEECH_S
+        if not (isinstance(audio, str) and audio):
+            return out
+        # a long reply comes in pieces: fetch the next while this one plays
+        pieces: "queue.Queue[bytes | None]" = queue.Queue()
+        pieces.put(base64.b64decode(audio))
+        rest = out.get("parts") if isinstance(out.get("parts"), int) else 0
+        if self._more is not None and isinstance(out.get("more"), str) and rest > 0:
+            def fetch() -> None:
+                for i in range(min(rest, 50)):
+                    try:
+                        got = self._more(out["more"], i)
+                        pieces.put(base64.b64decode(got.get("audio") or ""))
+                    except Exception as exc:  # noqa: BLE001
+                        _log.warning("Couldn't get the rest of NOVA's reply (%s)", type(exc).__name__)
+                        break
+                pieces.put(None)
+
+            threading.Thread(target=fetch, name="ears-more", daemon=True).start()
+        else:
+            pieces.put(None)
+        try:
+            while True:
+                try:
+                    data = pieces.get(timeout=40)
+                except queue.Empty:
+                    break
+                if data is None:
+                    break
+                if data:
+                    self._play(data)
+        except Exception as exc:  # noqa: BLE001
+            _log.warning("Couldn't play NOVA's reply (%s)", type(exc).__name__)
+        finally:
+            self._deaf_until = time.monotonic() + AFTER_SPEECH_S
         return out
 
 

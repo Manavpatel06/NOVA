@@ -16,6 +16,7 @@ import asyncio
 import base64
 import binascii
 import re
+import secrets
 import threading
 import time
 from typing import Any
@@ -30,6 +31,43 @@ MAX_TEXT = 1000
 ANSWER_WAIT_S = 90.0     # how long an approval question waits for an answer
 REPLY_WAIT_S = 170.0     # how long one request waits for NOVA's next words
 MAX_SESSIONS = 8
+SPEECH_KEEP_S = 180.0    # pieces of a long reply's speech are kept this long
+SPEECH_WAIT_S = 30.0
+MAX_SPEECH_JOBS = 16
+PIECE_MIN = 60           # merge shorter sentences into the next piece
+PIECE_MAX = 200
+
+
+def split_speech(text: str) -> list[str]:
+    """Sentences, merged into pieces of a speakable size. The first piece is
+    kept short so the first sound comes as soon as possible."""
+    text = " ".join((text or "").split())
+    if not text:
+        return [""]
+    sentences = [x for x in re.split(r"(?<=[.!?…])\s+", text) if x]
+    pieces: list[str] = []
+    buf = ""
+    for sentence in sentences:
+        while len(sentence) > PIECE_MAX:  # one very long sentence: break at a comma or space
+            cut = max(sentence.rfind(", ", 0, PIECE_MAX), sentence.rfind(" ", 0, PIECE_MAX))
+            cut = cut if cut > 0 else PIECE_MAX
+            head, sentence = sentence[:cut + 1].strip(), sentence[cut + 1:].strip()
+            if buf:
+                pieces.append(buf)
+                buf = ""
+            pieces.append(head)
+        limit = PIECE_MIN if not pieces else PIECE_MAX
+        if buf and len(buf) + 1 + len(sentence) > limit:
+            pieces.append(buf)
+            buf = sentence
+        else:
+            buf = f"{buf} {sentence}".strip()
+        if not pieces and len(buf) >= PIECE_MIN:  # the first piece goes out as soon as it's a sentence or two
+            pieces.append(buf)
+            buf = ""
+    if buf:
+        pieces.append(buf)
+    return pieces
 
 
 FOLLOW_UP_S = 8.0        # after a bare "Nova": the next sentence needs no name
@@ -67,10 +105,12 @@ class _PageChannel:
 
 
 class Talk:
-    def __init__(self, assistant: Any, voice: Any | None = None) -> None:
+    def __init__(self, assistant: Any, voice: Any | None = None, face: Any | None = None) -> None:
         self.assistant = assistant
         self.voice = voice
+        self.face = face   # nova.hub.face.Face: the hub screen's live NOVA
         self._sessions: dict[str, _Session] = {}
+        self._speech: dict[str, dict[str, Any]] = {}
         self._guard = threading.Lock()
         self._loop = asyncio.new_event_loop()
         threading.Thread(target=self._loop.run_forever, name="talk", daemon=True).start()
@@ -101,6 +141,7 @@ class Talk:
         sid = body.get("session")
         if not isinstance(sid, str) or not SESSION_RE.fullmatch(sid):
             raise HubError("session must be 8-40 letters, digits, - or _")
+        self._face("listening", "the phone")
         heard = self._heard(body)
         session = self._session(sid)
         if session.answer is not None and not session.answer.done():
@@ -111,6 +152,7 @@ class Talk:
         elif not heard:
             return self._out("", "I didn't catch that.", awaiting=False, want_audio=body.get("speak"))
         else:
+            self._face("thinking", "the phone", heard)
             fut = asyncio.run_coroutine_threadsafe(self._start(session, heard), self._loop)
             fut.result(5)
         kind, words = asyncio.run_coroutine_threadsafe(self._next(session), self._loop).result(REPLY_WAIT_S + 5)
@@ -158,6 +200,7 @@ class Talk:
                 session.follow_until = time.monotonic() + FOLLOW_UP_S
                 return self._out("", "Yes?", awaiting=True, want_audio=want_audio)
             channel = _PageChannel(session, name=f"your {device}", armed_by=ArmedBy.VOICE)
+            self._face("thinking", f"your {device}", command)
             asyncio.run_coroutine_threadsafe(self._start(session, command, channel), self._loop).result(5)
             heard = command
         kind, words = asyncio.run_coroutine_threadsafe(self._next(session), self._loop).result(REPLY_WAIT_S + 5)
@@ -205,11 +248,25 @@ class Talk:
             self._loop.call_soon_threadsafe(_set, session.answer, heard)
         elif session.task is None or session.task.done():
             channel = _PageChannel(session, name="a phone call", armed_by=ArmedBy.VOICE)
+            self._face("thinking", "a phone call", heard)
             asyncio.run_coroutine_threadsafe(self._start(session, heard, channel), self._loop).result(5)
         return self._within(session, wait_s)
 
     def phone_wait(self, call_sid: str, wait_s: float) -> "tuple[str | None, bool]":
         return self._within(self._session(f"phone-{call_sid}"), wait_s)
+
+    def _face(self, mode: str, a: str = "", b: str = "") -> None:
+        if self.face is None:
+            return
+        try:
+            if mode == "listening":
+                self.face.listening(a)
+            elif mode == "thinking":
+                self.face.thinking(a, b)
+            elif mode == "speaking":
+                self.face.speaking(a)
+        except Exception:  # noqa: BLE001 -- the screen never breaks a conversation
+            pass
 
     def _within(self, session: _Session, wait_s: float) -> "tuple[str | None, bool]":
         async def get():
@@ -221,6 +278,7 @@ class Talk:
             if session.task is None or session.task.done():
                 return "", False
             return None, False
+        self._face("speaking", words)
         return words, kind == "ask"
 
     async def _start(self, session: _Session, text: str, channel: Any = None) -> None:
@@ -244,13 +302,69 @@ class Talk:
             return "done", "That's taking too long; I'll keep going and tell you when it's done."
 
     def _out(self, heard: str, words: str, *, awaiting: bool, want_audio: Any) -> dict[str, Any]:
+        """The reply. Long ones are spoken in pieces (2026-11-25): the first
+        sentence is synthesized now and returned with the words; the rest are
+        synthesized in the background while it plays, and fetched in order
+        with more(). Short replies are one piece, exactly as before."""
         out: dict[str, Any] = {"heard": heard, "say": words, "awaiting": awaiting}
+        self._face("speaking", words)
         if want_audio is not False and self.voice_ready() and words:
+            parts = split_speech(words)
             try:
-                out["audio"] = base64.b64encode(self.voice.speak(words)).decode("ascii")
+                out["audio"] = base64.b64encode(self.voice.speak(parts[0])).decode("ascii")
             except Exception as exc:  # noqa: BLE001 -- the words still arrive
                 _log.warning("speech failed (%s)", type(exc).__name__)
+                return out
+            if len(parts) > 1:
+                out["more"] = self._speech_job(parts[1:])
+                out["parts"] = len(parts) - 1
         return out
+
+    # --- the rest of a long reply's speech ------------------------------------
+
+    def _speech_job(self, parts: list[str]) -> str:
+        jid = secrets.token_hex(8)
+        job = {"parts": [None] * len(parts), "cond": threading.Condition(), "at": time.monotonic()}
+        with self._guard:
+            now = time.monotonic()
+            for k in [k for k, v in self._speech.items() if now - v["at"] > SPEECH_KEEP_S]:
+                del self._speech[k]
+            while len(self._speech) >= MAX_SPEECH_JOBS:
+                del self._speech[min(self._speech, key=lambda k: self._speech[k]["at"])]
+            self._speech[jid] = job
+
+        def run() -> None:
+            for i, text in enumerate(parts):
+                try:
+                    audio = self.voice.speak(text)
+                except Exception as exc:  # noqa: BLE001
+                    _log.warning("speech failed (%s)", type(exc).__name__)
+                    audio = b""
+                with job["cond"]:
+                    job["parts"][i] = audio
+                    job["cond"].notify_all()
+
+        threading.Thread(target=run, name="speech", daemon=True).start()
+        return jid
+
+    def more(self, body: Any) -> dict[str, Any]:
+        """{"id", "part"} -> that piece of a long reply's speech, waiting for
+        it if it's still being synthesized."""
+        if not isinstance(body, dict) or not isinstance(body.get("id"), str) \
+                or not isinstance(body.get("part"), int) or isinstance(body.get("part"), bool):
+            raise HubError('body must be {"id": "...", "part": 0}')
+        with self._guard:
+            job = self._speech.get(body["id"])
+        part = body["part"]
+        if job is None or not 0 <= part < len(job["parts"]):
+            raise HubError("no such speech")
+        with job["cond"]:
+            job["cond"].wait_for(lambda: job["parts"][part] is not None, timeout=SPEECH_WAIT_S)
+            audio = job["parts"][part]
+        if audio is None:
+            raise HubError("still speaking that; ask again")
+        return {"audio": base64.b64encode(audio).decode("ascii") if audio else "",
+                "last": part == len(job["parts"]) - 1}
 
 
 def _set(fut: asyncio.Future, value: str) -> None:

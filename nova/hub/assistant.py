@@ -38,6 +38,7 @@ HUB_SKILLS = frozenset({
     "remind_me", "set_timer", "list_reminders", "cancel_reminders",
     "upgrade_nova", "upgrade_status", "discard_upgrade",
     "call_me",
+    "build_project", "build_status",
 })
 NOT_HERE = "That needs your laptop, and it isn't connected right now (is it on, with NOVA Link running?)."
 #: never run remotely: applying an upgrade is the hub's own job (ADR 0024)

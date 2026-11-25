@@ -68,12 +68,28 @@ footer { display:flex; align-items:center; gap:10px; padding:10px 16px 14px; bor
     return ctx;
   }
 
+  // pieces of a reply play back-to-back: each is scheduled when the one before ends
+  let playUntil = 0;
   async function play(b64) {
     try {
       const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer;
       const buf = await audioCtx().decodeAudioData(raw);
-      const src = ctx.createBufferSource(); src.buffer = buf; src.connect(ctx.destination); src.start();
+      const src = ctx.createBufferSource(); src.buffer = buf; src.connect(ctx.destination);
+      const at = Math.max(ctx.currentTime + 0.02, playUntil);
+      src.start(at); playUntil = at + buf.duration;
     } catch (e) { /* the words are on screen anyway */ }
+  }
+
+  async function playRest(id, parts) {
+    for (let i = 0; i < parts; i++) {
+      try {
+        const r = await fetch("/v1/talk/more", { method: "POST", headers: { "content-type": "application/json" },
+                                                 body: JSON.stringify({ id, part: i }) });
+        if (!r.ok) return;
+        const out = await r.json();
+        if (out.audio) await play(out.audio);
+      } catch (e) { return; }
+    }
   }
 
   async function send(body, shown) {
@@ -88,7 +104,7 @@ footer { display:flex; align-items:center; gap:10px; padding:10px 16px 14px; bor
       if (!shown && out.heard) add("me", out.heard);
       if (out.say) add(out.awaiting ? "nova ask" : "nova", out.say);
       answers.classList.toggle("on", !!out.awaiting);
-      if (out.audio) play(out.audio);
+      if (out.audio) { await play(out.audio); if (out.more) playRest(out.more, out.parts || 0); }
     } catch (e) {
       add("nova", "Can't reach the hub. Is Tailscale on?");
     } finally {

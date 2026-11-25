@@ -158,6 +158,9 @@ class Link:
 
     # --- ears ---------------------------------------------------------------
 
+    def more(self, speech_id: str, part: int) -> dict:
+        return self._post("/v1/talk/more", {"id": speech_id, "part": part}, 40.0)
+
     def hear(self, pcm16: bytes) -> dict:
         return self._post("/v1/link/hear", {"device": self.device,
                                             "audio": base64.b64encode(pcm16).decode("ascii")}, 200.0)
@@ -219,7 +222,7 @@ def main(argv: list[str] | None = None) -> int:
     if config.hub.listen:
         from nova.ears import Ears
 
-        ears = Ears(link.hear, listening=lambda: link.connected,
+        ears = Ears(link.hear, listening=lambda: link.connected, more=link.more,
                     silence_ms=config.wake.vad_silence_ms, max_ms=config.wake.max_utterance_ms,
                     min_speech_ms=config.wake.min_speech_ms)
         threading.Thread(target=ears.run, args=(stop_thread,), name="ears", daemon=True).start()
