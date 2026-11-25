@@ -42,9 +42,11 @@ def _egress(config, audit: AuditLog | None = None) -> Egress:
     # the hub reaches out to Bark (alerts) and, now that NOVA itself runs
     # here (ADR 0023), Open-Meteo for the weather skill -- nothing else
     # (the `claude` and `git` programs it runs make their own connections)
+    from nova.hub.phone import API_HOST as TWILIO_HOST
     from nova.skills.weather import FORECAST_URL, GEOCODE_URL
 
-    hosts = [BARK_HOST, FORECAST_URL.split("/")[2], GEOCODE_URL.split("/")[2]]
+    # + Twilio's API, used only when phone calls are set up (ADR 0025)
+    hosts = [BARK_HOST, FORECAST_URL.split("/")[2], GEOCODE_URL.split("/")[2], TWILIO_HOST]
     return Egress(hosts, audit=audit or _audit(config), redact_terms=config.security.redact_terms,
                   loopback_ports=[config.hub.ollama_port])
 
@@ -80,11 +82,24 @@ def _forge(egress: Egress, notify):
     return forge
 
 
-def _talk(config, egress: Egress, audit: AuditLog):
-    """NOVA itself, on the hub (ADR 0023): the assistant behind the talk page."""
+def _restart_soon(delay_s: float = 15.0) -> None:
+    """Exit after the reply has been spoken; systemd (Restart=always) starts
+    the hub again with the new code."""
+    import os
+
+    def go() -> None:
+        _log.info("Restarting to load an installed upgrade")
+        os._exit(0)
+
+    threading.Timer(delay_s, go).start()
+
+
+def _talk(config, egress: Egress, audit: AuditLog, devices=None):
+    """NOVA itself, on the hub (ADR 0023/0024): the assistant behind the talk
+    page, the laptop link and the hub's own mic."""
     if not config.hub.assistant:
         return None
-    from nova.hub.assistant import HubAssistant
+    from nova.hub.assistant import HubAssistant, hub_apply_upgrade
     from nova.hub.talk import Talk
     from nova.hub.voice import HubVoice
 
@@ -93,9 +108,32 @@ def _talk(config, egress: Egress, audit: AuditLog):
     missing = voice.missing()
     if missing:
         _log.warning("Talk page is text-only until `nova-hub voice` installs: %s", ", ".join(missing))
-    talk = Talk(HubAssistant(config, audit=audit, egress=egress), voice)
+    assistant = HubAssistant(config, audit=audit, egress=egress, devices=devices,
+                             local_skills={"apply_upgrade": hub_apply_upgrade(devices, _restart_soon)})
+    talk = Talk(assistant, voice)
     talk.warm_up()
     return talk
+
+
+def _hub_ears(config, talk) -> None:
+    """Phase 3: the hub's own mic and speaker ("Nova, ..." in the room)."""
+    import base64
+
+    # on in config, or switched on with `nova-hub ears on` (a flag file, so the
+    # tracked config file stays untouched on the hub)
+    if not (config.hub.hub_ears or (DATA_DIR / "hub_ears").exists()) or talk is None:
+        return
+    if not talk.voice_ready():
+        _log.warning("The hub's own mic is on in config, but voice isn't set up (nova-hub voice)")
+        return
+    from nova.ears import Ears
+
+    def send(pcm16: bytes) -> dict:
+        return talk.hear({"device": "hub", "audio": base64.b64encode(pcm16).decode("ascii")})
+
+    ears = Ears(send, silence_ms=config.wake.vad_silence_ms, max_ms=config.wake.max_utterance_ms,
+                min_speech_ms=config.wake.min_speech_ms)
+    threading.Thread(target=ears.run, args=(threading.Event(),), name="hub-ears", daemon=True).start()
 
 
 def _adopt_memory() -> None:
@@ -132,13 +170,15 @@ def _model(config, egress: Egress | None = None) -> LocalModel:
     return LocalModel(egress or _egress(config), model=config.hub.model, port=config.hub.ollama_port)
 
 
-def _bark(config, egress: Egress) -> Bark:
-    def hub_name() -> str:
-        try:
-            return (DATA_DIR / "hub_name").read_text(encoding="utf-8").strip().rstrip(".")
-        except OSError:
-            return ""
+def _hub_name() -> str:
+    try:
+        return (DATA_DIR / "hub_name").read_text(encoding="utf-8").strip().rstrip(".")
+    except OSError:
+        return ""
 
+
+def _bark(config, egress: Egress) -> Bark:
+    hub_name = _hub_name
     return Bark(egress, key_path=DATA_DIR / "bark_key", hub_name=hub_name, show_text=config.hub.alert_text)
 
 
@@ -173,8 +213,18 @@ def serve(config) -> int:
         except Exception:  # noqa: BLE001 -- Ollama not running is fine too
             pass
     bark = _bark(config, egress)
+    from nova.hub.devices import Devices
+
+    devices = Devices() if config.hub.assistant else None
+    talk = _talk(config, egress, audit, devices)
+    phone = None
+    if talk is not None:
+        from nova.hub.phone import Phone
+
+        phone = Phone(talk, data_dir=DATA_DIR, hub_name=_hub_name, egress=egress)
     service = HubService(model=model, data_dir=DATA_DIR, notifier=bark, brain=_brain(config, egress, audit),
-                         forge=_forge(egress, bark.say), talk=_talk(config, egress, audit))
+                         forge=_forge(egress, bark.say), talk=talk, devices=devices, phone=phone)
+    _hub_ears(config, talk)
     if service.talk is not None:
         from nova.brain.hub_tier import use_local_service
 
@@ -226,12 +276,29 @@ def ping(config) -> int:
     return 0 if ok else 1
 
 
+def phone_setup(config) -> int:
+    """`nova-hub phone`: settings arrive as JSON on stdin (never argv)."""
+    import json
+
+    from nova.hub.phone import PhoneError, write_settings
+
+    try:
+        values = json.loads(sys.stdin.read())
+        write_settings(DATA_DIR / "phone.json", **{k: str(values.get(k, "")).strip() for k in (
+            "account_sid", "auth_token", "nova_number", "owner_number", "pin")})
+    except (PhoneError, ValueError, TypeError) as exc:
+        print(f"Not saved: {exc}")
+        return 1
+    print("Saved.")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m nova.hub")
-    parser.add_argument("command", choices=["serve", "selftest", "ping"])
+    parser.add_argument("command", choices=["serve", "selftest", "ping", "phone-setup"])
     args = parser.parse_args(argv)
     config = load_config()
-    return {"serve": serve, "selftest": selftest, "ping": ping}[args.command](config)
+    return {"serve": serve, "selftest": selftest, "ping": ping, "phone-setup": phone_setup}[args.command](config)
 
 
 if __name__ == "__main__":

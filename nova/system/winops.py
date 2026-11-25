@@ -165,6 +165,26 @@ def git_update(repo: str, commit: str, *, timeout: float = 90.0) -> None:
     git_run("merge", "--ff-only", "--quiet", commit)
 
 
+def restart_link() -> None:
+    """Start a fresh NOVA Link (after an upgrade was installed); the caller
+    then exits. Fixed arguments, this Python, NOVA's own folder; no shell."""
+    import sys
+
+    from nova import ROOT
+
+    _require_windows()
+    exe = os.path.realpath(sys.executable)
+    pythonw = os.path.join(os.path.dirname(exe), "pythonw.exe")
+    if os.path.isfile(pythonw):
+        exe = pythonw
+    detached = 0x00000008  # DETACHED_PROCESS
+    try:
+        subprocess.Popen([exe, "-m", "nova.link"], cwd=str(ROOT), shell=False,  # noqa: S603 -- fixed args
+                         creationflags=detached | _NO_WINDOW, close_fds=True)
+    except OSError as exc:
+        raise WinOpsError(f"couldn't restart NOVA Link: {exc}") from exc
+
+
 _URL = re.compile(r"^https://(?P<host>[^/?#:@\\]+)(?::443)?(?P<rest>[/?#][^\\\s]*)?$", re.IGNORECASE)
 
 

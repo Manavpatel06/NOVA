@@ -38,6 +38,9 @@ from nova.log import get_logger
 _log = get_logger("hub.listener")
 
 BIND_HOST = "127.0.0.1"
+FUNNEL_HEADER = "Tailscale-Funnel-Request"
+PHONE_ROUTE = re.compile(r"/v1/phone/(voice|pin|heard|wait|status)(?:\?([A-Za-z0-9=_&-]{0,80}))?")
+MAX_FORM = 16_000
 TALK_PAGE = Path(__file__).with_name("talk.html")
 MAX_BODY = 6_000_000
 OWNER_HEADER = "Tailscale-User-Login"
@@ -49,6 +52,10 @@ def make_server(service: HubService, port: int) -> ThreadingHTTPServer:
     class Handler(BaseHTTPRequestHandler):
         server_version = "nova-hub"
         sys_version = ""
+        # a client that trickles its request (now that Funnel puts one route
+        # on the internet) is dropped instead of holding a thread forever;
+        # server-side waits (long polls, NOVA thinking) aren't socket reads
+        timeout = 30
 
         def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003 -- no paths/bodies in our logs
             return
@@ -77,6 +84,8 @@ def make_server(service: HubService, port: int) -> ThreadingHTTPServer:
                 raise HubError("body is not JSON") from None
 
         def _is_owner(self) -> bool:
+            if self.headers.get(FUNNEL_HEADER) is not None:
+                return False  # from the public internet (Funnel): never the owner
             return service.host_ok(self.headers.get("host"), port_bound) and service.is_owner(
                 self.headers.get(OWNER_HEADER))
 
@@ -129,6 +138,9 @@ def make_server(service: HubService, port: int) -> ThreadingHTTPServer:
             self.wfile.write(data)
 
         def do_GET(self) -> None:  # noqa: N802
+            if self.headers.get(FUNNEL_HEADER) is not None:
+                self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})
+                return
             if self.path in ("/talk", "/"):
                 if self._owner_only():
                     self._send_talk_page()
@@ -155,14 +167,53 @@ def make_server(service: HubService, port: int) -> ThreadingHTTPServer:
                 _log.error("%s %s failed (%s)", self.command, self.path, type(exc).__name__)
                 self._send(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal error"})
 
+        def _phone(self, route: str, query: str) -> None:
+            """Twilio's webhooks, the only thing Funnel exposes (ADR 0025).
+            The phone module checks Twilio's signature before anything else."""
+            from urllib.parse import parse_qsl
+
+            name = service.hub_name()
+            host = (self.headers.get("host") or "").strip().lower().rstrip(".")
+            if host not in ({name, f"{name}:8443"} if name else set()) | {f"127.0.0.1:{port_bound}"}:
+                self._send(HTTPStatus.FORBIDDEN, {"error": "wrong host"})
+                return
+            ctype = (self.headers.get("content-type") or "").split(";")[0].strip().lower()
+            try:
+                length = int(self.headers.get("content-length") or 0)
+            except ValueError:
+                length = -1
+            if ctype != "application/x-www-form-urlencoded" or not 0 < length <= MAX_FORM:
+                self._send(HTTPStatus.BAD_REQUEST, {"error": "bad request"})
+                return
+            try:
+                form = dict(parse_qsl(self.rfile.read(length).decode("utf-8"), keep_blank_values=True,
+                                      max_num_fields=60))
+                status, twiml = service.phone_webhook(route, query, form, self.headers.get("x-twilio-signature"))
+            except Exception as exc:  # noqa: BLE001 -- never a stack trace to the internet
+                _log.error("phone webhook failed (%s)", type(exc).__name__)
+                status, twiml = 500, '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'
+            data = twiml.encode("utf-8")
+            self.send_response(status)
+            self.send_header("content-type", "text/xml; charset=utf-8")
+            self.send_header("content-length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
         def do_POST(self) -> None:  # noqa: N802
+            phone = PHONE_ROUTE.fullmatch(self.path)
+            if phone:
+                self._phone(phone.group(1), phone.group(2) or "")
+                return
+            if self.headers.get(FUNNEL_HEADER) is not None:
+                self._send(HTTPStatus.FORBIDDEN, {"error": "not available from the internet"})
+                return
             if self.path in service.ROUTES:
                 self._handle(getattr(service, service.ROUTES[self.path]))
             else:
                 self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})
 
         def do_PUT(self) -> None:  # noqa: N802
-            if self.path == "/v1/memory":
+            if self.path == "/v1/memory" and self.headers.get(FUNNEL_HEADER) is None:
                 self._handle(service.put_memory)
             else:
                 self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})

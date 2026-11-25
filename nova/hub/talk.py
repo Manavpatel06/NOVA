@@ -32,19 +32,27 @@ REPLY_WAIT_S = 170.0     # how long one request waits for NOVA's next words
 MAX_SESSIONS = 8
 
 
+FOLLOW_UP_S = 8.0        # after a bare "Nova": the next sentence needs no name
+
+
 class _Session:
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self.events: asyncio.Queue = asyncio.Queue()
         self.answer: asyncio.Future | None = None
         self.task: asyncio.Task | None = None
         self.used = time.monotonic()
+        self.follow_until = 0.0
 
 
 class _PageChannel:
-    name = "the phone"
+    def __init__(self, session: _Session, *, name: str = "the phone", armed_by: Any = None) -> None:
+        from nova.security.tiers import ArmedBy
 
-    def __init__(self, session: _Session) -> None:
         self._s = session
+        self.name = name
+        # a tap on the page is a deliberate press; a mic that's always open is
+        # prefix voice (ArmedBy.VOICE: CONFIRM still needs "Nova, confirm")
+        self.armed_by = armed_by or ArmedBy.PTT
 
     async def ask(self, prompt: str) -> "str | None":
         loop = asyncio.get_running_loop()
@@ -108,6 +116,53 @@ class Talk:
         kind, words = asyncio.run_coroutine_threadsafe(self._next(session), self._loop).result(REPLY_WAIT_S + 5)
         return self._out(heard, words, awaiting=kind == "ask", want_audio=body.get("speak"))
 
+    def hear(self, body: Any) -> dict[str, Any]:
+        """One sentence from a device's always-open mic (the laptop through
+        NOVA Link, or the hub's own). Acted on only when it starts with
+        NOVA's name, answers NOVA's question, or follows a bare "Nova".
+        Anything else is dropped: {"ignored": true}, its words never logged
+        or returned."""
+        from nova.hub.devices import DEVICE_RE
+
+        if not isinstance(body, dict):
+            raise HubError("body must be a JSON object")
+        device = body.get("device")
+        if not isinstance(device, str) or not DEVICE_RE.fullmatch(device):
+            raise HubError("device must be a short lowercase name like 'laptop'")
+        if not isinstance(body.get("audio"), str):
+            raise HubError("send audio")
+        return self.hear_text(device, self._heard({"audio": body["audio"]}), want_audio=body.get("speak"))
+
+    def hear_text(self, device: str, heard: str, *, want_audio: Any = True) -> dict[str, Any]:
+        from nova.brain.address import strip_address
+        from nova.security.tiers import ArmedBy
+
+        session = self._session(f"device-{device}")
+        heard = (heard or "").strip()
+        if session.answer is not None and not session.answer.done():
+            if not heard:
+                return {"ignored": True}
+            self._loop.call_soon_threadsafe(_set, session.answer, heard)
+        else:
+            if session.task is not None and not session.task.done():
+                return {"ignored": True}  # mid-turn chatter is not a new command
+            cfg = getattr(self.assistant, "config", None)
+            names = list(cfg.wake.names) if cfg is not None else ["nova"]
+            command = strip_address(heard, names)
+            if time.monotonic() < session.follow_until:
+                session.follow_until = 0.0
+                command = heard if command is None else command
+            if command is None or not heard:
+                return {"ignored": True}
+            if command == "":
+                session.follow_until = time.monotonic() + FOLLOW_UP_S
+                return self._out("", "Yes?", awaiting=True, want_audio=want_audio)
+            channel = _PageChannel(session, name=f"your {device}", armed_by=ArmedBy.VOICE)
+            asyncio.run_coroutine_threadsafe(self._start(session, command, channel), self._loop).result(5)
+            heard = command
+        kind, words = asyncio.run_coroutine_threadsafe(self._next(session), self._loop).result(REPLY_WAIT_S + 5)
+        return self._out(heard, words, awaiting=kind == "ask", want_audio=want_audio)
+
     def _heard(self, body: dict) -> str:
         if isinstance(body.get("text"), str):
             return " ".join(body["text"].split())[:MAX_TEXT]
@@ -138,13 +193,43 @@ class Talk:
             s.used = time.monotonic()
             return s
 
-    async def _start(self, session: _Session, text: str) -> None:
+    # --- a phone call (ADR 0025): Twilio's webhooks can't wait long ----------
+
+    def phone_say(self, call_sid: str, heard: str, wait_s: float) -> "tuple[str | None, bool]":
+        """Something said on the call. Returns (words, awaiting); words None
+        means NOVA is still thinking -- ask again with phone_wait()."""
+        from nova.security.tiers import ArmedBy
+
+        session = self._session(f"phone-{call_sid}")
+        if session.answer is not None and not session.answer.done():
+            self._loop.call_soon_threadsafe(_set, session.answer, heard)
+        elif session.task is None or session.task.done():
+            channel = _PageChannel(session, name="a phone call", armed_by=ArmedBy.VOICE)
+            asyncio.run_coroutine_threadsafe(self._start(session, heard, channel), self._loop).result(5)
+        return self._within(session, wait_s)
+
+    def phone_wait(self, call_sid: str, wait_s: float) -> "tuple[str | None, bool]":
+        return self._within(self._session(f"phone-{call_sid}"), wait_s)
+
+    def _within(self, session: _Session, wait_s: float) -> "tuple[str | None, bool]":
+        async def get():
+            return await asyncio.wait_for(session.events.get(), wait_s)
+
+        try:
+            kind, words = asyncio.run_coroutine_threadsafe(get(), self._loop).result(wait_s + 2)
+        except (asyncio.TimeoutError, TimeoutError):
+            if session.task is None or session.task.done():
+                return "", False
+            return None, False
+        return words, kind == "ask"
+
+    async def _start(self, session: _Session, text: str, channel: Any = None) -> None:
         while not session.events.empty():  # a reply nobody waited for (an earlier timeout)
             session.events.get_nowait()
 
         async def run() -> None:
             try:
-                reply = await self.assistant.turn(text, _PageChannel(session))
+                reply = await self.assistant.turn(text, channel or _PageChannel(session))
             except Exception as exc:  # noqa: BLE001 -- one bad turn never takes the hub down
                 _log.error("turn failed (%s)", type(exc).__name__)
                 reply = "Sorry, something went wrong."

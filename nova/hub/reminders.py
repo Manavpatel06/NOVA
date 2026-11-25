@@ -61,7 +61,7 @@ class ReminderStore:
 
     # --- api ----------------------------------------------------------------
 
-    def add(self, text: Any, due: Any, *, urgent: bool = False) -> dict[str, Any]:
+    def add(self, text: Any, due: Any, *, urgent: bool = False, call: bool = False) -> dict[str, Any]:
         if not isinstance(text, str) or not text.strip():
             raise ReminderError("text is required")
         if isinstance(due, bool) or not isinstance(due, (int, float)):
@@ -75,6 +75,7 @@ class ReminderStore:
             "text": " ".join(text.split())[:MAX_TEXT],
             "due": float(due),
             "urgent": bool(urgent),
+            "call": bool(call),   # also phone Manav (ADR 0025)
             "created": now,
             "sent": 0,
             "last_sent": 0.0,

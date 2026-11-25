@@ -37,7 +37,8 @@ def _note(alerts_ready: bool) -> str:
     description=("Set a reminder that rings Manav's iPhone at a time, even if the laptop is off. Params: text (what "
                  "to remind him of, e.g. 'call mom'), when (as he said it: 'in 20 minutes', 'at 5:30 pm', "
                  "'tomorrow at 9', 'tonight at 8'), urgent ('yes' only if he says it's urgent or important: it then "
-                 "rings through silent mode until he taps it)."),
+                 "rings through silent mode until he taps it), call ('yes' only if he asks NOVA to call/phone him "
+                 "then: NOVA also phones him, when phone calls are set up)."),
     trusts_input=False,
     patterns=[
         # "remind me tomorrow at 9 to ..." first, so its time isn't read as the task
@@ -45,7 +46,7 @@ def _note(alerts_ready: bool) -> str:
         rf"remind me (?:to |about )?(?P<text>.+?) (?P<when>{_WHEN})",
     ],
 )
-async def remind_me(ctx: SkillCtx, text: str, when: str, urgent: str = "") -> Reply:
+async def remind_me(ctx: SkillCtx, text: str, when: str, urgent: str = "", call: str = "") -> Reply:
     now = datetime.now()
     due = parse_when(when, now)
     if due is None:
@@ -54,14 +55,16 @@ async def remind_me(ctx: SkillCtx, text: str, when: str, urgent: str = "") -> Re
     if not text:
         return Reply(text="What should I remind you about?", success=False)
     is_urgent = urgent.strip().lower() in _YES
+    is_call = call.strip().lower() in _YES | {"call", "phone"}
     try:
         out = await hub_post(ctx.config, ctx.egress, "/v1/reminders",
-                             {"text": text, "due": due.timestamp(), "urgent": is_urgent})
+                             {"text": text, "due": due.timestamp(), "urgent": is_urgent, "call": is_call})
     except HubUnavailable as exc:
         logger.warning("remind_me: hub unavailable (%s)", exc)
         return Reply(text=NO_HUB, success=False)
     logger.info("remind_me: set for %s (%s)", due.isoformat(timespec="minutes"), "urgent" if is_urgent else "normal")
-    return Reply(text=f"Okay, I'll remind you {say_when(due, now)}.{_note(out.get('alerts_ready', True))}")
+    how = "call you" if is_call else "remind you"
+    return Reply(text=f"Okay, I'll {how} {say_when(due, now)}.{_note(out.get('alerts_ready', True))}")
 
 
 @skill(

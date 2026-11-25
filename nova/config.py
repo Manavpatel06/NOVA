@@ -537,6 +537,12 @@ class HubConfig:
     #: the hub's speech-to-text model (CPU): small.en is the measured-fast
     #: default; base.en is faster and less accurate
     stt_model: str = "small.en"
+    #: NOVA Link (ADR 0024, laptop side): keep the laptop mic open for
+    #: "Nova, ..." and play replies on its speakers. Off: the laptop only
+    #: runs skills for the hub's NOVA.
+    listen: bool = True
+    #: the hub's own mic and speaker (phase 3, hub side)
+    hub_ears: bool = False
 
 
 @dataclass(frozen=True)

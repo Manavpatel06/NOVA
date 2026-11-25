@@ -55,6 +55,10 @@ class HubService:
         "/v1/forge/apply": "forge_apply",
         "/v1/forge/discard": "forge_discard",
         "/v1/talk": "talk_turn",
+        "/v1/link/poll": "link_poll",
+        "/v1/link/result": "link_result",
+        "/v1/link/hear": "link_hear",
+        "/v1/phone/call": "phone_call",
     }
 
     def __init__(
@@ -69,10 +73,14 @@ class HubService:
         brain: Any = None,
         forge: Any = None,
         talk: Any = None,
+        devices: Any = None,
+        phone: Any = None,
     ) -> None:
+        self.phone = phone
         self.brain = brain
         self.forge = forge
         self.talk = talk
+        self.devices = devices
         self._model = model
         self.reminders = reminders or ReminderStore(Path(data_dir) / "reminders.json", clock=clock)
         self._notifier = notifier
@@ -95,6 +103,57 @@ class HubService:
         if self.talk is None:
             raise HubError("NOVA isn't running on the hub (see nova-hub logs)")
         return self.talk.handle(body)
+
+    # --- NOVA Link: the laptop helper (ADR 0024) -----------------------------
+
+    def _devices(self):
+        if self.devices is None:
+            raise HubError("NOVA isn't running on the hub (see nova-hub logs)")
+        return self.devices
+
+    def link_poll(self, body: Any) -> dict[str, Any]:
+        from nova.hub.devices import DeviceError
+
+        try:
+            return self._devices().poll(body)
+        except DeviceError as exc:
+            raise HubError(str(exc)) from None
+
+    def link_result(self, body: Any) -> dict[str, Any]:
+        from nova.hub.devices import DeviceError
+
+        try:
+            return self._devices().result(body)
+        except DeviceError as exc:
+            raise HubError(str(exc)) from None
+
+    def link_hear(self, body: Any) -> dict[str, Any]:
+        """One sentence heard by a device's mic; acted on only if it was
+        addressed to NOVA (or answers NOVA's question)."""
+        if self.talk is None:
+            raise HubError("NOVA isn't running on the hub (see nova-hub logs)")
+        return self.talk.hear(body)
+
+    # --- phone calls (ADR 0025) -------------------------------------------------
+
+    def phone_call(self, body: Any) -> dict[str, Any]:
+        """NOVA calls Manav (owner-only, like every JSON route)."""
+        from nova.hub.phone import PhoneError
+
+        if self.phone is None:
+            raise HubError("phone calls aren't set up (run: nova-hub phone)")
+        message = body.get("message") if isinstance(body, dict) else None
+        if not isinstance(message, str):
+            raise HubError('body must be {"message": "..."}')
+        try:
+            return self.phone.call_me(message)
+        except PhoneError as exc:
+            raise HubError(str(exc)) from None
+
+    def phone_webhook(self, route: str, query: str, form: dict[str, str], signature: str | None) -> tuple[int, str]:
+        if self.phone is None:
+            return 404, '<?xml version="1.0" encoding="UTF-8"?><Response><Reject/></Response>'
+        return self.phone.webhook(route, query, form, signature)
 
     # --- who --------------------------------------------------------------
 
@@ -153,6 +212,9 @@ class HubService:
         out["brain"] = self.brain is not None
         out["forge"] = self.forge is not None
         out["assistant"] = self.talk is not None
+        if self.devices is not None:
+            out["devices"] = self.devices.status()
+        out["phone"] = bool(self.phone is not None and self.phone.configured())
         out["voice_ready"] = bool(self.talk is not None and self.talk.voice_ready())
         out["alerts_ready"] = bool(self._notifier is not None and self._notifier.configured())
         state = self._read_state()
@@ -188,7 +250,8 @@ class HubService:
         if not isinstance(body, dict):
             raise HubError("body must be a JSON object")
         try:
-            r = self.reminders.add(body.get("text"), body.get("due"), urgent=body.get("urgent") is True)
+            r = self.reminders.add(body.get("text"), body.get("due"), urgent=body.get("urgent") is True,
+                                   call=body.get("call") is True)
         except ReminderError as exc:
             raise HubError(str(exc)) from None
         _log.info("reminder %s added (%s)", r["id"], "urgent" if r["urgent"] else "normal")
@@ -221,10 +284,22 @@ class HubService:
         )
 
     def tick(self) -> int:
-        """Fire due reminders (the scheduler thread calls this)."""
-        if self._notifier is None:
+        """Fire due reminders (the scheduler thread calls this). A reminder
+        set as a call also phones Manav, once (ADR 0025)."""
+        if self._notifier is None and self.phone is None:
             return 0
-        return self.reminders.tick(self._notifier.send)
+
+        def send(item: dict[str, Any], late: bool) -> bool:
+            ok = bool(self._notifier is not None and self._notifier.send(item, late))
+            if item.get("call") and item.get("sent", 0) == 0 and self.phone is not None and self.phone.configured():
+                try:
+                    self.phone.call_me(f"This is your reminder: {item.get('text', '')}")
+                    ok = True
+                except Exception as exc:  # noqa: BLE001 -- Bark still rang (if set up)
+                    _log.error("reminder call failed (%s)", type(exc).__name__)
+            return ok
+
+        return self.reminders.tick(send)
 
     # --- /v1/brain (ADR 0021) ---------------------------------------------------
 

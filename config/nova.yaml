@@ -174,3 +174,8 @@ hub:
   # hub's own speech-to-text model (CPU; base.en is faster, less accurate)
   assistant: true
   stt_model: small.en
+  # NOVA Link on the laptop (docs/decisions/0024): listen on the laptop mic
+  # for "Nova, ..." and speak the hub's replies there
+  listen: true
+  # the hub's own mic and speaker -- turn on with: nova-hub ears on
+  hub_ears: false

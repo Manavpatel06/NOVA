@@ -14,6 +14,8 @@
 #   nova-hub share     turn on the shared drive \\nova-hub\nova (your devices only, over Tailscale)
 #   nova-hub voice     give NOVA on the hub ears and a voice (one-time download, ~900 MB)
 #   nova-hub talk      where to talk to NOVA from your phone
+#   nova-hub ears on|off   the hub's own mic + speaker: say "Nova, ..." in the room
+#   nova-hub phone     give NOVA a real phone number (Twilio): call it, or it calls you
 set -uo pipefail
 
 NOVA_DIR="${NOVA_DIR:-$HOME/NOVA}"
@@ -67,6 +69,9 @@ cmd_status() {
     [[ "$(jq -r '.voice_ready' <<<"$h")" == "true" ]] && good "NOVA lives here: talk at https://$(ts_name)/" \
       || note "NOVA lives here, text only for now -- voice: nova-hub voice"
   fi
+  [[ "$(jq -r '.devices.laptop.online // false' <<<"$h" 2>/dev/null)" == "true" ]] \
+    && good "your laptop is connected (NOVA Link)" || note "laptop not connected (NOVA Link runs on it when it's on)"
+  [[ "$(jq -r '.phone' <<<"$h" 2>/dev/null)" == "true" ]] && good "phone calls set up (Twilio)"
   systemctl is-active --quiet smbd && good "shared drive on (\\\\nova-hub\\nova, Tailscale only)" || note "shared drive off (optional): nova-hub share"
   [[ -s "$DATA_DIR/bark_key" ]] && good "iPhone alerts set up (Bark)" || note "iPhone alerts not set up yet (optional): install Bark, then  nova-hub bark <your key>"
   systemctl --user is-active --quiet nova-backup.timer && good "nightly memory backup on" || bad "backup timer off: systemctl --user enable --now nova-backup.timer"
@@ -263,6 +268,9 @@ CONF
 KOKORO_URL="https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
 KOKORO_FILES="7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5  kokoro-v1.0.onnx
 bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d  voices-v1.0.bin"
+# Silero VAD v5.1.2 (the speech detector the hub's own mic uses)
+VAD_URL="https://raw.githubusercontent.com/snakers4/silero-vad/v5.1.2/src/silero_vad/data/silero_vad.onnx"
+VAD_SUM="2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f"
 
 cmd_voice() {
   # NOVA's ears (Whisper) and voice (Kokoro) on the hub (ADR 0023). Downloads
@@ -281,6 +289,14 @@ cmd_voice() {
     fi
   done <<< "$KOKORO_FILES"
   good "voice files (checked against known checksums)"
+  mkdir -p "$models/vad"
+  if ! echo "$VAD_SUM  $models/vad/silero_vad.onnx" | sha256sum -c --status 2>/dev/null; then
+    curl -fsSL --retry 3 -o "$models/vad/silero_vad.onnx.part" "$VAD_URL" || { bad "couldn't download the speech detector"; return 1; }
+    echo "$VAD_SUM  $models/vad/silero_vad.onnx.part" | sha256sum -c --status \
+      || { rm -f "$models/vad/silero_vad.onnx.part"; bad "the speech detector didn't match its checksum"; return 1; }
+    mv "$models/vad/silero_vad.onnx.part" "$models/vad/silero_vad.onnx"
+  fi
+  good "speech detector (for the hub's own mic)"
   stt=$("$PY" -c 'from nova.config import load_config; print(load_config().hub.stt_model)')
   [[ "$stt" =~ ^[a-z0-9][a-z0-9.-]{1,39}$ ]] || { bad "odd stt_model in config: $stt"; return 1; }
   "$PY" -I -c "from faster_whisper import download_model; download_model('$stt', cache_dir='$models/hf')" >/dev/null 2>&1 \
@@ -300,6 +316,67 @@ cmd_talk() {
   echo "   1. Install Tailscale on your iPhone and sign in with the same account."
   echo "   2. Open in Safari:   https://$name/"
   echo "   3. Share button -> Add to Home Screen, so NOVA opens like an app."
+}
+
+cmd_ears() {
+  case "${1:-}" in
+    on)
+      [[ -f "$NOVA_DIR/models/vad/silero_vad.onnx" ]] || { bad "run 'nova-hub voice' first"; return 1; }
+      sudo apt-get -y -qq install libportaudio2 >/dev/null 2>&1 || true
+      "$NOVA_DIR/.venv/bin/pip" install -q sounddevice || { bad "couldn't install sounddevice"; return 1; }
+      touch "$DATA_DIR/hub_ears"
+      systemctl --user restart nova-hub.service
+      good "the hub listens for \"Nova, ...\" on its own mic and answers on its speaker"
+      note "it hears the room only while you're signed in on the hub (that's when its sound system runs)"
+      ;;
+    off)
+      rm -f "$DATA_DIR/hub_ears"
+      systemctl --user restart nova-hub.service
+      good "the hub's own mic is off"
+      ;;
+    *) echo "usage: nova-hub ears on|off" ;;
+  esac
+}
+
+cmd_phone() {
+  # ADR 0025. Manav types every value here himself; they go to data/phone.json
+  # (0600) through a pipe, never on a command line.
+  say "A real phone number for NOVA (Twilio)"
+  cat <<'HOW'
+   First, on twilio.com (about $1.15 a month for the number, plus a cent or two a minute):
+     1. Create an account, add a little credit, and buy a phone number that has Voice.
+     2. Verify your own phone number in Twilio (Phone Numbers -> Verified Caller IDs).
+     3. Copy your Account SID and Auth Token from the Twilio console's home page.
+   And in Tailscale's admin console (login.tailscale.com -> Access controls), allow Funnel
+   for this hub -- Tailscale shows a link to do it if the last step below asks.
+
+HOW
+  local sid token nova mine pin name
+  read -rp "   Account SID (starts with AC): " sid
+  read -rsp "   Auth Token (typing is hidden): " token; echo
+  read -rp "   NOVA's Twilio number, like +14805551234: " nova
+  read -rp "   Your own phone number, like +14805550000: " mine
+  read -rsp "   Choose a 6-digit PIN for calls (hidden): " pin; echo
+  printf '{"account_sid":"%s","auth_token":"%s","nova_number":"%s","owner_number":"%s","pin":"%s"}' \
+    "$sid" "$token" "$nova" "$mine" "$pin" | "$PY" -m nova.hub phone-setup || return 1
+  unset token pin
+  timeout 60 sudo tailscale funnel --bg --https=8443 --set-path=/phone "http://127.0.0.1:$PORT/v1/phone" \
+    || { bad "Funnel didn't start -- allow Funnel for this hub in Tailscale's admin console, then run this again"; return 1; }
+  local code
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 -X POST \
+         -H 'Content-Type: application/x-www-form-urlencoded' --data 'CallSid=test' "https://$(ts_name):8443/phone/voice")
+  if [[ "$code" == "403" ]]; then
+    good "the phone door is open: only https://$(ts_name):8443/phone, and it turned away an unsigned test call"
+  else
+    bad "the phone route answered $code instead of 403 -- tell Claude this number"
+  fi
+  systemctl --user restart nova-hub.service
+  name=$(ts_name)
+  echo
+  echo "   Last step, in Twilio: Phone Numbers -> your NOVA number -> Voice configuration:"
+  echo "     A call comes in  ->  Webhook  ->  https://$name:8443/phone/voice   (HTTP POST)"
+  echo "   Then call your NOVA number from your phone, type your PIN, and talk."
+  echo "   NOVA can call you too: \"Nova, call me\" or \"Nova, call me at 7 to wake me up\"."
 }
 
 cmd_logs() {
@@ -330,5 +407,7 @@ case "${1:-status}" in
   share)  cmd_share ;;
   voice)  cmd_voice ;;
   talk)   cmd_talk ;;
-  *) sed -n '2,17p' "$0"; exit 1 ;;
+  ears)   shift; cmd_ears "$@" ;;
+  phone)  cmd_phone ;;
+  *) sed -n '2,19p' "$0"; exit 1 ;;
 esac
