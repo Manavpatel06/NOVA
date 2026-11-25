@@ -15,10 +15,11 @@
 #   nova-hub voice     give NOVA on the hub ears and a voice (one-time download, ~900 MB)
 #   nova-hub talk      where to talk to NOVA from your phone
 #   nova-hub ears on|off   the hub's own mic + speaker: say "Nova, ..." in the room
-#   nova-hub phone     give NOVA a real phone number (Twilio): call it, or it calls you
+#   nova-hub phone     give NOVA a real phone number (Plivo or Twilio): call it, or it calls you
 #   nova-hub apikey    use your monthly Claude API credit first (faster), Max plan after
 #   nova-hub face on|off   NOVA's live face as this laptop's desktop background, screen kept awake
 #   nova-hub connect   your apps for NOVA: google (Gmail drafts + Calendar) | canvas | signin EMAIL | add | list
+#   nova-hub voice-reboot on|off   let "Nova, reboot the hub" (+ "Nova, confirm") restart this computer
 set -uo pipefail
 
 NOVA_DIR="${NOVA_DIR:-$HOME/NOVA}"
@@ -354,8 +355,22 @@ cmd_ears() {
 cmd_phone() {
   # ADR 0025. Manav types every value here himself; they go to data/phone.json
   # (0600) through a pipe, never on a command line.
-  say "A real phone number for NOVA (Twilio)"
-  cat <<'HOW'
+  say "A real phone number for NOVA"
+  local provider answer
+  read -rp "   Which carrier: 1) Plivo (cheaper: ~\$0.50/month + ~half a cent a minute, \$10 free credit)  2) Twilio  [1/2] " answer
+  if [[ "$answer" == "2" ]]; then provider=twilio; else provider=plivo; fi
+  if [[ "$provider" == "plivo" ]]; then
+    cat <<'HOW'
+   First, on plivo.com:
+     1. Sign up (the trial gives free credit, no card), and verify your own phone number when it asks.
+     2. Buy (rent) a phone number with Voice: Phone Numbers -> Buy Number.
+     3. Copy your Auth ID (starts with MA) and Auth Token from the console's home page.
+   And in Tailscale's admin console (login.tailscale.com -> Access controls), allow Funnel
+   for this hub -- Tailscale shows a link to do it if the last step below asks.
+
+HOW
+  else
+    cat <<'HOW'
    First, on twilio.com (about $1.15 a month for the number, plus a cent or two a minute):
      1. Create an account, add a little credit, and buy a phone number that has Voice.
      2. Verify your own phone number in Twilio (Phone Numbers -> Verified Caller IDs).
@@ -364,14 +379,16 @@ cmd_phone() {
    for this hub -- Tailscale shows a link to do it if the last step below asks.
 
 HOW
+  fi
   local sid token nova mine pin name
-  read -rp "   Account SID (starts with AC): " sid
+  if [[ "$provider" == "plivo" ]]; then read -rp "   Auth ID (starts with MA): " sid
+  else read -rp "   Account SID (starts with AC): " sid; fi
   read -rsp "   Auth Token (typing is hidden): " token; echo
-  read -rp "   NOVA's Twilio number, like +14805551234: " nova
+  read -rp "   NOVA's new number, like +14805551234: " nova
   read -rp "   Your own phone number, like +14805550000: " mine
   read -rsp "   Choose a 6-digit PIN for calls (hidden): " pin; echo
-  printf '{"account_sid":"%s","auth_token":"%s","nova_number":"%s","owner_number":"%s","pin":"%s"}' \
-    "$sid" "$token" "$nova" "$mine" "$pin" | "$PY" -m nova.hub phone-setup || return 1
+  printf '{"provider":"%s","account_sid":"%s","auth_token":"%s","nova_number":"%s","owner_number":"%s","pin":"%s"}' \
+    "$provider" "$sid" "$token" "$nova" "$mine" "$pin" | "$PY" -m nova.hub phone-setup || return 1
   unset token pin
   timeout 60 sudo tailscale funnel --bg --https=8443 --set-path=/phone "http://127.0.0.1:$PORT/v1/phone" \
     || { bad "Funnel didn't start -- allow Funnel for this hub in Tailscale's admin console, then run this again"; return 1; }
@@ -386,8 +403,15 @@ HOW
   systemctl --user restart nova-hub.service
   name=$(ts_name)
   echo
-  echo "   Last step, in Twilio: Phone Numbers -> your NOVA number -> Voice configuration:"
-  echo "     A call comes in  ->  Webhook  ->  https://$name:8443/phone/voice   (HTTP POST)"
+  if [[ "$provider" == "plivo" ]]; then
+    echo "   Last step, in Plivo: Voice -> Applications -> Add New Application:"
+    echo "     Answer URL  ->  https://$name:8443/phone/voice   (POST)"
+    echo "     Hangup URL  ->  https://$name:8443/phone/status  (POST)"
+    echo "   Save it, then Phone Numbers -> your NOVA number -> Application Type: XML Application -> pick it."
+  else
+    echo "   Last step, in Twilio: Phone Numbers -> your NOVA number -> Voice configuration:"
+    echo "     A call comes in  ->  Webhook  ->  https://$name:8443/phone/voice   (HTTP POST)"
+  fi
   echo "   Then call your NOVA number from your phone, type your PIN, and talk."
   echo "   NOVA can call you too: \"Nova, call me\" or \"Nova, call me at 7 to wake me up\"."
 }
@@ -535,6 +559,25 @@ cmd_connect() {
   esac
 }
 
+cmd_voice_reboot() {
+  # lets NOVA restart this computer when you say "Nova, reboot the hub" (and "Nova, confirm"):
+  # one sudoers line allowing exactly `systemctl reboot` without a password, for you only
+  local rule="/etc/sudoers.d/nova-reboot"
+  case "${1:-}" in
+    on)
+      local answer
+      read -rp "   Let NOVA restart this hub by voice (it still asks for \"Nova, confirm\")? This adds $rule. (y/n) " answer
+      [[ "$answer" =~ ^[Yy] ]] || { note "nothing changed"; return 0; }
+      printf '%s ALL=(root) NOPASSWD: /usr/bin/systemctl reboot\n' "$USER" | sudo tee "$rule.tmp" >/dev/null
+      sudo chmod 440 "$rule.tmp"
+      if sudo visudo -cf "$rule.tmp" >/dev/null; then sudo mv "$rule.tmp" "$rule"; good "NOVA can restart the hub by voice"
+      else sudo rm -f "$rule.tmp"; bad "the rule didn't check out; nothing changed"; return 1; fi
+      ;;
+    off) sudo rm -f "$rule"; good "NOVA can no longer restart the hub" ;;
+    *) echo "usage: nova-hub voice-reboot on|off" ;;
+  esac
+}
+
 cmd_logs() {
   journalctl --user -u nova-hub -n "${1:-60}" --no-pager
 }
@@ -568,5 +611,6 @@ case "${1:-status}" in
   apikey) cmd_apikey ;;
   face)   shift; cmd_face "$@" ;;
   connect) shift; cmd_connect "$@" ;;
-  *) sed -n '2,22p' "$0"; exit 1 ;;
+  voice-reboot) shift; cmd_voice_reboot "$@" ;;
+  *) sed -n '2,23p' "$0"; exit 1 ;;
 esac

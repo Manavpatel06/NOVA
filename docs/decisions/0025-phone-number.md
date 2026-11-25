@@ -42,3 +42,13 @@ He accepted about $1 a month plus per-minute charges.
 - Tailscale's `--set-path` mapping. `nova-hub phone` posts an unsigned test call to its own public URL and
   expects 403 from NOVA's signature check.
 - Twilio's speech recognition quality and the round-trip time on a real call.
+
+## Update 2026-11-25: Plivo as well as Twilio
+Manav asked for the cheapest number. Plivo: a US number is about $0.50 a month, calls about half a cent a minute
+inbound and a cent outbound, and the trial gives free credit without a card. `nova-hub phone` now asks which carrier
+(Plivo first). The gate is unchanged: Plivo's `X-Plivo-Signature-V3` (HMAC-SHA256 of the URL, "." and the form sorted by
+name as name+value, "." and the nonce, with the Auth Token; any of several comma-separated signatures), then only NOVA's
+and Manav's numbers (compared as digits, since Plivo may leave off the "+"), then the PIN. Plivo call ids are UUIDs; its
+XML uses `<Speak>`, `<GetInput>` (dtmf for the PIN, speech after) and `<Wait>`. NOVA calls out with
+`POST https://api.plivo.com/v1/Account/{auth_id}/Call/` (answer and hangup URLs on the Funnel route), and
+`api.plivo.com` joins the hub's egress allowlist. Settings without a carrier stay Twilio.

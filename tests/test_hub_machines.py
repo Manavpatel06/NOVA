@@ -171,3 +171,18 @@ def test_runnable_list_covers_the_dangerous_ones():
     from nova.system.winops import RUNNABLE
 
     assert {"exe", "bat", "cmd", "ps1", "vbs", "js", "msi", "lnk", "url", "hta", "scr", "docm", "xlsm", "reg"} <= RUNNABLE
+
+
+def test_update_and_reboot_need_nova_confirm_and_say_what_happened(monkeypatch):
+    from nova.hub import ops
+
+    skills = hub_skills.make()
+    assert skills["update_nova"].tier is Tier.CONFIRM and skills["reboot_hub"].tier is Tier.CONFIRM
+    started = []
+    monkeypatch.setattr(ops, "start", lambda what: started.append(what) or (True, ""))
+    assert asyncio.run(skills["update_nova"].handler(None)).text.startswith("Updating from GitHub now")
+    assert asyncio.run(skills["reboot_hub"].handler(None)).text.startswith("Restarting the hub")
+    assert started == ["update", "reboot"]
+    monkeypatch.setattr(ops, "start", lambda what: (False, "sudo: a password is required"))
+    reply = asyncio.run(skills["reboot_hub"].handler(None))
+    assert not reply.success and "nova-hub voice-reboot on" in reply.text

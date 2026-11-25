@@ -11,6 +11,9 @@ hub's NOVA), never offered on the laptop:
     credit. Read from /proc and /sys -- nothing is run.
   * restart_nova (ACT): NOVA on the hub restarts itself (systemd brings it
     back), e.g. after `nova-hub connect` or when something seems stuck.
+  * update_nova (CONFIRM): `nova-hub update` -- the latest NOVA from GitHub.
+  * reboot_hub (CONFIRM): restart the hub computer (after `nova-hub
+    voice-reboot on`). Both through nova/hub/ops.py's fixed commands.
 """
 from __future__ import annotations
 
@@ -131,7 +134,35 @@ def make(*, connectors: Any = None, devices: Any = None, spend: Callable[[], Any
         restart(6.0)
         return Reply(text="Restarting. I'll be back in about twenty seconds.")
 
+    async def update_nova(ctx):
+        from nova.hub import ops
+
+        ok, why = await asyncio.to_thread(ops.start, "update")
+        if not ok:
+            return Reply(text=f"I couldn't start the update ({why}). Run nova-hub update at the hub.", success=False)
+        return Reply(text="Updating from GitHub now. I'll restart when it's done -- give me a minute.")
+
+    async def reboot_hub(ctx):
+        from nova.hub import ops
+
+        ok, why = await asyncio.to_thread(ops.start, "reboot")
+        if not ok:
+            hint = " Turn it on once with nova-hub voice-reboot on." if "password" in why or "sudo" in why else ""
+            return Reply(text=f"I couldn't restart the hub ({why}).{hint}", success=False)
+        return Reply(text="Restarting the hub. I'll be back in about two minutes.")
+
     return {
+        "update_nova": SkillSpec(
+            name="update_nova", tier=Tier.CONFIRM,
+            examples=("update yourself from github", "pull the latest nova", "update nova on the hub"),
+            description="Install the latest NOVA from GitHub on the hub and restart (not building new skills: "
+                        "that's upgrade_nova).",
+            trusts_input=False, handler=update_nova, confirm_phrase="update NOVA on the hub from GitHub"),
+        "reboot_hub": SkillSpec(
+            name="reboot_hub", tier=Tier.CONFIRM,
+            examples=("reboot the hub", "restart the hub computer", "restart the old laptop"),
+            description="Restart the hub computer itself (NOVA is away ~2 minutes). Not the main laptop.",
+            trusts_input=False, handler=reboot_hub, confirm_phrase="restart the hub computer"),
         "hub_status": SkillSpec(
             name="hub_status", tier=Tier.READ,
             examples=("how's the hub", "hub status", "is the hub okay", "how's the hub's battery"),

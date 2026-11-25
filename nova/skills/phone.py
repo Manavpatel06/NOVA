@@ -1,4 +1,4 @@
-"""NOVA phones Manav (ADR 0025): "Nova, call me" -- from NOVA's own Twilio
+"""NOVA phones Manav (ADR 0025): "Nova, call me" -- from NOVA's own (Plivo or Twilio)
 number, through the hub. Needs `nova-hub phone` set up on the hub; to talk
 on the call, Manav types his PIN first."""
 from __future__ import annotations

@@ -61,7 +61,29 @@ def make_server(service: HubService, port: int) -> ThreadingHTTPServer:
         def log_message(self, fmt: str, *args: Any) -> None:  # noqa: A003 -- no paths/bodies in our logs
             return
 
+        def _read(self, length: int) -> bytes:
+            self._read_for = id(self.headers)
+            return self.rfile.read(length)
+
+        def _drain(self) -> None:
+            """A request refused before its body was read: read (and drop) the
+            body first, up to the size limit. Otherwise Windows resets the
+            connection and the client never sees the refusal."""
+            if getattr(self, "_read_for", None) == id(self.headers) or self.command not in ("POST", "PUT"):
+                return
+            self._read_for = id(self.headers)
+            try:
+                length = int(self.headers.get("content-length") or 0)
+            except ValueError:
+                return
+            if 0 < length <= 65_536:   # small bodies only; a big refused one just gets the connection closed
+                try:
+                    self.rfile.read(length)
+                except OSError:
+                    pass
+
         def _send(self, status: int, payload: dict[str, Any]) -> None:
+            self._drain()
             data = json.dumps(payload).encode("utf-8")
             self.send_response(status)
             self.send_header("content-type", "application/json")
@@ -80,7 +102,7 @@ def make_server(service: HubService, port: int) -> ThreadingHTTPServer:
             if length <= 0 or length > MAX_BODY:
                 raise HubError("body missing or too large")
             try:
-                return json.loads(self.rfile.read(length).decode("utf-8"))
+                return json.loads(self._read(length).decode("utf-8"))
             except (UnicodeDecodeError, json.JSONDecodeError):
                 raise HubError("body is not JSON") from None
 
@@ -203,9 +225,11 @@ def make_server(service: HubService, port: int) -> ThreadingHTTPServer:
                 self._send(HTTPStatus.BAD_REQUEST, {"error": "bad request"})
                 return
             try:
-                form = dict(parse_qsl(self.rfile.read(length).decode("utf-8"), keep_blank_values=True,
+                form = dict(parse_qsl(self._read(length).decode("utf-8"), keep_blank_values=True,
                                       max_num_fields=60))
-                status, twiml = service.phone_webhook(route, query, form, self.headers.get("x-twilio-signature"))
+                sigs = {h: self.headers.get(h) for h in ("x-twilio-signature", "x-plivo-signature-v3",
+                                                         "x-plivo-signature-v3-nonce")}
+                status, twiml = service.phone_webhook(route, query, form, sigs)
             except Exception as exc:  # noqa: BLE001 -- never a stack trace to the internet
                 _log.error("phone webhook failed (%s)", type(exc).__name__)
                 status, twiml = 500, '<?xml version="1.0" encoding="UTF-8"?><Response><Hangup/></Response>'

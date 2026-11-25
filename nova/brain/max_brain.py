@@ -140,6 +140,9 @@ class MaxBrain:
         self._tainted = False
         self._unavailable_until = 0.0
         self._carry: str | None = None
+        from nova.brain.aliases import EmailAliases
+
+        self._aliases = EmailAliases()   # addresses Manav says -> [EMAIL-n] for Claude
 
     def system_prompt(self) -> str:
         prompt = SYSTEM_PROMPT + PROTOCOL + tool_catalogue(self._skills_provider())
@@ -176,6 +179,7 @@ class MaxBrain:
         self._carry = f"{self._carry}\n{line}" if self._carry else line
 
     async def forget(self) -> None:
+        self._aliases.forget()
         sess, self._session = self._session, None
         self._tainted = False
         self._carry = None
@@ -197,7 +201,8 @@ class MaxBrain:
         terms = tuple(self._config.security.redact_terms)
         context = redact(self._context_provider(), redact_terms=terms)
         carry, self._carry = self._carry, None
-        message = (f"{carry}\n" if carry else "") + (f"[{context}]\n" if context else "") + f"Manav: {text}"
+        said = self._aliases.alias(text)
+        message = (f"{carry}\n" if carry else "") + (f"[{context}]\n" if context else "") + f"Manav: {said}"
         session = self._ensure_session()
         skills = self._skills_provider()
         tainted = self._tainted
@@ -242,7 +247,7 @@ class MaxBrain:
             for name, params in todo:
                 tools_ran = True
                 try:
-                    out, ok = await invoke_tool(name, params, tainted)
+                    out, ok = await invoke_tool(name, self._aliases.restore(params), tainted)
                 except Exception as exc:  # noqa: BLE001
                     out, ok = f"error: {exc}", False
                 all_ok = all_ok and ok
@@ -251,7 +256,8 @@ class MaxBrain:
                 if getattr(skills.get(name), "untrusted_output", False):
                     tainted = True
                     self._tainted = True
-                results.append(f"- {name}: {'ok' if ok else 'FAILED'} -- {redact(str(out), redact_terms=terms)}")
+                results.append(f"- {name}: {'ok' if ok else 'FAILED'} -- "
+                               f"{redact(self._aliases.known(str(out)), redact_terms=terms)}")
 
             if obj.get("final") is True and all_ok and say:
                 # Spoken now, no second round trip. The results ride along at
@@ -265,7 +271,7 @@ class MaxBrain:
 
         self._last_turn_at = self._clock()
         _log.info("Max brain: actions=%s, web=%s", actions_done or "none", used_web)
-        return AgentResult(text=say or "Done.", actions=actions_done, used_web=used_web)
+        return AgentResult(text=self._aliases.restore(say or "Done."), actions=actions_done, used_web=used_web)
 
     async def close(self) -> None:
         await self.forget()

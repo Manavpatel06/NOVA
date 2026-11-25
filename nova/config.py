@@ -443,6 +443,11 @@ class BrainConfig:
     #: Claude model (a full id, or "haiku"/"sonnet" for the max mode).
     #: Haiku is the fastest current model.
     model: str = "claude-haiku-5-5"
+    #: the right model for each task (2026-11-25, api mode): questions that need
+    #: real thinking -- explain, compare, plan, write, solve, "think hard" --
+    #: go to this stronger model; commands and small talk stay on `model`.
+    #: Empty = always `model`.
+    hard_model: str = "claude-sonnet-5-5"
     max_tokens: int = field(default=600, metadata={"bounds": Bounds(lo=64, hi=4096)})
     #: tool-use rounds per sentence ("open YouTube in Brave and play lofi" = 2-3)
     max_steps: int = field(default=6, metadata={"bounds": Bounds(lo=1, hi=12)})
@@ -555,6 +560,9 @@ class HubConfig:
     #: NOVA; unclear ones are judged by Claude on the API credit. 0 = off
     #: (every sentence needs the name, as before).
     conversation_s: float = field(default=60.0, metadata={"bounds": Bounds(lo=0.0, hi=600.0)})
+    #: NOVA warns first (2026-11-25): at this local hour, an iPhone heads-up of
+    #: how many Canvas assignments are due in the next two days. -1 = off.
+    heads_up_hour: int = field(default=8, metadata={"bounds": Bounds(lo=-1, hi=23)})
 
 
 @dataclass(frozen=True)

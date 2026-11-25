@@ -197,7 +197,7 @@ class HubService:
         except PhoneError as exc:
             raise HubError(str(exc)) from None
 
-    def phone_webhook(self, route: str, query: str, form: dict[str, str], signature: str | None) -> tuple[int, str]:
+    def phone_webhook(self, route: str, query: str, form: dict[str, str], signature: Any) -> tuple[int, str]:
         if self.phone is None:
             return 404, '<?xml version="1.0" encoding="UTF-8"?><Response><Reject/></Response>'
         return self.phone.webhook(route, query, form, signature)

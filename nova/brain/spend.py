@@ -27,7 +27,11 @@ _log = get_logger("brain.spend")
 #: over 100k tokens cost 5x on Haiku 5.5; NOVA's are a few thousand.
 PRICES: dict[str, tuple[float, float, float, float]] = {
     "claude-haiku-5-5": (0.10, 0.125, 0.01, 0.50),
+    "claude-sonnet-5-5": (2.0, 2.50, 0.10, 10.0),
+    "claude-opus-5-5": (4.0, 5.0, 0.20, 20.0),
 }
+#: only Haiku 5.5 is priced by prompt length (5x over 100k tokens)
+LONG_PROMPT_MODELS = frozenset({"claude-haiku-5-5"})
 #: an unknown model is charged as if it were expensive, never as free
 UNKNOWN = (5.0, 6.25, 0.50, 25.0)
 LONG_PROMPT = 100_000
@@ -45,7 +49,7 @@ def cost(model: str, usage: Any) -> float:
     p_in, p_write, p_read, p_out = PRICES.get(model, UNKNOWN)
     inp, write, read, out = (n("input_tokens"), n("cache_creation_input_tokens"),
                              n("cache_read_input_tokens"), n("output_tokens"))
-    scale = 5.0 if model in PRICES and inp + write + read > LONG_PROMPT else 1.0
+    scale = 5.0 if model in LONG_PROMPT_MODELS and inp + write + read > LONG_PROMPT else 1.0
     dollars = scale * (inp * p_in + write * p_write + read * p_read + out * p_out) / 1_000_000
     server = usage.get("server_tool_use")
     if isinstance(server, dict):

@@ -125,6 +125,9 @@ brain:
   mode: max              # max | api | router
   where: auto            # auto | hub | laptop -- where the Claude conversation runs (ADR 0021)
   model: claude-haiku-5-5
+  # questions that need real thinking (explain, compare, plan, write, solve,
+  # "think hard") go to this stronger model in api mode; "" = always `model`
+  hard_model: claude-sonnet-5-5
   max_tokens: 600
   max_steps: 6
   history_turns: 8
@@ -188,3 +191,6 @@ hub:
   # docs/decisions/0029: after "Nova, ..." keep talking without the name
   # until this many quiet seconds; Claude judges unclear sentences. 0 = off
   conversation_s: 60.0
+  # NOVA warns first: hub unplugged / hot / disk full, and at this hour a
+  # heads-up of Canvas assignments due in the next two days (-1 = off)
+  heads_up_hour: 8

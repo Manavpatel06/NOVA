@@ -43,13 +43,15 @@ def _egress(config, audit: AuditLog | None = None) -> Egress:
     # here (ADR 0023), Open-Meteo for the weather skill -- nothing else
     # (the `claude` and `git` programs it runs make their own connections)
     from nova.hub.phone import API_HOST as TWILIO_HOST
+    from nova.hub.phone import PLIVO_HOST
     from nova.skills.weather import FORECAST_URL, GEOCODE_URL
 
     # + Twilio's API, used only when phone calls are set up (ADR 0025)
     from nova.brain.agent import API_URL
 
     # + Anthropic's API when NOVA thinks with Manav's API credit (ADR 0026)
-    hosts = [BARK_HOST, FORECAST_URL.split("/")[2], GEOCODE_URL.split("/")[2], TWILIO_HOST, API_URL.split("/")[2]]
+    hosts = [BARK_HOST, FORECAST_URL.split("/")[2], GEOCODE_URL.split("/")[2], TWILIO_HOST, PLIVO_HOST,
+             API_URL.split("/")[2]]
     return Egress(hosts, audit=audit or _audit(config), redact_terms=config.security.redact_terms,
                   loopback_ports=[config.hub.ollama_port])
 
@@ -282,6 +284,21 @@ def serve(config) -> int:
             time.sleep(TICK_S)
 
     threading.Thread(target=scheduler, name="reminders", daemon=True).start()
+
+    from nova.hub.watch import Watch
+
+    watch = Watch(bark.say, connectors=connectors, state_path=DATA_DIR / "watch.json",
+                  heads_up_hour=config.hub.heads_up_hour)
+
+    def watcher() -> None:   # NOVA warns first: power, heat, disk, the morning heads-up
+        while True:
+            time.sleep(60)
+            try:
+                watch.tick()
+            except Exception as exc:  # noqa: BLE001
+                _log.error("watch tick failed (%s)", type(exc).__name__)
+
+    threading.Thread(target=watcher, name="watch", daemon=True).start()
     server = make_server(service, config.hub.port)
     _log.info("nova-hub listening on 127.0.0.1:%d", config.hub.port)
     try:
@@ -328,7 +345,7 @@ def phone_setup(config) -> int:
     try:
         values = json.loads(sys.stdin.read())
         write_settings(DATA_DIR / "phone.json", **{k: str(values.get(k, "")).strip() for k in (
-            "account_sid", "auth_token", "nova_number", "owner_number", "pin")})
+            "account_sid", "auth_token", "nova_number", "owner_number", "pin", "provider")})
     except (PhoneError, ValueError, TypeError) as exc:
         print(f"Not saved: {exc}")
         return 1
