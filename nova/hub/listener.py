@@ -13,6 +13,14 @@ open on the hub can't reach this port under some other name and pass). The firew
 (setup_hub.sh) already drops everything not coming over Tailscale.
 
 Requests and replies are small JSON. Sentence text is never logged here.
+
+Cross-site requests are refused (2026-11-25). The owner check is about the
+DEVICE (Tailscale names who is connecting, not which web page), so without
+this any website open in a browser on one of Manav's devices could fire
+requests here -- it couldn't read the answers, but it could start things.
+Browsers always mark such requests (Origin / Sec-Fetch-Site), and a request
+body must be declared JSON, which browsers can't send cross-site without
+asking first (CORS preflight, which this server never grants).
 """
 from __future__ import annotations
 
@@ -64,6 +72,9 @@ def make_server(service: HubService, port: int) -> ThreadingHTTPServer:
             self.wfile.write(data)
 
         def _body(self) -> Any:
+            ctype = (self.headers.get("content-type") or "").split(";")[0].strip().lower()
+            if ctype != "application/json":
+                raise HubError("body must be sent as application/json")
             try:
                 length = int(self.headers.get("content-length") or 0)
             except ValueError:
@@ -79,7 +90,22 @@ def make_server(service: HubService, port: int) -> ThreadingHTTPServer:
             return service.host_ok(self.headers.get("host"), port_bound) and service.is_owner(
                 self.headers.get(OWNER_HEADER))
 
+        def _cross_site(self) -> bool:
+            """A browser sent this from some other website."""
+            fetch_site = (self.headers.get("sec-fetch-site") or "").strip().lower()
+            if fetch_site and fetch_site not in ("same-origin", "none"):
+                return True
+            origin = (self.headers.get("origin") or "").strip().lower().rstrip("/")
+            if not origin:
+                return False
+            name = service.hub_name()
+            return not name or origin != f"https://{name}"
+
         def _owner_only(self) -> bool:
+            if self._cross_site():
+                _log.warning("refused %s %s: sent from another website", self.command, self.path)
+                self._send(HTTPStatus.FORBIDDEN, {"error": "cross-site requests are not allowed"})
+                return False
             if self._is_owner():
                 return True
             _log.warning("refused %s %s: not the hub's owner", self.command, self.path)

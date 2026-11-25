@@ -268,6 +268,8 @@ def hub(tmp_path):
 def _call(addr, method, path, body=None, login=None, raw=False):
     data = None if body is None else json.dumps(body).encode()
     req = urllib.request.Request(f"http://{addr[0]}:{addr[1]}{path}", data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
     if login:
         req.add_header(OWNER_HEADER, login)
     try:

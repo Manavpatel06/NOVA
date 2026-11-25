@@ -247,11 +247,15 @@ def hub(tmp_path):
     server.server_close()
 
 
-def _call(addr, method, path, body=None, login=None):
+def _call(addr, method, path, body=None, login=None, headers=None):
     data = None if body is None else (body if isinstance(body, bytes) else json.dumps(body).encode())
     req = urllib.request.Request(f"http://{addr[0]}:{addr[1]}{path}", data=data, method=method)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
     if login:
         req.add_header(OWNER_HEADER, login)
+    for k, v in (headers or {}).items():
+        req.add_header(k, v)
     try:
         with urllib.request.urlopen(req, timeout=5) as r:
             return r.status, json.loads(r.read())
@@ -280,6 +284,31 @@ def test_bad_requests_get_400_and_unknown_paths_404(hub):
     assert _call(addr, "POST", "/v1/route", {"text": ""}, login="manav@example.com")[0] == 400
     assert _call(addr, "GET", "/v1/route")[0] == 404
     assert _call(addr, "POST", "/v1/shell", {"x": 1}, login="manav@example.com")[0] == 404
+
+
+@pytest.mark.parametrize("headers", [
+    {"Origin": "https://evil.example"},
+    {"Origin": "null"},
+    {"Sec-Fetch-Site": "cross-site"},
+    {"Sec-Fetch-Site": "same-site"},
+    {"Content-Type": "text/plain"},
+])
+def test_requests_from_other_websites_are_refused_even_for_the_owner(hub, headers):
+    # Tailscale names the DEVICE, so a web page open on Manav's phone would pass
+    # the owner check; the browser's own markings are what give it away
+    addr, model = hub
+    status, _ = _call(addr, "POST", "/v1/route", {"text": "mute", "tools": []}, login="manav@example.com",
+                      headers=headers)
+    assert status in (400, 403)
+    assert model.seen == []
+
+
+def test_same_origin_and_non_browser_requests_still_work(hub, tmp_path):
+    addr, _ = hub
+    ok = {"text": "mute", "tools": []}
+    assert _call(addr, "POST", "/v1/route", ok, login="manav@example.com")[0] == 200
+    assert _call(addr, "POST", "/v1/route", ok, login="manav@example.com",
+                 headers={"Sec-Fetch-Site": "same-origin"})[0] == 200
 
 
 # --- laptop side: what the hub may propose ---------------------------------------------------
@@ -564,6 +593,8 @@ def _call_host(addr, method, path, body, host, login):
     data = json.dumps(body).encode() if body is not None else None
     req = urllib.request.Request(f"http://{addr[0]}:{addr[1]}{path}", data=data, method=method)
     req.add_header("Host", host)
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
     if login:
         req.add_header(OWNER_HEADER, login)
     try:
@@ -582,6 +613,19 @@ def test_requests_for_some_other_name_are_refused_even_with_the_owner_header(hub
     status, body = _call_host(addr, "POST", "/v1/route", {"text": "mute", "tools": []}, "nova-hub.tail1.ts.net",
                               "manav@example.com")
     assert status == 200 and body["tool"] == "mute"
+
+
+def test_the_hubs_own_pages_may_call_it(hub, tmp_path):
+    addr, _ = hub
+    (tmp_path / "hub_name").write_text("nova-hub.tail1.ts.net\n")
+    req = urllib.request.Request(f"http://{addr[0]}:{addr[1]}/v1/route",
+                                 data=json.dumps({"text": "mute", "tools": []}).encode(), method="POST")
+    for k, v in {"Host": "nova-hub.tail1.ts.net", "Content-Type": "application/json",
+                 "Origin": "https://nova-hub.tail1.ts.net", "Sec-Fetch-Site": "same-origin",
+                 OWNER_HEADER: "manav@example.com"}.items():
+        req.add_header(k, v)
+    with urllib.request.urlopen(req, timeout=5) as r:
+        assert r.status == 200
 
 
 def test_other_tailnet_devices_get_only_ok_from_health(hub, tmp_path):

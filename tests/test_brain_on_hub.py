@@ -105,6 +105,7 @@ def test_brain_routes_are_owner_only_over_http(tmp_path, host):
         def call(path, body, login=None):
             req = urllib.request.Request(f"http://{addr[0]}:{addr[1]}{path}", data=json.dumps(body).encode(),
                                          method="POST")
+            req.add_header("Content-Type", "application/json")
             if login:
                 req.add_header(OWNER_HEADER, login)
             try:
