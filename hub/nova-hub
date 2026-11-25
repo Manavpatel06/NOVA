@@ -287,7 +287,7 @@ cmd_voice() {
   good "speech libraries installed"
   mkdir -p "$models/tts" "$models/hf"
   while read -r sum file; do
-    if ! echo "$sum  $models/tts/$file" | sha256sum -c --status 2>/dev/null; then
+    if ! echo "$sum  $models/tts/$file" | sha256sum -c --status >/dev/null 2>&1; then
       curl -fsSL --retry 3 -o "$models/tts/$file.part" "$KOKORO_URL/$file" || { bad "couldn't download $file"; return 1; }
       echo "$sum  $models/tts/$file.part" | sha256sum -c --status || { rm -f "$models/tts/$file.part"; bad "$file didn't match its checksum"; return 1; }
       mv "$models/tts/$file.part" "$models/tts/$file"
@@ -295,7 +295,7 @@ cmd_voice() {
   done <<< "$KOKORO_FILES"
   good "voice files (checked against known checksums)"
   mkdir -p "$models/vad"
-  if ! echo "$VAD_SUM  $models/vad/silero_vad.onnx" | sha256sum -c --status 2>/dev/null; then
+  if ! echo "$VAD_SUM  $models/vad/silero_vad.onnx" | sha256sum -c --status >/dev/null 2>&1; then
     curl -fsSL --retry 3 -o "$models/vad/silero_vad.onnx.part" "$VAD_URL" || { bad "couldn't download the speech detector"; return 1; }
     echo "$VAD_SUM  $models/vad/silero_vad.onnx.part" | sha256sum -c --status \
       || { rm -f "$models/vad/silero_vad.onnx.part"; bad "the speech detector didn't match its checksum"; return 1; }
