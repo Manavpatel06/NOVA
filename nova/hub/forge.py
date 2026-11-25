@@ -368,7 +368,19 @@ class Forge:
         if not self._sandbox:
             return self._run(cmd, tree, TEST_TIMEOUT_S, None)
         venv = str(self.test_python.parent.parent)
-        argv = [self._exe("bwrap"), *self._system(), "--unshare-all", "--ro-bind", venv, venv,
+        # the interpreter the venv points at (a system python on the hub, but
+        # possibly elsewhere): visible read-only, or the venv can't start
+        bases = {str(self.test_python.resolve().parent.parent)}
+        try:  # the path the venv was made with, which may itself go through a link
+            for line in (self.test_python.parent.parent / "pyvenv.cfg").read_text(encoding="utf-8").splitlines():
+                key, _, value = line.partition("=")
+                if key.strip() == "home" and value.strip():
+                    bases.add(str(Path(value.strip()).parent))
+        except OSError:
+            pass
+        extra = [arg for b in sorted(bases) if not (b == "/usr" or b.startswith("/usr/"))
+                 for arg in ("--ro-bind", b, b)]
+        argv = [self._exe("bwrap"), *self._system(), "--unshare-all", *extra, "--ro-bind", venv, venv,
                 "--bind", str(tree), str(tree), "--setenv", "HOME", "/tmp", "--chdir", str(tree), *cmd]
         return self._run(argv, tree, TEST_TIMEOUT_S, {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"})
 
