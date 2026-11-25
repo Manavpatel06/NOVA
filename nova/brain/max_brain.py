@@ -163,6 +163,7 @@ class MaxBrain:
 
     def _ensure_session(self) -> Any:
         if self._session is None:
+            self._tool_names = frozenset(self._skills_provider())
             self._session = self._session_factory(self.system_prompt())
             self._tainted = False
         return self._session
@@ -188,6 +189,8 @@ class MaxBrain:
         if self._session is not None and (
             (self._last_turn_at is not None and now - self._last_turn_at > cfg.history_idle_s)
             or getattr(self._session, "turns", 0) >= max(4, 3 * cfg.history_turns)
+            # the tool list is in the session's prompt: a connected app came or went (ADR 0030)
+            or frozenset(self._skills_provider()) != getattr(self, "_tool_names", frozenset())
         ):
             await self.forget()  # fresh memory, and any web taint goes with it
 

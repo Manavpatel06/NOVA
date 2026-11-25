@@ -260,6 +260,9 @@ class SkillSpec:
     untrusted_output: bool = False
     # How NOVA asks out loud for approval, e.g. "close {app}" -> "Should I close spotify?"
     confirm_phrase: str | None = None
+    # Connected apps (ADR 0030): the tool's own JSON-schema parameters, used
+    # for the brain's tool list instead of "every parameter is a string".
+    input_schema: dict[str, Any] | None = None
 
     async def invoke(self, ctx: SkillCtx, **params: Any) -> Reply:
         # Layer 2 of docs/SECURITY_SPEC.md §1.3: the skill-parameter binder's

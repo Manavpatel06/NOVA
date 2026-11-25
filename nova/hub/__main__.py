@@ -97,7 +97,22 @@ def _restart_soon(delay_s: float = 15.0) -> None:
     threading.Timer(delay_s, go).start()
 
 
-def _talk(config, egress: Egress, audit: AuditLog, devices=None, face=None):
+def _connectors():
+    """Connected apps (ADR 0030): the MCP servers `nova-hub connect` set up."""
+    from nova.hub.connectors import Connectors
+
+    def builtin() -> set:
+        import nova.skills  # noqa: F401 -- registers the skills
+        from nova.skills.registry import all_skills
+
+        return set(all_skills())
+
+    c = Connectors(DATA_DIR / "connectors.json", DATA_DIR / "connectors", builtin=builtin)
+    c.start()   # in the background: NOVA answers while they start
+    return c
+
+
+def _talk(config, egress: Egress, audit: AuditLog, devices=None, face=None, connectors=None):
     """NOVA itself, on the hub (ADR 0023/0024): the assistant behind the talk
     page, the laptop link and the hub's own mic."""
     if not config.hub.assistant:
@@ -111,7 +126,7 @@ def _talk(config, egress: Egress, audit: AuditLog, devices=None, face=None):
     missing = voice.missing()
     if missing:
         _log.warning("Talk page is text-only until `nova-hub voice` installs: %s", ", ".join(missing))
-    assistant = HubAssistant(config, audit=audit, egress=egress, devices=devices,
+    assistant = HubAssistant(config, audit=audit, egress=egress, devices=devices, connectors=connectors,
                              local_skills={"apply_upgrade": hub_apply_upgrade(devices, _restart_soon)})
     judge = None
     if config.hub.conversation_s > 0:
@@ -229,7 +244,8 @@ def serve(config) -> int:
     devices = Devices() if config.hub.assistant else None
     face = Face()
     face.devices = devices
-    talk = _talk(config, egress, audit, devices, face)
+    connectors = _connectors() if config.hub.assistant else None
+    talk = _talk(config, egress, audit, devices, face, connectors)
     phone = None
     if talk is not None:
         from nova.hub.phone import Phone
@@ -243,6 +259,7 @@ def serve(config) -> int:
     builder.recover()
     service = HubService(model=model, data_dir=DATA_DIR, notifier=bark, brain=_brain(config, egress, audit),
                          forge=_forge(egress, bark.say), talk=talk, devices=devices, phone=phone, builder=builder, face=face)
+    service.connectors = connectors
     _hub_ears(config, talk)
     if service.talk is not None:
         from nova.brain.hub_tier import use_local_service

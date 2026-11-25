@@ -18,6 +18,7 @@
 #   nova-hub phone     give NOVA a real phone number (Twilio): call it, or it calls you
 #   nova-hub apikey    use your monthly Claude API credit first (faster), Max plan after
 #   nova-hub face on|off   NOVA's live face as this laptop's desktop background, screen kept awake
+#   nova-hub connect   your apps for NOVA: google (Gmail drafts + Calendar) | canvas | signin EMAIL | add | list
 set -uo pipefail
 
 NOVA_DIR="${NOVA_DIR:-$HOME/NOVA}"
@@ -513,6 +514,27 @@ DESK
   esac
 }
 
+cmd_connect() {
+  # ADR 0030: connected apps -- Gmail + Calendar (all your Google accounts), Canvas, any MCP server
+  if [[ ! -x "$NOVA_DIR/.venv/bin/uvx" ]]; then
+    local answer
+    read -rp "   Connected apps run with uv (from PyPI, ~40 MB, into NOVA's own folder). Install it? (y/n) " answer
+    [[ "$answer" =~ ^[Yy] ]] || { note "nothing changed"; return 1; }
+    "$PY" -m pip install -q uv || { bad "couldn't install uv"; return 1; }
+    good "uv installed"
+  fi
+  command -v bwrap >/dev/null 2>&1 || { bad "connected apps run sandboxed: sudo apt install bubblewrap"; return 1; }
+  # signing in needs the sign-in page's return port (localhost:8000) free: pause NOVA meanwhile
+  [[ "${1:-}" == "signin" ]] && systemctl --user stop nova-hub
+  (cd "$NOVA_DIR" && "$PY" -m nova.hub.connectors "$@") || { [[ "${1:-}" == "signin" ]] && systemctl --user start nova-hub; return 1; }
+  case "${1:-list}" in
+    google|canvas|add|remove|on|off|signin)
+      systemctl --user restart nova-hub
+      good "NOVA restarted with your apps (first start downloads each one: give it a minute)"
+      ;;
+  esac
+}
+
 cmd_logs() {
   journalctl --user -u nova-hub -n "${1:-60}" --no-pager
 }
@@ -545,5 +567,6 @@ case "${1:-status}" in
   phone)  cmd_phone ;;
   apikey) cmd_apikey ;;
   face)   shift; cmd_face "$@" ;;
-  *) sed -n '2,21p' "$0"; exit 1 ;;
+  connect) shift; cmd_connect "$@" ;;
+  *) sed -n '2,22p' "$0"; exit 1 ;;
 esac

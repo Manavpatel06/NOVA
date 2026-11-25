@@ -114,6 +114,13 @@ def tool_definitions(skills: dict[str, Any]) -> list[dict[str, Any]]:
         if spec.name in RESERVED_TOOL_NAMES:
             _log.error("Skill %r shadows a Claude server tool name; left out of the brain", spec.name)
             continue
+        examples = "; ".join(f'"{e}"' for e in spec.examples[:4])
+        tier = getattr(spec.tier, "name", str(spec.tier))
+        schema = getattr(spec, "input_schema", None)
+        if isinstance(schema, dict):  # a connected app's tool (ADR 0030)
+            tools.append({"name": spec.name, "description": f"{spec.description} (tier {tier})."[:1000],
+                          "input_schema": schema})
+            continue
         props: dict[str, Any] = {}
         required: list[str] = []
         for pname, p in inspect.signature(spec.handler).parameters.items():
@@ -122,8 +129,6 @@ def tool_definitions(skills: dict[str, Any]) -> list[dict[str, Any]]:
             props[pname] = {"type": "string", "description": pname.replace("_", " ")}
             if p.default is inspect.Parameter.empty:
                 required.append(pname)
-        examples = "; ".join(f'"{e}"' for e in spec.examples[:4])
-        tier = getattr(spec.tier, "name", str(spec.tier))
         desc = f"{spec.description} (tier {tier}). Example requests: {examples}."
         tools.append({
             "name": spec.name,

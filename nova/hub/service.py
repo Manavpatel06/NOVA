@@ -62,6 +62,7 @@ class HubService:
         "/v1/phone/call": "phone_call",
         "/v1/build/start": "build_start",
         "/v1/build/list": "build_list",
+        "/v1/connectors": "connectors_status",
     }
 
     def __init__(
@@ -165,6 +166,14 @@ class HubService:
             return self.builder.start(body.get("request"), name)
         except ValueError as exc:
             raise HubError(str(exc)) from None
+
+    connectors: Any = None   # connected apps (ADR 0030), set by serve()
+
+    def connectors_status(self, body: Any = None) -> dict[str, Any]:
+        """Which connected apps are running, and how many tools each offers (no secrets)."""
+        if self.connectors is None:
+            return {"connectors": []}
+        return {"connectors": self.connectors.status()}
 
     def build_list(self, body: Any = None) -> dict[str, Any]:
         if self.builder is None:

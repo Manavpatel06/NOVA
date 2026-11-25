@@ -66,6 +66,7 @@ class HubAssistant:
         journal: bool = True,
         devices: Any | None = None,
         local_skills: dict[str, Any] | None = None,
+        connectors: Any | None = None,
     ) -> None:
         import nova.skills  # noqa: F401 -- registers the skills
         from nova.brain.router import Router
@@ -78,6 +79,7 @@ class HubAssistant:
         self._journal = journal
         self.devices = devices
         self._extra = dict(local_skills or {})   # hub-side replacements (apply_upgrade)
+        self.connectors = connectors             # connected apps (ADR 0030)
         self._proxies: dict[str, Any] = {}
         self._channel: Channel | None = None
         self._strict = False
@@ -105,6 +107,14 @@ class HubAssistant:
                 out[name] = spec
             elif self.devices is not None and name not in NOT_REMOTE:
                 out[name] = self._proxy(spec)
+        if self.connectors is not None:
+            try:
+                apps = self.connectors.skills()
+            except Exception as exc:  # noqa: BLE001 -- a broken connector never costs NOVA its own skills
+                _log.warning("connected apps unavailable (%s)", type(exc).__name__)
+                apps = {}
+            for name, spec in apps.items():
+                out.setdefault(name, spec)
         return out
 
     def is_remote(self, name: str) -> bool:
@@ -195,8 +205,16 @@ class HubAssistant:
         now = datetime.now().strftime("%A %B %d %Y, %I:%M %p").replace(" 0", " ")
         laptop = ("laptop connected" if self.devices is not None and self.devices.online(LAPTOP)
                   else "laptop NOT connected: laptop skills will fail, say so instead of trying")
+        apps = ""
+        if self.connectors is not None:
+            try:
+                notes = self.connectors.notes()
+            except Exception:  # noqa: BLE001
+                notes = {}
+            if notes:
+                apps = "; connected apps -- " + "; ".join(f"{k}: {v}" for k, v in sorted(notes.items()))
         return (f"{now}; {self.config.weather.location_name}; talking from: "
-                f"{getattr(self._channel, 'name', 'phone')}; {laptop}")
+                f"{getattr(self._channel, 'name', 'phone')}; {laptop}{apps}")
 
     async def warm_up(self) -> None:
         if self.brain is not None and hasattr(self.brain, "warm_up"):
