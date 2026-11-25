@@ -1,0 +1,7 @@
+{
+  "uuid": "nova-face@nova",
+  "name": "NOVA face",
+  "description": "Shows NOVA's live face (the NOVA face app) as the desktop background, behind every window.",
+  "shell-version": ["46", "47", "48", "49", "50", "51"],
+  "url": "https://github.com/Manavpatel06/NOVA"
+}

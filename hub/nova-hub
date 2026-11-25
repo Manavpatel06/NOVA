@@ -17,7 +17,7 @@
 #   nova-hub ears on|off   the hub's own mic + speaker: say "Nova, ..." in the room
 #   nova-hub phone     give NOVA a real phone number (Twilio): call it, or it calls you
 #   nova-hub apikey    use your monthly Claude API credit first (faster), Max plan after
-#   nova-hub face on|off   NOVA's live face full-screen on this laptop's display, screen kept awake
+#   nova-hub face on|off   NOVA's live face as this laptop's desktop background, screen kept awake
 set -uo pipefail
 
 NOVA_DIR="${NOVA_DIR:-$HOME/NOVA}"
@@ -405,41 +405,74 @@ cmd_apikey() {
   good "NOVA on the hub now thinks with your API credit first"
 }
 
-FACE_URL="http://127.0.0.1:$PORT/face"
 FACE_AUTOSTART="$HOME/.config/autostart/nova-face.desktop"
 
-face_browser() {
-  # its own profile, so it never fights a Firefox window you open yourself
-  local profile
-  if [[ -d "$HOME/snap/firefox" ]]; then profile="$HOME/snap/firefox/common/nova-face"; else profile="$HOME/.nova-face"; fi
-  mkdir -p "$profile"
-  if command -v firefox >/dev/null 2>&1; then
-    echo "firefox --new-instance --profile $profile --kiosk $FACE_URL"
-  elif command -v chromium >/dev/null 2>&1; then
-    echo "chromium --kiosk --noerrdialogs --disable-session-crashed-bubble --user-data-dir=$profile $FACE_URL"
+FACE_EXT_UUID="nova-face@nova"
+FACE_EXT_DIR="$HOME/.local/share/gnome-shell/extensions/$FACE_EXT_UUID"
+
+face_deps() {
+  # GTK 4 + WebKitGTK for the face app (system Python, not NOVA's venv)
+  /usr/bin/python3 -c 'import gi; gi.require_version("Gtk","4.0"); gi.require_version("WebKit","6.0")' 2>/dev/null && return 0
+  local answer
+  read -rp "   The face app needs GTK 4 + WebKitGTK from Ubuntu (python3-gi gir1.2-gtk-4.0 gir1.2-webkit-6.0, ~60 MB). Install? (y/n) " answer
+  [[ "$answer" =~ ^[Yy] ]] || return 1
+  sudo apt-get install -y python3-gi gir1.2-gtk-4.0 gir1.2-webkit-6.0 >/dev/null
+}
+
+face_extension_on() {
+  mkdir -p "$FACE_EXT_DIR"
+  cp "$NOVA_DIR/hub/face/$FACE_EXT_UUID/"* "$FACE_EXT_DIR/"
+  gsettings set org.gnome.shell disable-user-extensions false 2>/dev/null
+  if gnome-extensions enable "$FACE_EXT_UUID" 2>/dev/null; then
+    return 0
   fi
+  # GNOME Shell on Wayland only sees a new extension after you sign in again;
+  # list it now so it switches on by itself at that sign-in.
+  local cur; cur=$(gsettings get org.gnome.shell enabled-extensions 2>/dev/null)
+  if [[ "$cur" != *"$FACE_EXT_UUID"* ]]; then
+    if [[ "$cur" == "@as []" || -z "$cur" ]]; then cur="['$FACE_EXT_UUID']"; else cur="${cur%]}, '$FACE_EXT_UUID']"; fi
+    gsettings set org.gnome.shell enabled-extensions "$cur"
+  fi
+  return 2
+}
+
+face_extension_off() {
+  gnome-extensions disable "$FACE_EXT_UUID" 2>/dev/null
+  local cur; cur=$(gsettings get org.gnome.shell enabled-extensions 2>/dev/null)
+  if [[ "$cur" == *"$FACE_EXT_UUID"* ]]; then
+    cur=$(sed -e "s/, '$FACE_EXT_UUID'//; s/'$FACE_EXT_UUID', //; s/'$FACE_EXT_UUID'//" <<<"$cur")
+    gsettings set org.gnome.shell enabled-extensions "$cur"
+  fi
+  rm -rf "$FACE_EXT_DIR"
 }
 
 cmd_face() {
-  # ADR 0028: NOVA's face on the hub's own screen, kept awake (lid open).
+  # ADR 0028: NOVA's face is the hub's desktop -- a live wallpaper behind every
+  # window, so the terminal and apps open on top of it. Screen kept awake (lid open).
+  local launch="/usr/bin/python3 $NOVA_DIR/hub/face/renderer.py"
   case "${1:-}" in
     on)
-      say "NOVA's face on this screen"
+      say "NOVA's face as this screen's background"
       if [[ -z "${WAYLAND_DISPLAY:-}${DISPLAY:-}" ]]; then
         bad "run this in a terminal on the hub's own desktop (not over SSH)"; return 1
       fi
-      local launch; launch=$(face_browser)
-      [[ -n "$launch" ]] || { bad "no browser found -- install Firefox: sudo snap install firefox"; return 1; }
+      face_deps || { bad "the face app needs GTK 4 + WebKitGTK"; return 1; }
+      good "face app ready"
+      face_extension_on; local ext=$?
+      if [[ $ext -eq 0 ]]; then good "background add-on on"; else note "background add-on installed -- it switches on after you sign out and back in once"; fi
+      pkill -f "nova-face" 2>/dev/null || true             # the old Firefox kiosk, if it was running
+      rm -rf "$HOME/.nova-face" "$HOME/snap/firefox/common/nova-face" 2>/dev/null
       mkdir -p "$(dirname "$FACE_AUTOSTART")"
       cat > "$FACE_AUTOSTART" <<DESK
 [Desktop Entry]
 Type=Application
 Name=NOVA face
-Comment=NOVA live on this screen
-Exec=sh -c "sleep 8; $launch"
+Comment=NOVA live as this screen's background
+Exec=sh -c "sleep 5; exec $launch"
+StartupWMClass=io.nova.face
 X-GNOME-Autostart-enabled=true
 DESK
-      good "opens by itself whenever you sign in"
+      good "starts by itself whenever you sign in"
       gsettings set org.gnome.desktop.session idle-delay 0 2>/dev/null
       gsettings set org.gnome.settings-daemon.plugins.power idle-dim false 2>/dev/null
       gsettings set org.gnome.settings-daemon.plugins.power sleep-inactive-ac-type 'nothing' 2>/dev/null
@@ -454,20 +487,27 @@ DESK
         sudo sed -i "/^\[daemon\]/a AutomaticLoginEnable=true\nAutomaticLogin=$USER" "$conf"
         good "signs in automatically after a restart"
       else
-        note "after a restart, sign in once and the face opens"
+        note "after a restart, sign in once and the face starts"
       fi
-      nohup sh -c "$launch" >/dev/null 2>&1 &
-      good "NOVA's face is up (Alt+F4 closes it; nova-hub face on opens it again)"
+      pkill -f "hub/face/renderer.py" 2>/dev/null || true
+      nohup $launch >/dev/null 2>&1 &
+      if [[ $ext -eq 0 ]]; then
+        good "NOVA's face is your background -- open Terminal or any app on top of it"
+      else
+        note "until you sign out and in once, the face shows full-screen as a normal window (Super key to get past it)"
+      fi
       ;;
     off)
       rm -f "$FACE_AUTOSTART"
+      pkill -f "hub/face/renderer.py" 2>/dev/null || true
       pkill -f "nova-face" 2>/dev/null || true
+      face_extension_off
       gsettings set org.gnome.desktop.session idle-delay 300 2>/dev/null
       gsettings set org.gnome.settings-daemon.plugins.power idle-dim true 2>/dev/null
       if grep -q '^AutomaticLoginEnable=true' /etc/gdm3/custom.conf 2>/dev/null; then
         sudo sed -i -e '/^AutomaticLoginEnable=true/d' -e "/^AutomaticLogin=$USER/d" /etc/gdm3/custom.conf
       fi
-      good "face off; the screen sleeps normally again"
+      good "face off; your normal wallpaper is back and the screen sleeps normally again"
       ;;
     *) echo "usage: nova-hub face on|off" ;;
   esac

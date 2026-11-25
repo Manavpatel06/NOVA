@@ -319,3 +319,37 @@ def test_nobody_else_sees_what_was_said(hub, headers):
     headers = {k: v.replace("{port}", str(hub[1])) for k, v in headers.items()}
     status, body, _ = _get(hub, "/v1/face/state", **headers)
     assert status in (403, 404) and "secret" not in body
+
+
+# --- the face as the hub's desktop background (ADR 0028) ----------------------
+
+_REPO = Path(__file__).resolve().parents[1]
+_FACE = _REPO / "hub" / "face"
+
+
+def test_the_background_app_shows_the_hubs_own_face_page():
+    src = (_FACE / "renderer.py").read_text(encoding="utf-8")
+    assert 'URL = "http://127.0.0.1:8765/face"' in src   # loopback only: the face's own-screen access rule
+    assert "load-failed" in src                          # comes back when the service restarts
+
+
+def test_the_extension_and_the_app_agree_on_the_window():
+    src = (_FACE / "renderer.py").read_text(encoding="utf-8")
+    ext = (_FACE / "nova-face@nova" / "extension.js").read_text(encoding="utf-8")
+    assert 'TITLE = "NOVA face"' in src and "const TITLE = 'NOVA face';" in ext
+    assert 'APP_ID = "io.nova.face"' in src and "'io.nova.face'" in ext
+    assert "_backgroundGroup" in ext and "disable()" in ext
+
+
+def test_the_extension_metadata_matches_its_folder():
+    meta = json.loads((_FACE / "nova-face@nova" / "metadata.json").read_text(encoding="utf-8"))
+    assert meta["uuid"] == "nova-face@nova"
+    assert all(v.isdigit() for v in meta["shell-version"])
+
+
+def test_face_on_uses_the_background_app_not_a_browser():
+    script = (_REPO / "hub" / "nova-hub").read_text(encoding="utf-8")
+    body = script[script.index("cmd_face() {"):script.index("cmd_logs() {")]
+    assert "hub/face/renderer.py" in body and "face_extension_on" in body
+    assert "--kiosk" not in script
+    assert "(y/n)" in body        # apt install and auto sign-in are both asked
