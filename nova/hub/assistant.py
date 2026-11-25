@@ -88,6 +88,7 @@ class HubAssistant:
         ))
         self.router = Router(confidence_floor=config.brain.confidence_floor,
                              ambiguity_margin=config.brain.ambiguity_margin)
+        self.spend = None
         self.brain = brain if brain is not None else self._make_brain()
 
     # --- setup ------------------------------------------------------------
@@ -170,8 +171,22 @@ class HubAssistant:
             except ClaudeCliNotFound:
                 return False
 
-        return MaxBrain(self.config, session_factory=session, skills_provider=self.skills,
-                        cli_available=cli_ok, context_provider=self._context)
+        max_brain = MaxBrain(self.config, session_factory=session, skills_provider=self.skills,
+                             cli_available=cli_ok, context_provider=self._context)
+        if getattr(self.config.hub, "brain", "api_first") != "api_first":
+            return max_brain
+        # ADR 0026: Manav's monthly API credit first (faster, and it saves the
+        # Max plan for coding), the Max plan when the credit or the key isn't there
+        import dataclasses as dc
+
+        from nova.brain.agent import Agent
+        from nova.brain.spend import Spend
+
+        self.spend = Spend(DATA_DIR / "api_spend.json", budget_usd=self.config.brain.api_budget_usd)
+        api_cfg = dc.replace(self.config, brain=dc.replace(self.config.brain, mode="api"))
+        api = Agent(api_cfg, self.egress, skills_provider=self.skills, context_provider=self._context,
+                    spend=self.spend)
+        return FirstAvailable([("api", api), ("max", max_brain)])
 
     def _context(self) -> str:
         from datetime import datetime
@@ -286,6 +301,45 @@ class HubAssistant:
         if match.spec is None or match.clarification is not None or match.confidence < 1.0:
             return None
         return match if match.spec.name in allowed else None
+
+
+class FirstAvailable:
+    """Several brains, best first (ADR 0026). A sentence goes to the first one
+    available; if it can't be reached before anything happened (it returns
+    None), the next one gets the same sentence. Instant commands are noted to
+    all of them, so whichever answers next knows what just happened."""
+
+    def __init__(self, brains: list[tuple[str, Any]]) -> None:
+        self.brains = brains
+        self.last = ""
+
+    def available(self) -> bool:
+        return any(b.available() for _, b in self.brains)
+
+    def note(self, said: str, reply: str) -> None:
+        for _, b in self.brains:
+            note = getattr(b, "note", None)
+            if note is not None:
+                note(said, reply)
+
+    async def warm_up(self) -> None:
+        for name, b in self.brains:
+            if b.available() and hasattr(b, "warm_up"):
+                await b.warm_up()
+                return  # warm only the one that will answer
+
+    async def respond(self, text: str, invoke_tool: Any) -> Any:
+        for name, b in self.brains:
+            if not b.available():
+                continue
+            result = await b.respond(text, invoke_tool)
+            if result is not None:
+                if name != self.last:
+                    _log.info("Brain: answering with %s", name)
+                self.last = name
+                return result
+            _log.warning("Brain %s couldn't answer; trying the next", name)
+        return None
 
 
 def hub_apply_upgrade(devices: Any, restart: Callable[[], None]) -> Any:

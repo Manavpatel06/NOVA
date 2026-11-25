@@ -141,6 +141,7 @@ class Agent:
         skills_provider: Callable[[], dict[str, Any]] | None = None,
         context_provider: Callable[[], str] | None = None,
         clock: Callable[[], float] = time.monotonic,
+        spend: Any = None,
     ) -> None:
         from nova.brain.keys import get_api_key
         from nova.skills.registry import all_skills
@@ -151,6 +152,8 @@ class Agent:
         self._skills_provider = skills_provider or all_skills
         self._context_provider = context_provider or (lambda: "")
         self._clock = clock
+        #: nova.brain.spend.Spend (ADR 0026): the monthly credit budget
+        self._spend = spend
         self._history: list[dict[str, Any]] = []   # plain text user/assistant pairs only
         #: one flag per remembered exchange (parallel to _history's pairs):
         #: True when that exchange saw web content. A later turn is tainted
@@ -181,6 +184,7 @@ class Agent:
             cfg.mode == "api"
             and self._egress is not None
             and self._disabled_reason is None
+            and (self._spend is None or self._spend.allowed())
             and self._api_key() is not None
         )
 
@@ -253,6 +257,8 @@ class Agent:
             except Exception as exc:  # noqa: BLE001
                 status = getattr(exc, "status", None)
                 _log.error("Brain request failed (%s)", exc)
+                if self._spend is not None and status in (400, 402, 403) and "credit" in str(exc).lower():
+                    self._spend.mark_exhausted()
                 if status in (401, 403):
                     self._key = None  # re-read later; maybe he fixes it
                     self._key_checked_at = self._clock()
@@ -260,6 +266,8 @@ class Agent:
                     return None  # nothing happened yet: let the router try
                 break
 
+            if self._spend is not None:
+                self._spend.record(cfg.model, reply.get("usage"))
             blocks = reply.get("content") or []
             stop = reply.get("stop_reason")
             texts = [b.get("text", "") for b in blocks if b.get("type") == "text"]

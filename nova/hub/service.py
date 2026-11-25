@@ -215,6 +215,11 @@ class HubService:
         if self.devices is not None:
             out["devices"] = self.devices.status()
         out["phone"] = bool(self.phone is not None and self.phone.configured())
+        spend = getattr(getattr(self.talk, "assistant", None), "spend", None)
+        if spend is not None:
+            from nova.brain.keys import get_api_key
+
+            out["api"] = {**spend.status(), "key_set": get_api_key() is not None}
         out["voice_ready"] = bool(self.talk is not None and self.talk.voice_ready())
         out["alerts_ready"] = bool(self._notifier is not None and self._notifier.configured())
         state = self._read_state()

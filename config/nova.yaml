@@ -131,6 +131,9 @@ brain:
   history_idle_s: 600
   web_search: true
   request_timeout_s: 20
+  # the hub uses the monthly API credit until this estimated spend, then the
+  # Max plan until the 1st (docs/decisions/0026; credit is $100/month)
+  api_budget_usd: 90
 
 governor:
   # Measured, not modelled -- see docs/GOVERNOR_MEASUREMENTS.md for the
@@ -179,3 +182,6 @@ hub:
   listen: true
   # the hub's own mic and speaker -- turn on with: nova-hub ears on
   hub_ears: false
+  # docs/decisions/0026: think with the monthly API credit first (key set
+  # with `nova-hub apikey`), the Max plan after brain.api_budget_usd
+  brain: api_first

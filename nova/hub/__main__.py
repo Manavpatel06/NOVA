@@ -46,7 +46,10 @@ def _egress(config, audit: AuditLog | None = None) -> Egress:
     from nova.skills.weather import FORECAST_URL, GEOCODE_URL
 
     # + Twilio's API, used only when phone calls are set up (ADR 0025)
-    hosts = [BARK_HOST, FORECAST_URL.split("/")[2], GEOCODE_URL.split("/")[2], TWILIO_HOST]
+    from nova.brain.agent import API_URL
+
+    # + Anthropic's API when NOVA thinks with Manav's API credit (ADR 0026)
+    hosts = [BARK_HOST, FORECAST_URL.split("/")[2], GEOCODE_URL.split("/")[2], TWILIO_HOST, API_URL.split("/")[2]]
     return Egress(hosts, audit=audit or _audit(config), redact_terms=config.security.redact_terms,
                   loopback_ports=[config.hub.ollama_port])
 
@@ -293,12 +296,29 @@ def phone_setup(config) -> int:
     return 0
 
 
+def apikey_setup(config) -> int:
+    """`nova-hub apikey`: the key arrives on stdin (never argv), is saved 0600,
+    then proven with one tiny request."""
+    from nova.brain.agent import check_key
+    from nova.brain.keys import set_file_key
+
+    try:
+        set_file_key(sys.stdin.read())
+    except ValueError as exc:
+        print(f"Not saved: {exc}")
+        return 1
+    ok, message = check_key()
+    print(message)
+    return 0 if ok else 1
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m nova.hub")
-    parser.add_argument("command", choices=["serve", "selftest", "ping", "phone-setup"])
+    parser.add_argument("command", choices=["serve", "selftest", "ping", "phone-setup", "apikey-setup"])
     args = parser.parse_args(argv)
     config = load_config()
-    return {"serve": serve, "selftest": selftest, "ping": ping, "phone-setup": phone_setup}[args.command](config)
+    return {"serve": serve, "selftest": selftest, "ping": ping, "phone-setup": phone_setup,
+            "apikey-setup": apikey_setup}[args.command](config)
 
 
 if __name__ == "__main__":

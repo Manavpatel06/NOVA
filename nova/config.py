@@ -437,6 +437,9 @@ class BrainConfig:
     #: when hub.host is set, this laptop's `claude` if the hub can't be
     #: reached; "hub" = hub only; "laptop" = never the hub.
     where: str = "auto"
+    #: ADR 0026: estimated monthly API spend at which the hub switches to the
+    #: Max plan until next month (Manav's credit is $100/month)
+    api_budget_usd: float = field(default=90.0, metadata={"bounds": Bounds(lo=0.0, hi=10000.0)})
     #: Claude model (a full id, or "haiku"/"sonnet" for the max mode).
     #: Haiku is the fastest current model.
     model: str = "claude-haiku-5-5"
@@ -543,6 +546,10 @@ class HubConfig:
     listen: bool = True
     #: the hub's own mic and speaker (phase 3, hub side)
     hub_ears: bool = False
+    #: which Claude the hub's NOVA thinks with (ADR 0026): "api_first" = Manav's
+    #: monthly API credit while under brain.api_budget_usd (and a key is set
+    #: with `nova-hub apikey`), else the Max plan; "max" = Max plan only
+    brain: str = "api_first"
 
 
 @dataclass(frozen=True)
