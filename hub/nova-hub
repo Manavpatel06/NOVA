@@ -277,8 +277,13 @@ cmd_voice() {
   # happen here, once -- NOVA itself never downloads anything.
   say "NOVA's ears and voice on the hub (one-time download, about 900 MB)"
   local models="$NOVA_DIR/models" stt
-  "$NOVA_DIR/.venv/bin/pip" install -q numpy "faster-whisper==1.2.1" "kokoro-onnx==0.5.0" onnxruntime \
-    || { bad "couldn't install the speech libraries"; return 1; }
+  "$NOVA_DIR/.venv/bin/pip" install -q numpy "faster-whisper==1.2.1" onnxruntime "espeakng-loader>=0.2.4" \
+    "phonemizer-fork>=3.3.2" || { bad "couldn't install the speech libraries"; return 1; }
+  # kokoro-onnx 0.5.0 is plain Python but declares Python <3.14, and the hub
+  # has 3.14; its dependencies are installed above, and it was checked to
+  # speak (and be heard back word for word) on 3.14
+  "$NOVA_DIR/.venv/bin/pip" install -q --no-deps --ignore-requires-python "kokoro-onnx==0.5.0" \
+    || { bad "couldn't install the Kokoro voice library"; return 1; }
   good "speech libraries installed"
   mkdir -p "$models/tts" "$models/hf"
   while read -r sum file; do
