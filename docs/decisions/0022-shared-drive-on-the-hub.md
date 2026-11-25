@@ -15,16 +15,28 @@ forge.
   answers y/n in the script before the task is created. `-Remove` undoes everything on the laptop.
 
 ## How it is kept private
-- Samba listens only on `lo` and `tailscale0` (`bind interfaces only`). `hosts allow` covers only loopback
-  and Tailscale's ranges (100.64.0.0/10, fd7a:115c:a1e0::/48).
-- UFW already allows nothing but `tailscale0` (ADR 0019).
-- The smbd unit is ordered after tailscaled and waits for `tailscale0`, so it never comes up on the Wi-Fi.
-- After a restart, `nova-hub share` reads what port 445 is actually bound to. If anything is not loopback or
-  Tailscale, it stops smbd and fails.
-- Connections require SMB3 with encryption, so traffic is encrypted twice (WireGuard, then SMB).
+Samba can't bind to `tailscale0`: it skips interfaces that aren't broadcast ("not adding non-broadcast
+interface"), and Tailscale's is point-to-point. That was confirmed on the real hub and reproduced with a
+point-to-point /32 tun device. So smbd listens on all addresses, and four independent layers keep the share
+Tailscale-only:
+1. **UFW** (ADR 0019) accepts incoming traffic only on `tailscale0`.
+2. **systemd `RestrictNetworkInterfaces=lo tailscale0`** on smbd: the kernel drops smbd's packets on any
+   other interface. The filter is fixed when smbd starts, so smbd has `PartOf=tailscaled.service` and
+   restarts with Tailscale. It also starts after Tailscale and waits for `tailscale0`.
+3. **systemd `IPAddressDeny=any` / `IPAddressAllow=localhost 100.64.0.0/10 fd7a:115c:a1e0::/48`** on smbd.
+4. **Samba `hosts allow`** with the same ranges. Tested: a connection from a 192.168.x address is dropped
+   while the Tailscale address works.
+
+`nova-hub share` checks that UFW is active, that both systemd filters show on smbd and that smbd is running.
+If any is missing it stops smbd and says so.
+
+Other protections:
+- Connections require SMB3 with encryption, so traffic is encrypted twice (WireGuard, then SMB). Tested:
+  SMB2 is refused.
 - Access:
   - Manav's own account is the only valid user.
-  - There are no guests, no anonymous access, no NetBIOS and no printers.
+  - There are no guests, no anonymous access, no NetBIOS and no printers. Tested: a wrong password and an
+    anonymous login are refused.
   - Files are created 0640 and folders 0750.
 - The original `smb.conf` is kept as `smb.conf.before-nova`.
 

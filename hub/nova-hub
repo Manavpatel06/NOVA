@@ -176,9 +176,12 @@ cmd_upgrades() {
 }
 
 cmd_share() {
-  # A network drive for your laptop (ADR 0022): ~/Shared on this hub, served
-  # by Samba ONLY on Tailscale (and loopback), SMB3 with encryption required,
-  # your account only, no guests. The firewall already drops everything else.
+  # A network drive for your laptop (ADR 0022): ~/Shared on this hub, reachable
+  # ONLY over Tailscale, SMB3 with encryption required, your account only, no
+  # guests. Samba can't bind to tailscale0 (it skips non-broadcast interfaces),
+  # so it listens normally and four layers keep it Tailscale-only: the firewall
+  # (UFW, tailscale0 only), systemd's per-service interface and address
+  # filters, and Samba's own hosts allow.
   local share="$HOME/Shared"
   say "Shared drive: \\\\nova-hub\\nova  ->  $share"
   sudo apt-get -y -qq install samba >/dev/null || { bad "couldn't install Samba"; return 1; }
@@ -189,8 +192,7 @@ cmd_share() {
 # NOVA hub (nova-hub share): one private share, reachable only over Tailscale.
 [global]
    server string = nova-hub
-   interfaces = lo tailscale0
-   bind interfaces only = yes
+   bind interfaces only = no
    hosts allow = 127.0.0.1 100.64.0.0/10 fd7a:115c:a1e0::/48
    hosts deny = 0.0.0.0/0 ::/0
    server min protocol = SMB3
@@ -215,15 +217,20 @@ cmd_share() {
    directory mask = 0750
 CONF
   sudo testparm -s >/dev/null 2>&1 || { bad "Samba config check failed"; return 1; }
-  # start after Tailscale, and wait for its network to exist, so it never
-  # comes up listening on the Wi-Fi instead
+  # The kernel only lets smbd talk over loopback and tailscale0, and only to
+  # loopback and Tailscale addresses. It starts after Tailscale and restarts
+  # with it (the interface filter is fixed when smbd starts).
   sudo mkdir -p /etc/systemd/system/smbd.service.d
   sudo tee /etc/systemd/system/smbd.service.d/90-nova.conf >/dev/null <<'CONF'
 [Unit]
 After=tailscaled.service
 Wants=tailscaled.service
+PartOf=tailscaled.service
 [Service]
 ExecStartPre=/bin/sh -c 'for i in $(seq 1 30); do ip link show tailscale0 >/dev/null 2>&1 && exit 0; sleep 2; done; exit 0'
+RestrictNetworkInterfaces=lo tailscale0
+IPAddressDeny=any
+IPAddressAllow=localhost 100.64.0.0/10 fd7a:115c:a1e0::/48
 CONF
   sudo systemctl disable --now nmbd >/dev/null 2>&1 || true
   sudo systemctl daemon-reload
@@ -233,12 +240,14 @@ CONF
     echo "   Choose a password for the shared drive (your laptop asks for it once, then remembers it):"
     sudo smbpasswd -a "$USER" || { bad "password not set; run nova-hub share again"; return 1; }
   fi
-  sleep 2
-  local stray
-  stray=$(sudo ss -ltnH 'sport = :445' 2>/dev/null | awk '{print $4}' \
-          | grep -vE '^(127\.0\.0\.1|100\.[0-9.]+|\[::1\]|\[fd7a:[0-9a-f:]+\]|\[fe80::[0-9a-f:]+%(tailscale0|lo)\]):445$' || true)
-  if [[ -n "$stray" ]]; then
-    bad "Samba is listening somewhere other than Tailscale -- stopping it"; sudo systemctl stop smbd; return 1
+  # refuse to leave it running unless every layer is really in place
+  local why=""
+  sudo ufw status 2>/dev/null | grep -q "Status: active" || why="the firewall is off"
+  [[ "$(systemctl show smbd -p RestrictNetworkInterfaces --value)" == *tailscale0* ]] || why="the interface filter isn't active"
+  [[ -n "$(systemctl show smbd -p IPAddressDeny --value)" ]] || why="the address filter isn't active"
+  systemctl is-active --quiet smbd || why="Samba didn't start"
+  if [[ -n "$why" ]]; then
+    bad "shared drive NOT turned on: $why"; sudo systemctl stop smbd; return 1
   fi
   good "shared drive on: \\\\$(ts_name | cut -d. -f1)\\nova  (user: $USER)"
   echo "   On your laptop:  powershell -ExecutionPolicy Bypass -File D:\\NOVA\\scripts\\hub_drive.ps1 -User $USER"
