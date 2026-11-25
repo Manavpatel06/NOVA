@@ -1,0 +1,37 @@
+# 0022 — The hub as a shared drive and backup target
+
+Date: 2026-11-25. Manav asked whether the hub's spare storage, RAM and compute could take load off his
+laptop. The answer: storage and backups help a lot (C: is full), and they cost the hub almost nothing.
+Moving compute off the laptop mostly doesn't help, because the hub is slower than the laptop and adds network
+delay. The hub already takes the work that suits it: the local model, the Claude brain, reminders and the
+forge.
+
+## What it is
+- `nova-hub share` installs Samba and shares `~/Shared` on the hub as `\\nova-hub\nova`.
+- `scripts/hub_drive.ps1 -User <name>` maps it as `H:` on the laptop. Windows prompts for the password
+  (`cmdkey /pass`), and Windows remembers it. NOVA never sees it.
+- `hub_drive.ps1 -Backup <folders>` can add a daily 02:30 scheduled task. The task robocopy-mirrors those
+  folders to `\\nova-hub\nova\backups\<name>` and skips venvs, caches, `node_modules` and models. Manav
+  answers y/n in the script before the task is created. `-Remove` undoes everything on the laptop.
+
+## How it is kept private
+- Samba listens only on `lo` and `tailscale0` (`bind interfaces only`). `hosts allow` covers only loopback
+  and Tailscale's ranges (100.64.0.0/10, fd7a:115c:a1e0::/48).
+- UFW already allows nothing but `tailscale0` (ADR 0019).
+- The smbd unit is ordered after tailscaled and waits for `tailscale0`, so it never comes up on the Wi-Fi.
+- After a restart, `nova-hub share` reads what port 445 is actually bound to. If anything is not loopback or
+  Tailscale, it stops smbd and fails.
+- Connections require SMB3 with encryption, so traffic is encrypted twice (WireGuard, then SMB).
+- Access:
+  - Manav's own account is the only valid user.
+  - There are no guests, no anonymous access, no NetBIOS and no printers.
+  - Files are created 0640 and folders 0750.
+- The original `smb.conf` is kept as `smb.conf.before-nova`.
+
+## Limits
+- Backups are a **mirror, not a history**: deleting a file on the laptop deletes it from the backup on the
+  next run. The hub's own nightly snapshot covers NOVA's memory only. Versioned backups of `~/Shared` (for
+  example restic) are a later step if Manav wants them.
+- The hub has 512 GB in one disk, so one copy on the hub is not a full backup. It protects against the laptop
+  failing, not against the hub's disk failing.
+- The share is reachable only while Tailscale is on, on both machines.
