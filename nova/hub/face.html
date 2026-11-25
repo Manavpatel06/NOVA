@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>NOVA</title>
 <style>
-:root { --ink:#0D171C; --ink2:#15232A; --line:#2A3F48; --text:#E6EEF0; --dim:#8FA3AB; --teal:#4AC8B8; --star:#FFD282; --muted:#5B6B72; }
+:root { --ink:#02040c; --ink2:#0b1430; --line:#26304d; --text:#EEF3FF; --dim:#9AA8C8; --teal:#6FD8FF; --star:#FFD282; --muted:#4B5677; }
 * { box-sizing:border-box; }
 html, body { margin:0; height:100%; background:var(--ink); color:var(--text); overflow:hidden; cursor:none;
   font:18px/1.45 "Ubuntu", "Segoe UI", system-ui, sans-serif; }
@@ -17,8 +17,8 @@ canvas { position:absolute; inset:0; width:100%; height:100%; }
 #name { letter-spacing:.35em; font-size:16px; color:var(--dim); }
 #status { position:absolute; left:0; right:0; text-align:center; font-size:17px; letter-spacing:.25em; text-transform:uppercase; color:var(--dim); }
 #talk { position:absolute; left:8%; right:8%; text-align:center; }
-#heard { color:var(--dim); font-size:22px; min-height:1.5em; transition:opacity .6s; }
-#said { color:var(--text); font-size:clamp(20px, 3.6vh, 32px); line-height:1.35; margin-top:8px; overflow:hidden; transition:opacity .6s; }
+#heard { text-shadow:0 2px 10px rgba(0,0,0,.8); color:var(--dim); font-size:22px; min-height:1.5em; transition:opacity .6s; }
+#said { text-shadow:0 2px 12px rgba(0,0,0,.8); color:var(--text); font-size:clamp(18px, 3.2vh, 30px); line-height:1.35; margin-top:8px; overflow:hidden; transition:opacity .6s; }
 #devices { position:absolute; bottom:18px; right:32px; color:var(--dim); font-size:14px; }
 .dot { display:inline-block; width:9px; height:9px; border-radius:50%; background:var(--muted); margin-right:6px; vertical-align:middle; }
 .dot.on { background:var(--teal); }
@@ -34,71 +34,142 @@ canvas { position:absolute; inset:0; width:100%; height:100%; }
 </div>
 <script nonce="__NONCE__">
 (() => {
-  const C = { teal: "#4AC8B8", star: "#FFD282", starHi: "#FFF0D2", line: "#2A3F48", muted: "#5B6B72" };
+  // NOVA as a living nova: a blue-white core inside a turbulent shell of gold and violet filaments,
+  // over a field of stars. What NOVA is doing changes how the whole thing moves.
   const canvas = document.getElementById("orb"), g = canvas.getContext("2d");
-  const talkEl = document.getElementById("talk"), statusEl = document.getElementById("status"), heardEl = document.getElementById("heard"), saidEl = document.getElementById("said");
+  const talkEl = document.getElementById("talk"), statusEl = document.getElementById("status"),
+        heardEl = document.getElementById("heard"), saidEl = document.getElementById("said");
   const clockEl = document.getElementById("clock"), dateEl = document.getElementById("date"), dot = document.getElementById("laptopdot");
+  const reduce = matchMedia("(prefers-reduced-motion: reduce)").matches;
   let state = { mode: "idle", heard: "", said: "", seq: -1, laptop: false, source: "" };
   let lastChange = performance.now(), offline = false;
   const LABEL = { idle: "ready", listening: "listening", thinking: "thinking", speaking: "speaking" };
 
-  function resize() {
-    const dpr = window.devicePixelRatio || 1;
-    canvas.width = innerWidth * dpr; canvas.height = innerHeight * dpr; g.setTransform(dpr, 0, 0, dpr, 0, 0);
-  }
-  addEventListener("resize", resize); resize();
+  // how each mode looks; the drawing eases between them so changes flow
+  const LOOK = {
+    idle:      { core: 1.00, bright: 0.80, spin: 0.020, shell: 1.00, flare: 0.25, warm: 0.55, cool: 0.45 },
+    listening: { core: 1.12, bright: 1.00, spin: 0.030, shell: 0.90, flare: 0.35, warm: 0.40, cool: 0.80 },
+    thinking:  { core: 0.95, bright: 0.85, spin: 0.110, shell: 1.04, flare: 0.55, warm: 0.85, cool: 0.35 },
+    speaking:  { core: 1.10, bright: 1.15, spin: 0.045, shell: 1.12, flare: 0.90, warm: 0.70, cool: 0.70 },
+    offline:   { core: 0.70, bright: 0.30, spin: 0.008, shell: 0.95, flare: 0.05, warm: 0.30, cool: 0.20 },
+  };
+  const cur = Object.assign({}, LOOK.idle);
 
-  function starPath(cx, cy, long, short) {
-    g.beginPath();
-    for (let k = 0; k < 8; k++) {
-      const ang = Math.PI / 4 * k, r = k % 2 === 0 ? long : short;
-      const x = cx + r * Math.sin(ang), y = cy - r * Math.cos(ang);
-      k === 0 ? g.moveTo(x, y) : g.lineTo(x, y);
-    }
-    g.closePath();
-  }
-  function arc(cx, cy, r, startDeg, extentDeg, color, width) {
-    g.beginPath(); g.strokeStyle = color; g.lineWidth = width; g.lineCap = "round";
-    g.arc(cx, cy, r, (startDeg - 90) * Math.PI / 180, (startDeg - 90 + extentDeg) * Math.PI / 180); g.stroke();
-  }
+  let W = 0, H = 0, stars = [], fil = [];
+  const sprite = (r, g2, b) => {   // a soft glowing dot, drawn once and stamped many times
+    const c = document.createElement("canvas"); c.width = c.height = 64;
+    const x = c.getContext("2d"), grd = x.createRadialGradient(32, 32, 0, 32, 32, 32);
+    grd.addColorStop(0, `rgba(${r},${g2},${b},1)`); grd.addColorStop(0.35, `rgba(${r},${g2},${b},0.35)`);
+    grd.addColorStop(1, `rgba(${r},${g2},${b},0)`); x.fillStyle = grd; x.fillRect(0, 0, 64, 64); return c;
+  };
+  const SPR = { gold: sprite(255, 178, 80), amber: sprite(255, 120, 60), rose: sprite(240, 90, 170),
+                violet: sprite(150, 90, 255), cyan: sprite(90, 220, 255), white: sprite(255, 255, 255) };
+  const WARM = [SPR.gold, SPR.amber, SPR.gold, SPR.rose], COOL = [SPR.violet, SPR.rose, SPR.cyan];
 
-  function draw(now) {
-    const t = now / 1000, w = innerWidth, h = innerHeight;
-    // the whole figure drifts very slowly so an always-on screen never holds one image
-    const base = Math.min(w / 6, h / 8.5);
-    const cx = w / 2 + Math.sin(t / 47) * w * 0.03, cy = h * 0.11 + base * 2.1 + Math.cos(t / 59) * h * 0.012;
-    g.clearRect(0, 0, w, h);
-    const mode = offline ? "offline" : state.mode;
-    let color = C.teal, pulse, scale = 1, glow = 0.18;
-    if (mode === "listening") { pulse = (Math.sin(t * 6) + 1) / 2; glow = 0.28; }
-    else if (mode === "thinking") { color = C.star; pulse = 0.5; scale = 0.95; glow = 0.22; }
-    else if (mode === "speaking") { pulse = (Math.sin(t * 9) + 1) / 2; scale = 1 + 0.08 * Math.sin(t * 9); glow = 0.35; }
-    else if (mode === "offline") { color = C.muted; pulse = 0; scale = 0.85; glow = 0.05; }
-    else { pulse = (Math.sin(t * 1.4) + 1) / 4; scale = 0.95; }
-
-    const grad = g.createRadialGradient(cx, cy, 0, cx, cy, base * 2.6);
-    grad.addColorStop(0, `rgba(74,200,184,${glow})`); grad.addColorStop(1, "rgba(74,200,184,0)");
-    g.fillStyle = grad; g.fillRect(0, 0, w, h);
-
-    [1.42, 1.95].forEach((k, i) => {
-      const r = base * k + (i === 1 ? 10 : 5) * pulse;
-      const c = (i === 0 || mode === "listening" || mode === "speaking") ? color : C.line;
-      arc(cx, cy, r, 40, 100, c, i === 0 ? 7 : 5);
-      arc(cx, cy, r, 220, 100, c, i === 0 ? 7 : 5);
+  function build() {
+    const dpr = Math.min(window.devicePixelRatio || 1, 1.5);
+    W = innerWidth; H = innerHeight;
+    canvas.width = W * dpr; canvas.height = H * dpr; g.setTransform(dpr, 0, 0, dpr, 0, 0);
+    stars = Array.from({ length: Math.round(W * H / 4200) }, () => ({
+      x: Math.random() * W, y: Math.random() * H, r: Math.random() * 1.3 + 0.2,
+      a: Math.random() * 0.7 + 0.15, tw: Math.random() * 6.28, c: Math.random() < 0.15 ? "255,210,160" : Math.random() < 0.3 ? "170,200,255" : "255,255,255" }));
+    const n = reduce ? 600 : 1400;
+    // colour follows depth in the shell: hot gold inside, rose in the middle, violet at the rim,
+    // with a few blue-white strands where the core lights the inner edge
+    fil = Array.from({ length: n }, () => {
+      const depth = Math.pow(Math.random(), 0.9), rad = 0.98 + depth * 0.78;
+      const pick = Math.random();
+      let spr, warm = true;
+      if (depth < 0.12 && pick < 0.35) { spr = SPR.cyan; warm = false; }
+      else if (depth < 0.45) spr = pick < 0.6 ? SPR.gold : SPR.amber;
+      else if (depth < 0.75) spr = pick < 0.45 ? SPR.amber : (pick < 0.8 ? SPR.rose : SPR.gold);
+      else { spr = pick < 0.6 ? SPR.violet : SPR.rose; warm = false; }
+      return { ang: Math.random() * Math.PI * 2, rad, len: 0.06 + Math.random() * 0.24,
+               ph: Math.random() * 6.28, sp: 0.5 + Math.random(), size: 3 + Math.random() * 7,
+               a: 0.06 + Math.random() * 0.18, warm, spr, curl: (Math.random() - 0.5) * 0.05 };
     });
-    if (mode === "thinking") arc(cx, cy, base * 2.35, (t * 240) % 360, 70, C.star, 4);
-    if (mode === "speaking") {  // ripples outward while NOVA talks
-      for (let i = 0; i < 3; i++) {
-        const p = ((t * 0.9) + i / 3) % 1;
-        g.beginPath(); g.strokeStyle = `rgba(74,200,184,${0.35 * (1 - p)})`; g.lineWidth = 2;
-        g.arc(cx, cy, base * (1.2 + p * 1.6), 0, Math.PI * 2); g.stroke();
+  }
+  addEventListener("resize", build); build();
+
+  // speech-like loudness from a few sines, so speaking looks like a voice and not a metronome
+  const voice = t => 0.5 + 0.22 * Math.sin(t * 11.3) + 0.16 * Math.sin(t * 17.9 + 1.3) + 0.12 * Math.sin(t * 5.1 + 0.4);
+
+  let last = performance.now(), turn = 0, slow = 0;
+  function draw(now) {
+    const dt = Math.min(0.05, (now - last) / 1000); last = now;
+    // a slow machine gets fewer filaments rather than a stuttering nova
+    slow = dt > 0.034 ? slow + 1 : Math.max(0, slow - 1);
+    if (slow > 90 && fil.length > 400) { fil.length = Math.floor(fil.length * 0.75); slow = 0; }
+    const t = now / 1000, mode = offline ? "offline" : state.mode, aim = LOOK[mode] || LOOK.idle;
+    for (const k in cur) cur[k] += (aim[k] - cur[k]) * Math.min(1, dt * 2.5);   // ease toward the new look
+    turn += cur.spin * dt * (reduce ? 0.3 : 1);
+
+    const base = Math.min(W / 7, H / 6.8);
+    const cx = W / 2 + Math.sin(t / 47) * W * 0.02, cy = H * 0.10 + base * 2.15 + Math.cos(t / 59) * H * 0.01;
+    const talk = mode === "speaking" ? voice(t) : 0;
+    const listen = mode === "listening" ? 0.5 + 0.5 * Math.sin(t * 3.2) : 0;
+
+    // space
+    g.globalCompositeOperation = "source-over";
+    const sky = g.createRadialGradient(cx, cy, base * 0.5, cx, cy, Math.max(W, H) * 0.8);
+    sky.addColorStop(0, "#0b1430"); sky.addColorStop(0.5, "#060b1f"); sky.addColorStop(1, "#02040c");
+    g.fillStyle = sky; g.fillRect(0, 0, W, H);
+    for (const s of stars) {
+      const a = s.a * (0.65 + 0.35 * Math.sin(t * 1.3 + s.tw));
+      g.fillStyle = `rgba(${s.c},${a})`; g.beginPath(); g.arc(s.x, s.y, s.r, 0, 6.283); g.fill();
+    }
+
+    g.globalCompositeOperation = "lighter";
+    // the nebula's haze
+    const haze = g.createRadialGradient(cx, cy, base * 0.6, cx, cy, base * 2.9 * cur.shell);
+    haze.addColorStop(0, `rgba(120,70,200,${0.10 * cur.bright})`);
+    haze.addColorStop(0.55, `rgba(255,140,70,${0.07 * cur.bright * cur.warm})`);
+    haze.addColorStop(1, "rgba(0,0,0,0)");
+    g.fillStyle = haze; g.fillRect(cx - base * 3.2, cy - base * 3.2, base * 6.4, base * 6.4);
+
+    // the shell: filaments swirling round the core
+    const shellR = base * cur.shell * (1 + 0.06 * talk - 0.05 * listen);
+    for (const f of fil) {
+      const wob = Math.sin(t * 0.6 * f.sp + f.ph) * 0.06 + Math.sin(t * 1.7 * f.sp + f.ph * 2) * 0.03 * cur.flare;
+      const a = f.ang + turn * (1.6 - f.rad * 0.5) + wob;
+      const r1 = shellR * (f.rad + 0.05 * Math.sin(a * 5 + t * 0.8) + (mode === "speaking" ? 0.10 * talk * (f.rad - 0.9) : 0));
+      const r2 = r1 + shellR * f.len * (0.6 + cur.flare);
+      const tint = f.warm ? cur.warm : cur.cool;
+      g.globalAlpha = Math.min(1, f.a * cur.bright * (0.5 + tint));
+      const steps = 7;
+      for (let i = 0; i <= steps; i++) {   // a filament is a run of glows curling outward
+        const rr = r1 + (r2 - r1) * i / steps, aa = a + i * f.curl;
+        const sz = f.size * (1 - i / (steps + 3)) * (base / 120);
+        g.drawImage(f.spr, cx + Math.cos(aa) * rr - sz, cy + Math.sin(aa) * rr - sz, sz * 2, sz * 2);
       }
     }
-    const s = base * scale;
-    starPath(cx, cy, s, s * 0.29); g.fillStyle = mode === "offline" ? C.muted : C.star; g.fill();
-    starPath(cx, cy, s * 0.5, s * 0.17); g.fillStyle = mode === "offline" ? "#8FA3AB" : C.starHi; g.fill();
+    g.globalAlpha = 1;
 
-    const below = cy + base * 2.1;
+    // the core: blue-white, its glow filling the shell
+    const coreR = base * 0.55 * cur.core * (1 + 0.16 * talk + 0.06 * listen + 0.03 * Math.sin(t * 1.4));
+    const corona = g.createRadialGradient(cx, cy, 0, cx, cy, coreR * 2.6);
+    corona.addColorStop(0, `rgba(170,240,255,${0.75 * cur.bright})`);
+    corona.addColorStop(0.4, `rgba(60,190,255,${0.32 * cur.bright})`);
+    corona.addColorStop(1, "rgba(40,110,255,0)");
+    g.fillStyle = corona; g.beginPath(); g.arc(cx, cy, coreR * 2.6, 0, 6.283); g.fill();
+    for (let i = 0; i < 90; i++) {   // the core's surface boils: soft bright cells that drift
+      const a = i * 2.399 + t * 0.15 * (i % 3 - 1), d = coreR * 0.75 * Math.sqrt((i * 0.618) % 1);
+      const sz = coreR * (0.16 + 0.10 * Math.sin(t * 1.9 + i));
+      g.globalAlpha = 0.18 * cur.bright * (1 + talk);
+      g.drawImage(i % 4 ? SPR.white : SPR.cyan, cx + Math.cos(a) * d - sz, cy + Math.sin(a) * d - sz, sz * 2, sz * 2);
+    }
+    g.globalAlpha = 1;
+    const core = g.createRadialGradient(cx, cy, 0, cx, cy, coreR);
+    core.addColorStop(0, "rgba(255,255,255,1)"); core.addColorStop(0.5, `rgba(215,250,255,${0.9 * cur.bright})`);
+    core.addColorStop(1, "rgba(110,215,255,0)");
+    g.fillStyle = core; g.beginPath(); g.arc(cx, cy, coreR, 0, 6.283); g.fill();
+    if (mode === "thinking") {   // a slow bright sweep while it thinks
+      g.strokeStyle = "rgba(255,210,140,0.35)"; g.lineWidth = 3;
+      g.beginPath(); g.arc(cx, cy, shellR * 2.05, t * 2.2, t * 2.2 + 0.9); g.stroke();
+    }
+    g.globalCompositeOperation = "source-over";
+
+    const below = cy + base * 2.0;
     statusEl.style.top = below + "px";
     talkEl.style.top = (below + 34) + "px";
     talkEl.style.bottom = "44px";
@@ -124,7 +195,6 @@ canvas { position:absolute; inset:0; width:100%; height:100%; }
       statusEl.textContent = LABEL[s.mode] + (s.mode !== "idle" && s.source ? " · " + s.source : "");
       heardEl.textContent = s.heard ? "“" + s.heard + "”" : "";
       saidEl.textContent = s.said || "";
-      // the conversation fades after a few quiet minutes; the clock and star stay
       const quiet = s.mode === "idle" && performance.now() - lastChange > 180000;
       heardEl.style.opacity = saidEl.style.opacity = quiet ? 0 : 1;
       dot.classList.toggle("on", !!s.laptop);
