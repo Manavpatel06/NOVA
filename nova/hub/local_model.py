@@ -107,6 +107,11 @@ class LocalModel:
         self._egress.local_json(self._port, "/api/generate",
                                 {"model": self.model, "prompt": "", "keep_alive": -1}, timeout=self._timeout)
 
+    def unload(self) -> None:
+        """Free the model's memory now (it loads again if ever asked)."""
+        self._egress.local_json(self._port, "/api/generate",
+                                {"model": self.model, "prompt": "", "keep_alive": 0}, timeout=self._timeout)
+
     def route(self, text: str, tools: list[dict[str, Any]]) -> dict[str, Any]:
         text = (text or "").strip()[:MAX_TEXT]
         if not text:

@@ -39,9 +39,13 @@ def _audit(config) -> AuditLog:
 
 
 def _egress(config, audit: AuditLog | None = None) -> Egress:
-    # the hub reaches out to exactly one internet host: Bark, for alerts
+    # the hub reaches out to Bark (alerts) and, now that NOVA itself runs
+    # here (ADR 0023), Open-Meteo for the weather skill -- nothing else
     # (the `claude` and `git` programs it runs make their own connections)
-    return Egress([BARK_HOST], audit=audit or _audit(config), redact_terms=config.security.redact_terms,
+    from nova.skills.weather import FORECAST_URL, GEOCODE_URL
+
+    hosts = [BARK_HOST, FORECAST_URL.split("/")[2], GEOCODE_URL.split("/")[2]]
+    return Egress(hosts, audit=audit or _audit(config), redact_terms=config.security.redact_terms,
                   loopback_ports=[config.hub.ollama_port])
 
 
@@ -76,6 +80,54 @@ def _forge(egress: Egress, notify):
     return forge
 
 
+def _talk(config, egress: Egress, audit: AuditLog):
+    """NOVA itself, on the hub (ADR 0023): the assistant behind the talk page."""
+    if not config.hub.assistant:
+        return None
+    from nova.hub.assistant import HubAssistant
+    from nova.hub.talk import Talk
+    from nova.hub.voice import HubVoice
+
+    _adopt_memory()
+    voice = HubVoice(stt_model=config.hub.stt_model, voice=config.tts.voice)
+    missing = voice.missing()
+    if missing:
+        _log.warning("Talk page is text-only until `nova-hub voice` installs: %s", ", ".join(missing))
+    talk = Talk(HubAssistant(config, audit=audit, egress=egress), voice)
+    talk.warm_up()
+    return talk
+
+
+def _adopt_memory() -> None:
+    """The first time NOVA runs here, its memory starts as the copy the
+    laptop mirrored (regular files only, one folder deep at most)."""
+    import shutil
+
+    from nova import MEMORY_DIR
+
+    mirror = DATA_DIR / "memory-mirror"
+    if MEMORY_DIR.exists() and any(MEMORY_DIR.iterdir()):
+        return
+    if not mirror.is_dir():
+        return
+    root = mirror.resolve()
+    copied = 0
+    for src in sorted(mirror.rglob("*")):
+        rel = src.relative_to(mirror)
+        if src.is_symlink() or not src.is_file() or len(rel.parts) > 2:
+            continue
+        if not src.resolve().is_relative_to(root):
+            continue
+        dst = MEMORY_DIR / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if not dst.parent.resolve().is_relative_to(MEMORY_DIR.resolve()) or dst.is_symlink():
+            continue  # realpath on both sides (CLAUDE.md rule 3)
+        shutil.copyfile(src, dst)
+        copied += 1
+    if copied:
+        _log.info("NOVA's memory on the hub starts from the laptop's copy (%d files)", copied)
+
+
 def _model(config, egress: Egress | None = None) -> LocalModel:
     return LocalModel(egress or _egress(config), model=config.hub.model, port=config.hub.ollama_port)
 
@@ -105,18 +157,28 @@ def serve(config) -> int:
     audit = _audit(config)
     egress = _egress(config, audit)
     model = _model(config, egress)
-    for attempt in range(30):  # Ollama may still be starting after a reboot
-        try:
-            model.warm_up()
-            _log.info("Local model %s loaded", model.model)
-            break
-        except Exception as exc:  # noqa: BLE001
-            if attempt == 29:
-                _log.error("Local model not ready (%s); serving anyway, health will say so", exc)
-            time.sleep(2)
+    if config.hub.local_tier:
+        for attempt in range(30):  # Ollama may still be starting after a reboot
+            try:
+                model.warm_up()
+                _log.info("Local model %s loaded", model.model)
+                break
+            except Exception as exc:  # noqa: BLE001
+                if attempt == 29:
+                    _log.error("Local model not ready (%s); serving anyway, health will say so", exc)
+                time.sleep(2)
+    else:
+        try:  # the local lane is off: give its memory to NOVA's voice instead
+            model.unload()
+        except Exception:  # noqa: BLE001 -- Ollama not running is fine too
+            pass
     bark = _bark(config, egress)
     service = HubService(model=model, data_dir=DATA_DIR, notifier=bark, brain=_brain(config, egress, audit),
-                         forge=_forge(egress, bark.say))
+                         forge=_forge(egress, bark.say), talk=_talk(config, egress, audit))
+    if service.talk is not None:
+        from nova.brain.hub_tier import use_local_service
+
+        use_local_service(service)  # NOVA's own skills call this service directly
 
     def scheduler() -> None:
         while True:

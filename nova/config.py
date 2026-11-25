@@ -515,12 +515,13 @@ class HubConfig:
     printed by `nova-hub login`); empty means no hub and NOVA works exactly as
     before. With `local_tier` on, a sentence the instant lane didn't take is
     first offered to the hub's local model, and goes to Claude only when that
-    model isn't sure (saves Max-plan usage). Hub side: the port its service
+    model isn't sure (saves Max-plan usage). Off by default since 2026-11-25:
+    measured 8-16 s per sentence on the hub's CPU, slower than Claude. Hub side: the port its service
     listens on (127.0.0.1 only; `tailscale serve` publishes it) and the Ollama
     model it runs."""
 
     host: str = ""
-    local_tier: bool = True
+    local_tier: bool = False
     #: how long a sentence may wait for the hub before going to Claude
     timeout_s: float = field(default=8.0, metadata={"bounds": Bounds(lo=1.0, hi=60.0)})
     port: int = field(default=8765, metadata={"bounds": Bounds(lo=1024, hi=65535)})
@@ -530,6 +531,12 @@ class HubConfig:
     #: pass through Bark's and Apple's servers). Off: "Reminder -- tap to see
     #: it", and the words stay on the hub, shown when tapped over Tailscale.
     alert_text: bool = False
+    #: NOVA itself on the hub (ADR 0023): the talk page and the assistant
+    #: behind it. Hub side only.
+    assistant: bool = True
+    #: the hub's speech-to-text model (CPU): small.en is the measured-fast
+    #: default; base.en is faster and less accurate
+    stt_model: str = "small.en"
 
 
 @dataclass(frozen=True)

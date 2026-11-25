@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import json
 import re
+import secrets
+from pathlib import Path
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
@@ -36,21 +38,9 @@ from nova.log import get_logger
 _log = get_logger("hub.listener")
 
 BIND_HOST = "127.0.0.1"
+TALK_PAGE = Path(__file__).with_name("talk.html")
 MAX_BODY = 6_000_000
 OWNER_HEADER = "Tailscale-User-Login"
-
-
-#: owner-only JSON routes -> HubService method
-_POST_ROUTES = {
-    "/v1/brain/start": "brain_start",
-    "/v1/brain/send": "brain_send",
-    "/v1/brain/close": "brain_close",
-    "/v1/forge/request": "forge_request",
-    "/v1/forge/list": "forge_list",
-    "/v1/forge/ready": "forge_ready",
-    "/v1/forge/apply": "forge_apply",
-    "/v1/forge/discard": "forge_discard",
-}
 
 
 def make_server(service: HubService, port: int) -> ThreadingHTTPServer:
@@ -121,7 +111,28 @@ def make_server(service: HubService, port: int) -> ThreadingHTTPServer:
             self.end_headers()
             self.wfile.write(data)
 
+        def _send_talk_page(self) -> None:
+            nonce = secrets.token_urlsafe(18)
+            data = TALK_PAGE.read_text(encoding="utf-8").replace("__NONCE__", nonce).encode("utf-8")
+            self.send_response(HTTPStatus.OK)
+            self.send_header("content-type", "text/html; charset=utf-8")
+            self.send_header("content-length", str(len(data)))
+            self.send_header("cache-control", "no-store")
+            self.send_header("x-frame-options", "DENY")
+            self.send_header("referrer-policy", "no-referrer")
+            self.send_header("content-security-policy",
+                             f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; "
+                             "connect-src 'self'; media-src blob: data:; base-uri 'none'; form-action 'none'; "
+                             "frame-ancestors 'none'")
+            self.send_header("permissions-policy", "microphone=(self), camera=(), geolocation=()")
+            self.end_headers()
+            self.wfile.write(data)
+
         def do_GET(self) -> None:  # noqa: N802
+            if self.path in ("/talk", "/"):
+                if self._owner_only():
+                    self._send_talk_page()
+                return
             ack = re.fullmatch(r"/v1/ack/([0-9a-f]{8})\?t=([A-Za-z0-9_-]{8,40})", self.path)
             if ack:
                 if self._owner_only():
@@ -145,16 +156,8 @@ def make_server(service: HubService, port: int) -> ThreadingHTTPServer:
                 self._send(HTTPStatus.INTERNAL_SERVER_ERROR, {"error": "internal error"})
 
         def do_POST(self) -> None:  # noqa: N802
-            if self.path == "/v1/route":
-                self._handle(service.route)
-            elif self.path == "/v1/reminders":
-                self._handle(service.add_reminder)
-            elif self.path == "/v1/reminders/list":
-                self._handle(service.list_reminders)
-            elif self.path == "/v1/reminders/cancel":
-                self._handle(service.cancel_reminder)
-            elif self.path in _POST_ROUTES:
-                self._handle(getattr(service, _POST_ROUTES[self.path]))
+            if self.path in service.ROUTES:
+                self._handle(getattr(service, service.ROUTES[self.path]))
             else:
                 self._send(HTTPStatus.NOT_FOUND, {"error": "not found"})
 

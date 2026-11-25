@@ -250,9 +250,28 @@ class HubTier:
         return True
 
 
+#: set when NOVA itself runs on the hub (ADR 0023): its skills then call the
+#: hub's service directly instead of over the network
+_LOCAL_SERVICE: Any = None
+
+
+def use_local_service(service: Any) -> None:
+    global _LOCAL_SERVICE
+    _LOCAL_SERVICE = service
+
+
 async def hub_post(config: Any, egress: Any, path: str, body: dict[str, Any], *, timeout_s: float = 8.0) -> dict[str, Any]:
     """One owner-only call to the hub (reminders and the like). Raises
     HubUnavailable when there's no hub or it can't be reached."""
+    if _LOCAL_SERVICE is not None:
+        from nova.hub.service import HubError
+
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(_LOCAL_SERVICE.call, path, body), timeout=timeout_s + 1.0)
+        except HubError as exc:
+            raise HubUnavailable(str(exc)) from exc
+        except Exception as exc:  # noqa: BLE001
+            raise HubUnavailable(type(exc).__name__) from exc
     host = config.hub.host.strip().lower()
     if not host or egress is None:
         raise HubUnavailable("no hub configured")

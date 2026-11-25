@@ -39,6 +39,24 @@ class HubError(ValueError):
 
 
 class HubService:
+    #: owner-only JSON calls: path -> method. The listener serves these over
+    #: HTTP; NOVA running on the hub calls them in-process (call()).
+    ROUTES = {
+        "/v1/route": "route",
+        "/v1/reminders": "add_reminder",
+        "/v1/reminders/list": "list_reminders",
+        "/v1/reminders/cancel": "cancel_reminder",
+        "/v1/brain/start": "brain_start",
+        "/v1/brain/send": "brain_send",
+        "/v1/brain/close": "brain_close",
+        "/v1/forge/request": "forge_request",
+        "/v1/forge/list": "forge_list",
+        "/v1/forge/ready": "forge_ready",
+        "/v1/forge/apply": "forge_apply",
+        "/v1/forge/discard": "forge_discard",
+        "/v1/talk": "talk_turn",
+    }
+
     def __init__(
         self,
         *,
@@ -50,9 +68,11 @@ class HubService:
         notifier: Any = None,
         brain: Any = None,
         forge: Any = None,
+        talk: Any = None,
     ) -> None:
         self.brain = brain
         self.forge = forge
+        self.talk = talk
         self._model = model
         self.reminders = reminders or ReminderStore(Path(data_dir) / "reminders.json", clock=clock)
         self._notifier = notifier
@@ -62,6 +82,19 @@ class HubService:
         self._started = clock()
         self._model_lock = threading.Lock()
         self._state_path = self._data_dir / "hub_state.json"
+
+    def call(self, path: str, body: Any) -> dict[str, Any]:
+        """One owner-only call made from inside the hub (NOVA's own skills)."""
+        name = self.ROUTES.get(path)
+        if name is None:
+            raise HubError(f"no such call: {path}")
+        return getattr(self, name)(body)
+
+    def talk_turn(self, body: Any) -> dict[str, Any]:
+        """One thing said on the talk page (ADR 0023)."""
+        if self.talk is None:
+            raise HubError("NOVA isn't running on the hub (see nova-hub logs)")
+        return self.talk.handle(body)
 
     # --- who --------------------------------------------------------------
 
@@ -119,6 +152,8 @@ class HubService:
         out["reminders_pending"] = len(self.reminders.pending())
         out["brain"] = self.brain is not None
         out["forge"] = self.forge is not None
+        out["assistant"] = self.talk is not None
+        out["voice_ready"] = bool(self.talk is not None and self.talk.voice_ready())
         out["alerts_ready"] = bool(self._notifier is not None and self._notifier.configured())
         state = self._read_state()
         out["memory_files"] = state.get("memory_files", 0)

@@ -12,6 +12,8 @@
 #   nova-hub github    sign the hub in to GitHub, so approved upgrades reach your laptop
 #   nova-hub upgrades  NOVA's self-upgrades: what's building, ready, installed
 #   nova-hub share     turn on the shared drive \\nova-hub\nova (your devices only, over Tailscale)
+#   nova-hub voice     give NOVA on the hub ears and a voice (one-time download, ~900 MB)
+#   nova-hub talk      where to talk to NOVA from your phone
 set -uo pipefail
 
 NOVA_DIR="${NOVA_DIR:-$HOME/NOVA}"
@@ -60,6 +62,11 @@ cmd_status() {
     note "upgrade workshop not ready: run setup_hub.sh again"
   fi
   gh auth status >/dev/null 2>&1 && good "GitHub connected (upgrades reach your laptop)" || note "GitHub not connected: nova-hub github"
+  local h; h=$(health)
+  if [[ "$(jq -r '.assistant' <<<"$h" 2>/dev/null)" == "true" ]]; then
+    [[ "$(jq -r '.voice_ready' <<<"$h")" == "true" ]] && good "NOVA lives here: talk at https://$(ts_name)/" \
+      || note "NOVA lives here, text only for now -- voice: nova-hub voice"
+  fi
   systemctl is-active --quiet smbd && good "shared drive on (\\\\nova-hub\\nova, Tailscale only)" || note "shared drive off (optional): nova-hub share"
   [[ -s "$DATA_DIR/bark_key" ]] && good "iPhone alerts set up (Bark)" || note "iPhone alerts not set up yet (optional): install Bark, then  nova-hub bark <your key>"
   systemctl --user is-active --quiet nova-backup.timer && good "nightly memory backup on" || bad "backup timer off: systemctl --user enable --now nova-backup.timer"
@@ -253,6 +260,48 @@ CONF
   echo "   On your laptop:  powershell -ExecutionPolicy Bypass -File D:\\NOVA\\scripts\\hub_drive.ps1 -User $USER"
 }
 
+KOKORO_URL="https://github.com/thewh1teagle/kokoro-onnx/releases/download/model-files-v1.0"
+KOKORO_FILES="7d5df8ecf7d4b1878015a32686053fd0eebe2bc377234608764cc0ef3636a6c5  kokoro-v1.0.onnx
+bca610b8308e8d99f32e6fe4197e7ec01679264efed0cac9140fe9c29f1fbf7d  voices-v1.0.bin"
+
+cmd_voice() {
+  # NOVA's ears (Whisper) and voice (Kokoro) on the hub (ADR 0023). Downloads
+  # happen here, once -- NOVA itself never downloads anything.
+  say "NOVA's ears and voice on the hub (one-time download, about 900 MB)"
+  local models="$NOVA_DIR/models" stt
+  "$NOVA_DIR/.venv/bin/pip" install -q numpy "faster-whisper==1.2.1" "kokoro-onnx==0.5.0" onnxruntime \
+    || { bad "couldn't install the speech libraries"; return 1; }
+  good "speech libraries installed"
+  mkdir -p "$models/tts" "$models/hf"
+  while read -r sum file; do
+    if ! echo "$sum  $models/tts/$file" | sha256sum -c --status 2>/dev/null; then
+      curl -fsSL --retry 3 -o "$models/tts/$file.part" "$KOKORO_URL/$file" || { bad "couldn't download $file"; return 1; }
+      echo "$sum  $models/tts/$file.part" | sha256sum -c --status || { rm -f "$models/tts/$file.part"; bad "$file didn't match its checksum"; return 1; }
+      mv "$models/tts/$file.part" "$models/tts/$file"
+    fi
+  done <<< "$KOKORO_FILES"
+  good "voice files (checked against known checksums)"
+  stt=$("$PY" -c 'from nova.config import load_config; print(load_config().hub.stt_model)')
+  [[ "$stt" =~ ^[a-z0-9][a-z0-9.-]{1,39}$ ]] || { bad "odd stt_model in config: $stt"; return 1; }
+  "$PY" -I -c "from faster_whisper import download_model; download_model('$stt', cache_dir='$models/hf')" >/dev/null 2>&1 \
+    || { bad "couldn't download the Whisper $stt model"; return 1; }
+  good "Whisper $stt (speech to text)"
+  systemctl --user restart nova-hub.service
+  sleep 8
+  health | jq -e '.voice_ready' >/dev/null 2>&1 && good "NOVA on the hub can hear and speak" \
+    || note "restarting; check in a minute with: nova-hub status"
+  cmd_talk
+}
+
+cmd_talk() {
+  local name; name=$(ts_name)
+  say "Talk to NOVA from your phone"
+  if [[ -z "$name" ]]; then bad "Tailscale isn't up (run: nova-hub login)"; return 1; fi
+  echo "   1. Install Tailscale on your iPhone and sign in with the same account."
+  echo "   2. Open in Safari:   https://$name/"
+  echo "   3. Share button -> Add to Home Screen, so NOVA opens like an app."
+}
+
 cmd_logs() {
   journalctl --user -u nova-hub -n "${1:-60}" --no-pager
 }
@@ -279,5 +328,7 @@ case "${1:-status}" in
   github) cmd_github ;;
   upgrades) cmd_upgrades ;;
   share)  cmd_share ;;
-  *) sed -n '2,15p' "$0"; exit 1 ;;
+  voice)  cmd_voice ;;
+  talk)   cmd_talk ;;
+  *) sed -n '2,17p' "$0"; exit 1 ;;
 esac

@@ -1,0 +1,150 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="NOVA">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="theme-color" content="#0b0d12">
+<title>NOVA</title>
+<style>
+:root { --bg:#f5f6f8; --card:#fff; --ink:#14161b; --muted:#6a7080; --line:#e2e5ea; --accent:#4f5bd5; --accent-ink:#fff; --me:#e9ecff; --warn:#b4540b; }
+@media (prefers-color-scheme: dark) { :root { --bg:#0b0d12; --card:#151821; --ink:#eef0f5; --muted:#8b92a5; --line:#262b38; --accent:#7c86ff; --accent-ink:#0b0d12; --me:#1e2340; --warn:#f0a35b; } }
+* { box-sizing:border-box; }
+html, body { margin:0; height:100%; background:var(--bg); color:var(--ink); font:16px/1.45 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+body { display:flex; flex-direction:column; padding:env(safe-area-inset-top) 0 env(safe-area-inset-bottom); }
+header { display:flex; align-items:center; justify-content:space-between; padding:14px 16px 8px; }
+header h1 { margin:0; font-size:20px; letter-spacing:.08em; }
+#state { font-size:13px; color:var(--muted); }
+#log { flex:1; overflow-y:auto; padding:8px 16px 16px; display:flex; flex-direction:column; gap:10px; }
+.msg { max-width:85%; padding:10px 13px; border-radius:16px; background:var(--card); border:1px solid var(--line); white-space:pre-wrap; word-wrap:break-word; }
+.msg.me { align-self:flex-end; background:var(--me); border-color:transparent; }
+.msg.ask { border-color:var(--warn); }
+.hint { color:var(--muted); font-size:14px; text-align:center; margin:auto 0; padding:0 24px; }
+#answers { display:none; gap:8px; padding:0 16px 8px; flex-wrap:wrap; justify-content:center; }
+#answers.on { display:flex; }
+#answers button { border:1px solid var(--line); background:var(--card); color:var(--ink); border-radius:999px; padding:9px 16px; font-size:15px; }
+footer { display:flex; align-items:center; gap:10px; padding:10px 16px 14px; border-top:1px solid var(--line); background:var(--bg); }
+#text { flex:1; min-width:0; border:1px solid var(--line); background:var(--card); color:var(--ink); border-radius:999px; padding:11px 15px; font-size:16px; }
+#mic { width:64px; height:64px; flex:none; border-radius:50%; border:none; background:var(--accent); color:var(--accent-ink); font-size:14px; font-weight:600; }
+#mic.rec { background:#d93a3a; color:#fff; animation:pulse 1.2s infinite; }
+#mic:disabled { opacity:.5; }
+@keyframes pulse { 50% { box-shadow:0 0 0 10px rgba(217,58,58,.18); } }
+</style>
+</head>
+<body>
+<header><h1>NOVA</h1><span id="state">ready</span></header>
+<div id="log"><p class="hint" id="hint">Tap the button, talk, tap again. Or type below.</p></div>
+<div id="answers">
+  <button data-say="yes">Yes</button>
+  <button data-say="no">No</button>
+  <button data-say="Nova, confirm">Nova, confirm</button>
+</div>
+<footer>
+  <input id="text" placeholder="Type to NOVA" autocomplete="off" enterkeyhint="send">
+  <button id="mic" aria-label="Talk">Talk</button>
+</footer>
+<script nonce="__NONCE__">
+(() => {
+  const log = document.getElementById("log"), stateEl = document.getElementById("state");
+  const mic = document.getElementById("mic"), text = document.getElementById("text");
+  const answers = document.getElementById("answers"), hint = document.getElementById("hint");
+  const bytes = new Uint8Array(12); crypto.getRandomValues(bytes);
+  const session = btoa(String.fromCharCode(...bytes)).replace(/[+/=]/g, c => ({"+": "-", "/": "_", "=": ""}[c]));
+  let ctx = null, stream = null, node = null, chunks = [], recording = false, busy = false, rate = 48000, stopTimer = null;
+
+  function add(kind, words) {
+    if (hint) hint.remove();
+    const p = document.createElement("div");
+    p.className = "msg " + kind; p.textContent = words;
+    log.appendChild(p); log.scrollTop = log.scrollHeight;
+  }
+  function setState(s) { stateEl.textContent = s; }
+  function audioCtx() {
+    if (!ctx) ctx = new (window.AudioContext || window.webkitAudioContext)();
+    if (ctx.state === "suspended") ctx.resume();
+    return ctx;
+  }
+
+  async function play(b64) {
+    try {
+      const raw = Uint8Array.from(atob(b64), c => c.charCodeAt(0)).buffer;
+      const buf = await audioCtx().decodeAudioData(raw);
+      const src = ctx.createBufferSource(); src.buffer = buf; src.connect(ctx.destination); src.start();
+    } catch (e) { /* the words are on screen anyway */ }
+  }
+
+  async function send(body, shown) {
+    if (busy) return;
+    busy = true; mic.disabled = true; setState("thinking…");
+    if (shown) add("me", shown);
+    try {
+      const r = await fetch("/v1/talk", { method: "POST", headers: { "content-type": "application/json" },
+                                          body: JSON.stringify(Object.assign({ session }, body)) });
+      const out = await r.json();
+      if (!r.ok) { add("nova", out.error || "Something went wrong."); return; }
+      if (!shown && out.heard) add("me", out.heard);
+      if (out.say) add(out.awaiting ? "nova ask" : "nova", out.say);
+      answers.classList.toggle("on", !!out.awaiting);
+      if (out.audio) play(out.audio);
+    } catch (e) {
+      add("nova", "Can't reach the hub. Is Tailscale on?");
+    } finally {
+      busy = false; mic.disabled = false; setState("ready");
+    }
+  }
+
+  function toPcm16(parts, from) {
+    const n = parts.reduce((a, p) => a + p.length, 0), all = new Float32Array(n);
+    let o = 0; for (const p of parts) { all.set(p, o); o += p.length; }
+    const ratio = from / 16000, out = new Int16Array(Math.floor(n / ratio));
+    for (let i = 0; i < out.length; i++) {
+      const a = Math.floor(i * ratio), b = Math.min(n, Math.floor((i + 1) * ratio));
+      let s = 0; for (let j = a; j < b; j++) s += all[j];
+      const v = Math.max(-1, Math.min(1, s / Math.max(1, b - a)));
+      out[i] = v < 0 ? v * 32768 : v * 32767;
+    }
+    return new Uint8Array(out.buffer);
+  }
+  function b64(u8) {
+    let s = ""; for (let i = 0; i < u8.length; i += 0x8000) s += String.fromCharCode.apply(null, u8.subarray(i, i + 0x8000));
+    return btoa(s);
+  }
+
+  async function start() {
+    const c = audioCtx();
+    try {
+      stream = await navigator.mediaDevices.getUserMedia({ audio: { channelCount: 1, echoCancellation: true, noiseSuppression: true } });
+    } catch (e) { add("nova", "I need the microphone. Allow it for this page in Safari's settings."); return; }
+    rate = c.sampleRate; chunks = [];
+    const srcNode = c.createMediaStreamSource(stream);
+    node = c.createScriptProcessor(4096, 1, 1);
+    node.onaudioprocess = e => { if (recording) chunks.push(new Float32Array(e.inputBuffer.getChannelData(0))); };
+    srcNode.connect(node); node.connect(c.destination);
+    recording = true; mic.classList.add("rec"); mic.textContent = "Stop"; setState("listening…");
+    stopTimer = setTimeout(stop, 55000);
+  }
+  function stop() {
+    if (!recording) return;
+    recording = false; clearTimeout(stopTimer);
+    mic.classList.remove("rec"); mic.textContent = "Talk";
+    if (node) { node.disconnect(); node = null; }
+    if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+    const pcm = toPcm16(chunks, rate); chunks = [];
+    if (pcm.length < 16000) { setState("ready"); return; }  // under half a second
+    send({ audio: b64(pcm) }, null);
+  }
+
+  mic.addEventListener("click", () => { if (busy) return; recording ? stop() : start(); });
+  text.addEventListener("keydown", e => {
+    if (e.key === "Enter" && text.value.trim()) { audioCtx(); const t = text.value.trim(); text.value = ""; send({ text: t }, t); }
+  });
+  answers.addEventListener("click", e => {
+    const say = e.target.getAttribute("data-say"); if (say) { audioCtx(); send({ text: say }, say); }
+  });
+})();
+</script>
+</body>
+</html>

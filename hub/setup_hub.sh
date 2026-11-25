@@ -177,6 +177,6 @@ cat <<'NEXT'
   devices, checks every part, and offers to restart. After that, any time:
 
     nova-hub status    is everything working?
-    nova-hub test      try the local model on ten sample sentences
+    nova-hub voice     give NOVA on the hub ears and a voice (talk from your phone)
 
 NEXT

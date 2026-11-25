@@ -385,6 +385,7 @@ class _PostEgress:
 
 
 def _cfg(host="nova-hub.tail1.ts.net", **hub):
+    hub.setdefault("local_tier", True)  # off by default since 2026-11-25; these tests are about the lane itself
     return dataclasses.replace(Config(), hub=dataclasses.replace(HubConfig(), host=host, **hub))
 
 
