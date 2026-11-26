@@ -104,8 +104,11 @@ class HubVoice:
             return ""
         with self._lock:
             model = self._load_stt()
+            # greedy decoding (beam 1) and no timestamps: about twice as fast on the hub's CPU, and the
+            # sentences are short commands (2026-11-26: 7.9 s for 1.8 s of speech before this)
             segments, _info = model.transcribe(audio, language="en", condition_on_previous_text=False,
-                                               hotwords="Nova", vad_filter=True)
+                                               hotwords="Nova Manav", vad_filter=True, beam_size=1,
+                                               without_timestamps=True)
             return "".join(s.text for s in segments if not _is_silence_hallucination(s)).strip()
 
     # --- text to speech ---------------------------------------------------

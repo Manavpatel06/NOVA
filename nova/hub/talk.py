@@ -142,6 +142,27 @@ class Talk:
     # --- one request ------------------------------------------------------
 
     def handle(self, body: Any) -> dict[str, Any]:
+        t0 = time.monotonic()
+        out = self._handle(body, t0)
+        return self._timed(out, t0, show=isinstance(body, dict) and body.get("timing") is True)
+
+    def _timed(self, out: dict[str, Any], t0: float, *, show: bool = False) -> dict[str, Any]:
+        """Where the time went (2026-11-26, "voice input is delayed"): ms for
+        speech-to-text, thinking and the first piece of voice, in the hub's
+        log -- and in the reply when the caller asks ("timing": true). Never
+        the words. Nothing for ignored speech."""
+        if not isinstance(out, dict) or out.get("ignored"):
+            return out
+        ms = out.pop("ms", {})
+        ms["total"] = int((time.monotonic() - t0) * 1000)
+        ms["think"] = max(0, ms["total"] - ms.get("stt", 0) - ms.get("voice", 0))
+        _log.info("turn: hear %d ms, think %d ms, voice %d ms (total %d ms)",
+                  ms.get("stt", 0), ms["think"], ms.get("voice", 0), ms["total"])
+        if show:
+            out["ms"] = ms
+        return out
+
+    def _handle(self, body: Any, t0: float) -> dict[str, Any]:
         if not isinstance(body, dict):
             raise HubError("body must be a JSON object")
         sid = body.get("session")
@@ -149,20 +170,27 @@ class Talk:
             raise HubError("session must be 8-40 letters, digits, - or _")
         self._face("listening", "the phone")
         heard = self._heard(body)
+        stt_ms = int((time.monotonic() - t0) * 1000) if "audio" in body and "text" not in body else 0
         session = self._session(sid)
         if session.answer is not None and not session.answer.done():
             # this is the answer to the question NOVA just asked
             self._loop.call_soon_threadsafe(_set, session.answer, heard)
         elif session.task is not None and not session.task.done():
-            return self._out(heard, "Still working on the last one.", awaiting=False, want_audio=body.get("speak"))
+            return self._with_stt(stt_ms, self._out(heard, "Still working on the last one.", awaiting=False, want_audio=body.get("speak")))
         elif not heard:
-            return self._out("", "I didn't catch that.", awaiting=False, want_audio=body.get("speak"))
+            return self._with_stt(stt_ms, self._out("", "I didn't catch that.", awaiting=False, want_audio=body.get("speak")))
         else:
             self._face("thinking", "the phone", heard)
             fut = asyncio.run_coroutine_threadsafe(self._start(session, heard), self._loop)
             fut.result(5)
         kind, words = asyncio.run_coroutine_threadsafe(self._next(session), self._loop).result(REPLY_WAIT_S + 5)
-        return self._out(heard, words, awaiting=kind == "ask", want_audio=body.get("speak"))
+        return self._with_stt(stt_ms, self._out(heard, words, awaiting=kind == "ask", want_audio=body.get("speak")))
+
+    @staticmethod
+    def _with_stt(stt_ms: int, out: dict[str, Any]) -> dict[str, Any]:
+        if stt_ms and isinstance(out, dict) and not out.get("ignored"):
+            out.setdefault("ms", {})["stt"] = stt_ms
+        return out
 
     def hear(self, body: Any) -> dict[str, Any]:
         """One sentence from a device's always-open mic (the laptop through
@@ -180,7 +208,10 @@ class Talk:
             raise HubError("device must be a short lowercase name like 'laptop'")
         if not isinstance(body.get("audio"), str):
             raise HubError("send audio")
-        return self.hear_text(device, self._heard({"audio": body["audio"]}), want_audio=body.get("speak"))
+        t0 = time.monotonic()
+        heard = self._heard({"audio": body["audio"]})
+        stt_ms = int((time.monotonic() - t0) * 1000)
+        return self._timed(self._with_stt(stt_ms, self.hear_text(device, heard, want_audio=body.get("speak"))), t0)
 
     def hear_text(self, device: str, heard: str, *, want_audio: Any = True) -> dict[str, Any]:
         from nova.brain.address import strip_address
@@ -380,7 +411,9 @@ class Talk:
         if want_audio is not False and self.voice_ready() and words:
             parts = split_speech(words)
             try:
+                tv = time.monotonic()
                 out["audio"] = base64.b64encode(self.voice.speak(parts[0])).decode("ascii")
+                out.setdefault("ms", {})["voice"] = int((time.monotonic() - tv) * 1000)
             except Exception as exc:  # noqa: BLE001 -- the words still arrive
                 _log.warning("speech failed (%s)", type(exc).__name__)
                 return out

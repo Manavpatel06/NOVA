@@ -44,6 +44,14 @@ def on_activate(app: Gtk.Application) -> None:
 
 
 def main() -> int:
+    import os
+
+    # NOVA's ears and voice come first: the face only gets the CPU they leave (2026-11-26).
+    # WebKit's own processes start from this one and inherit it.
+    try:
+        os.nice(15)
+    except OSError:
+        pass
     app = Gtk.Application(application_id=APP_ID)
     app.connect("activate", on_activate)
     return app.run(sys.argv[:1])

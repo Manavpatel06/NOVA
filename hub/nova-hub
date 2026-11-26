@@ -20,6 +20,7 @@
 #   nova-hub face on|off   NOVA's live face as this laptop's desktop background, screen kept awake
 #   nova-hub connect   your apps for NOVA: google (Gmail drafts + Calendar) | canvas | signin EMAIL | add | list
 #   nova-hub voice-reboot on|off   let "Nova, reboot the hub" (+ "Nova, confirm") restart this computer
+#   nova-hub tune [off]  quicker replies: Wi-Fi power saving off, CPU performance profile (asks first)
 set -uo pipefail
 
 NOVA_DIR="${NOVA_DIR:-$HOME/NOVA}"
@@ -578,6 +579,38 @@ cmd_voice_reboot() {
   esac
 }
 
+cmd_tune() {
+  # 2026-11-26 "voice is delayed": the hub answered pings on the home network in 110+ ms (Wi-Fi power
+  # saving) and ran its CPU in a power-saving profile. Both are reversible: nova-hub tune off.
+  local conf=/etc/NetworkManager/conf.d/90-nova-wifi-powersave.conf
+  case "${1:-on}" in
+    on)
+      say "Making the hub quicker to answer"
+      local answer
+      read -rp "   Turn off Wi-Fi power saving on the hub (faster replies, slightly more power)? (y/n) " answer
+      if [[ "$answer" =~ ^[Yy] ]]; then
+        printf '[connection]\nwifi.powersave = 2\n' | sudo tee "$conf" >/dev/null
+        sudo systemctl reload NetworkManager 2>/dev/null || sudo systemctl restart NetworkManager
+        for dev in $(iw dev 2>/dev/null | awk '/Interface/ {print $2}'); do sudo iw dev "$dev" set power_save off 2>/dev/null; done
+        good "Wi-Fi power saving off"
+      fi
+      if command -v powerprofilesctl >/dev/null 2>&1; then
+        read -rp "   Run the CPU in its performance profile while plugged in (faster voice, a bit warmer)? (y/n) " answer
+        if [[ "$answer" =~ ^[Yy] ]]; then
+          powerprofilesctl set performance && good "CPU: performance profile"
+        fi
+      fi
+      note "check it from the laptop: .venv\\Scripts\\python.exe scripts\\probe_voice_latency.py"
+      ;;
+    off)
+      sudo rm -f "$conf"; sudo systemctl reload NetworkManager 2>/dev/null
+      command -v powerprofilesctl >/dev/null 2>&1 && powerprofilesctl set balanced
+      good "back to Ubuntu's defaults"
+      ;;
+    *) echo "usage: nova-hub tune [on|off]" ;;
+  esac
+}
+
 cmd_logs() {
   journalctl --user -u nova-hub -n "${1:-60}" --no-pager
 }
@@ -612,5 +645,6 @@ case "${1:-status}" in
   face)   shift; cmd_face "$@" ;;
   connect) shift; cmd_connect "$@" ;;
   voice-reboot) shift; cmd_voice_reboot "$@" ;;
-  *) sed -n '2,23p' "$0"; exit 1 ;;
+  tune)   shift; cmd_tune "$@" ;;
+  *) sed -n '2,24p' "$0"; exit 1 ;;
 esac

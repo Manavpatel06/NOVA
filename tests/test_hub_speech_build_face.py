@@ -353,3 +353,15 @@ def test_face_on_uses_the_background_app_not_a_browser():
     assert "hub/face/renderer.py" in body and "face_extension_on" in body
     assert "--kiosk" not in script
     assert "(y/n)" in body        # apt install and auto sign-in are both asked
+
+
+# --- where a turn's time goes (2026-11-26) ---------------------------------------------
+
+def test_timings_are_logged_and_returned_only_when_asked(caplog):
+    talk = Talk(_Says("Done."), None, None)
+    with caplog.at_level("INFO"):
+        plain = talk.handle({"session": "timing-test-1", "text": "Nova, mute", "speak": False})
+        timed = talk.handle({"session": "timing-test-2", "text": "Nova, mute", "speak": False, "timing": True})
+    assert "ms" not in plain
+    assert set(timed["ms"]) >= {"total", "think"} and timed["ms"]["total"] >= timed["ms"]["think"]
+    assert "turn: hear 0 ms, think" in caplog.text and "mute" not in caplog.text.split("turn:")[-1]
