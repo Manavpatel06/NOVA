@@ -21,6 +21,7 @@
 #   nova-hub connect   your apps for NOVA: google (Gmail drafts + Calendar) | canvas | signin EMAIL | add | list
 #   nova-hub voice-reboot on|off   let "Nova, reboot the hub" (+ "Nova, confirm") restart this computer
 #   nova-hub tune [off]  quicker replies: Wi-Fi power saving off, CPU performance profile (asks first)
+#   nova-hub hearing fast|accurate   speech-to-text: base.en (~2.5x quicker) or small.en (fewer mistakes)
 set -uo pipefail
 
 NOVA_DIR="${NOVA_DIR:-$HOME/NOVA}"
@@ -322,6 +323,26 @@ cmd_voice() {
   health | jq -e '.voice_ready' >/dev/null 2>&1 && good "NOVA on the hub can hear and speak" \
     || note "restarting; check in a minute with: nova-hub status"
   cmd_talk
+}
+
+cmd_hearing() {
+  # ADR 0033: how the hub turns speech into text. accurate = Whisper small.en (the default);
+  # fast = Whisper base.en, about 2.5x quicker on a CPU but makes more mistakes.
+  local models="$NOVA_DIR/models" pick answer
+  case "${1:-}" in
+    fast) pick="base.en" ;;
+    accurate) pick="small.en" ;;
+    *) echo "usage: nova-hub hearing fast|accurate   (now: $(cat "$DATA_DIR/stt_model" 2>/dev/null || echo small.en))"; return 1 ;;
+  esac
+  if ! compgen -G "$models/hf/models--*faster-whisper-$pick*" >/dev/null; then
+    read -rp "   Download the Whisper $pick model (about $([[ $pick == base.en ]] && echo 145 || echo 480) MB)? (y/n) " answer
+    [[ "$answer" =~ ^[Yy] ]] || { note "nothing changed"; return 0; }
+    "$PY" -I -c "from faster_whisper import download_model; download_model('$pick', cache_dir='$models/hf')" >/dev/null 2>&1 \
+      || { bad "couldn't download the Whisper $pick model"; return 1; }
+  fi
+  mkdir -p "$DATA_DIR"; printf '%s\n' "$pick" > "$DATA_DIR/stt_model"
+  systemctl --user restart nova-hub.service
+  good "hearing: Whisper $pick"
 }
 
 cmd_talk() {
@@ -646,5 +667,6 @@ case "${1:-status}" in
   connect) shift; cmd_connect "$@" ;;
   voice-reboot) shift; cmd_voice_reboot "$@" ;;
   tune)   shift; cmd_tune "$@" ;;
-  *) sed -n '2,24p' "$0"; exit 1 ;;
+  hearing) shift; cmd_hearing "$@" ;;
+  *) sed -n '2,25p' "$0"; exit 1 ;;
 esac

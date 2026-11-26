@@ -365,3 +365,20 @@ def test_timings_are_logged_and_returned_only_when_asked(caplog):
     assert "ms" not in plain
     assert set(timed["ms"]) >= {"total", "think"} and timed["ms"]["total"] >= timed["ms"]["think"]
     assert "turn: hear 0 ms, think" in caplog.text and "mute" not in caplog.text.split("turn:")[-1]
+
+
+def test_the_page_strips_novas_name_so_simple_commands_stay_instant():
+    class _Seen(_Says):
+        def __init__(self):
+            super().__init__("ok")
+            self.texts = []
+
+        async def turn(self, text, channel):
+            self.texts.append(text)
+            return "ok"
+
+    a = _Seen()
+    talk = Talk(a, None, None)
+    talk.handle({"session": "strip-test-1", "text": "Nova, what time is it", "speak": False})
+    talk.handle({"session": "strip-test-2", "text": "what's the weather", "speak": False})
+    assert a.texts == ["what time is it", "what's the weather"]

@@ -30,3 +30,16 @@ full-screen canvas at 60 fps costs as much as the nova).
 ## To verify on the hub
 Run `nova-hub update`, `nova-hub tune`, sign out and back in (the face restarts with the new settings), then
 `scripts/probe_voice_latency.py` from the laptop. Expected: hearing ~2 s, first voice ~2 s.
+
+## After the first fix (measured 2026-11-26, laptop -> hub)
+- Speech-to-text 7.9 s -> 1.9 s; first piece of voice 9.8 s -> 1.9 s. The face was the CPU hog.
+- Still slow: a new HTTPS connection for every request, 187 ms each (22 ms reusing one). Now **kept open**
+  (`Egress(keep_alive_hosts=...)`): NOVA Link -> the hub, and the hub -> Claude's API. Same rules: allowlisted
+  hosts only, certificate checked, redirects refused, every request audited. A connection the server closed while
+  idle is replaced once.
+- "Nova, ..." typed or said on the phone page went to Claude even for "what time is it". The name is now
+  stripped first, so simple commands take the instant lane there too.
+- **`nova-hub hearing fast|accurate`**: Whisper base.en is 2.5x quicker than small.en (0.8 s vs 2.1 s per
+  sentence measured) but makes more mistakes ("Nova, open the folder" -> "Nova opened the folder"). small.en
+  stays the default.
+- Tried and dropped: the int8 Kokoro model (no faster on this CPU: 3.44 s vs 3.57 s).

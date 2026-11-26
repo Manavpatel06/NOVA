@@ -180,8 +180,12 @@ class Talk:
         elif not heard:
             return self._with_stt(stt_ms, self._out("", "I didn't catch that.", awaiting=False, want_audio=body.get("speak")))
         else:
-            self._face("thinking", "the phone", heard)
-            fut = asyncio.run_coroutine_threadsafe(self._start(session, heard), self._loop)
+            from nova.brain.address import strip_address
+
+            # "Nova, what time is it" typed or said on the page: the instant lane wants the command itself
+            command = strip_address(heard, self._names()) or heard
+            self._face("thinking", "the phone", command)
+            fut = asyncio.run_coroutine_threadsafe(self._start(session, command), self._loop)
             fut.result(5)
         kind, words = asyncio.run_coroutine_threadsafe(self._next(session), self._loop).result(REPLY_WAIT_S + 5)
         return self._with_stt(stt_ms, self._out(heard, words, awaiting=kind == "ask", want_audio=body.get("speak")))

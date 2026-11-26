@@ -52,8 +52,9 @@ def _egress(config, audit: AuditLog | None = None) -> Egress:
     # + Anthropic's API when NOVA thinks with Manav's API credit (ADR 0026)
     hosts = [BARK_HOST, FORECAST_URL.split("/")[2], GEOCODE_URL.split("/")[2], TWILIO_HOST, PLIVO_HOST,
              API_URL.split("/")[2]]
+    # Claude's API is called every turn: keep that connection open (ADR 0033)
     return Egress(hosts, audit=audit or _audit(config), redact_terms=config.security.redact_terms,
-                  loopback_ports=[config.hub.ollama_port])
+                  loopback_ports=[config.hub.ollama_port], keep_alive_hosts=[API_URL.split("/")[2]])
 
 
 def _brain(config, egress: Egress, audit: AuditLog):
@@ -99,6 +100,18 @@ def _restart_soon(delay_s: float = 15.0) -> None:
     threading.Timer(delay_s, go).start()
 
 
+def _stt_model(config) -> str:
+    """The hub's speech-to-text model: config, or `nova-hub hearing fast|accurate`
+    (a file in data/, so the tracked config file stays untouched on the hub)."""
+    import re
+
+    try:
+        chosen = (DATA_DIR / "stt_model").read_text(encoding="utf-8").strip()
+    except OSError:
+        chosen = ""
+    return chosen if re.fullmatch(r"(?:tiny|base|small|medium)\.en", chosen) else config.hub.stt_model
+
+
 def _connectors():
     """Connected apps (ADR 0030): the MCP servers `nova-hub connect` set up."""
     from nova.hub.connectors import Connectors
@@ -124,7 +137,7 @@ def _talk(config, egress: Egress, audit: AuditLog, devices=None, face=None, conn
     from nova.hub.voice import HubVoice
 
     _adopt_memory()
-    voice = HubVoice(stt_model=config.hub.stt_model, voice=config.tts.voice)
+    voice = HubVoice(stt_model=_stt_model(config), voice=config.tts.voice)
     missing = voice.missing()
     if missing:
         _log.warning("Talk page is text-only until `nova-hub voice` installs: %s", ", ".join(missing))

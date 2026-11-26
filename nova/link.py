@@ -216,7 +216,7 @@ def main(argv: list[str] | None = None) -> int:
         return 1
     audit = AuditLog(DATA_DIR / "link-audit.log", redact_terms=config.security.redact_terms)
     egress = Egress(list(config.security.egress_allowlist) + [host], audit=audit,
-                    redact_terms=config.security.redact_terms)
+                    redact_terms=config.security.redact_terms, keep_alive_hosts=[host])
     link = Link(config, egress=egress, audit=audit)
     stop_thread = threading.Event()
     if config.hub.listen:

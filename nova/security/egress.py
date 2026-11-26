@@ -116,6 +116,7 @@ class Egress:
         audit: AuditLog,
         redact_terms: Sequence[str] = (),
         loopback_ports: Sequence[int] = (),
+        keep_alive_hosts: Sequence[str] = (),
     ) -> None:
         normalized: set[str] = set()
         for raw in allowlist:
@@ -139,6 +140,17 @@ class Egress:
         self._loopback_ports: frozenset[int] = frozenset(ports)
         self._audit = audit
         self._redact_terms = tuple(redact_terms)
+        #: 2026-11-26 (voice delay): hosts NOVA talks to all the time -- the hub from the laptop, Claude's
+        #: API from the hub -- keep their HTTPS connection open between requests. Measured laptop->hub:
+        #: 187 ms a request with a new connection each time, 22 ms reusing one. Must be allowlisted hosts.
+        keep = {normalize_host(h) for h in keep_alive_hosts}
+        if None in keep or not keep <= normalized:
+            raise ConfigError("keep_alive_hosts must be hosts on the egress allowlist")
+        self._keep_alive: frozenset[str] = frozenset(h for h in keep if h)
+        self._pool: dict[str, list] = {}
+        import threading as _threading
+
+        self._pool_lock = _threading.Lock()
 
         # Refuse every redirect at the urllib layer, process-wide — see
         # _NoRedirectHandler and EgressRedirectBlocked above. install_opener
@@ -213,9 +225,13 @@ class Egress:
         req = urllib.request.Request(url, data=data, method=method,
                                      headers={"content-type": "application/json", **headers})
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310 -- the sanctioned transport
-                raw = response.read()
-                status = response.status
+            if host in self._keep_alive:
+                status, raw = self._pooled(url, host, data, {"content-type": "application/json", **headers},
+                                           timeout, method)
+            else:
+                with urllib.request.urlopen(req, timeout=timeout) as response:  # noqa: S310 -- the sanctioned transport
+                    raw = response.read()
+                    status = response.status
         except EgressRedirectBlocked as exc:
             # Not an HTTPError/URLError: without this it escaped unaudited.
             self._audit.record({
@@ -240,6 +256,61 @@ class Egress:
             raise EgressError(f"{host} unreachable: {exc}") from exc
         self._audit.record({"kind": "egress.post_result", "host": host, "status": status, "bytes_in": len(raw)})
         return json.loads(raw.decode("utf-8"))
+
+    def _pooled(self, url: str, host: str, data: bytes, headers: dict[str, str], timeout: float,
+                method: str) -> tuple[int, bytes]:
+        """One request on a kept-open HTTPS connection to an allowlisted
+        keep-alive host (certificate checked as always). Redirects are refused
+        and HTTP errors raised exactly like urlopen's, so post_json's handling
+        is the same either way. A kept connection the server has since closed
+        is replaced once, transparently."""
+        import http.client
+        import io
+        import ssl
+
+        parts = urlsplit(url)
+        path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        with self._pool_lock:
+            idle = self._pool.setdefault(host, [])
+            conn = idle.pop() if idle else None
+        reused = conn is not None
+        for _attempt in (0, 1):
+            if conn is None:
+                conn = http.client.HTTPSConnection(host, parts.port or 443, timeout=timeout,
+                                                   context=ssl.create_default_context())
+            elif conn.sock is not None:
+                conn.sock.settimeout(timeout)
+            try:
+                conn.request(method, path, body=data, headers=headers)
+                resp = conn.getresponse()
+                raw = resp.read()
+            except (http.client.RemoteDisconnected, http.client.CannotSendRequest, http.client.BadStatusLine,
+                    ConnectionError) as exc:   # reset, aborted (Windows) or broken pipe
+                conn.close()
+                conn = None
+                if reused:          # it had gone stale while idle: one fresh try
+                    reused = False
+                    continue
+                raise OSError(f"connection lost: {type(exc).__name__}") from exc
+            except BaseException:
+                conn.close()
+                raise
+            if resp.will_close:
+                conn.close()
+            else:
+                with self._pool_lock:
+                    idle = self._pool.setdefault(host, [])
+                    if len(idle) < 4:
+                        idle.append(conn)
+                    else:
+                        conn.close()
+            if 300 <= resp.status < 400:
+                raise EgressRedirectBlocked(original_url=url, redirect_url=resp.getheader("location") or "",
+                                            status=resp.status)
+            if resp.status >= 400:
+                raise urllib.error.HTTPError(url, resp.status, resp.reason, resp.headers, io.BytesIO(raw))
+            return resp.status, raw
+        raise OSError("connection lost")
 
     def post_form(self, url: str, fields: dict[str, str], *, headers: dict[str, str], timeout: float = 20.0) -> dict:
         """POST a form (application/x-www-form-urlencoded) to an allowlisted

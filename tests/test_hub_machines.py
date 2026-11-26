@@ -186,3 +186,15 @@ def test_update_and_reboot_need_nova_confirm_and_say_what_happened(monkeypatch):
     monkeypatch.setattr(ops, "start", lambda what: (False, "sudo: a password is required"))
     reply = asyncio.run(skills["reboot_hub"].handler(None))
     assert not reply.success and "nova-hub voice-reboot on" in reply.text
+
+
+def test_hearing_choice_comes_from_a_data_file_and_only_known_models(tmp_path, monkeypatch):
+    import nova.hub.__main__ as hub_main
+    from nova.config import Config
+
+    monkeypatch.setattr(hub_main, "DATA_DIR", tmp_path)
+    assert hub_main._stt_model(Config()) == Config().hub.stt_model
+    (tmp_path / "stt_model").write_text("base.en\n")
+    assert hub_main._stt_model(Config()) == "base.en"
+    (tmp_path / "stt_model").write_text("../../evil\n")
+    assert hub_main._stt_model(Config()) == Config().hub.stt_model
