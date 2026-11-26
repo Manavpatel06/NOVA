@@ -38,6 +38,24 @@ PIECE_MIN = 60           # merge shorter sentences into the next piece
 PIECE_MAX = 200
 
 
+FIRST_MAX = 90           # a longer first sentence is broken at a comma (2026-11-26: 3-4.5 s to voice otherwise)
+
+
+def _first_cut(sentence: str) -> tuple[str, str]:
+    """Break a long first sentence at a natural pause -- a comma, semicolon,
+    colon or dash -- so the first sound comes sooner. ("", sentence) if
+    there's no good place."""
+    if len(sentence) <= FIRST_MAX:
+        return "", sentence
+    best = -1
+    for m in re.finditer(r"[,;:]\s|\s[-\u2013\u2014]\s", sentence):
+        if 25 <= m.start() <= FIRST_MAX:
+            best = m.end()
+    if best < 0:
+        return "", sentence
+    return sentence[:best].strip(), sentence[best:].strip()
+
+
 def split_speech(text: str) -> list[str]:
     """Sentences, merged into pieces of a speakable size. The first piece is
     kept short so the first sound comes as soon as possible."""
@@ -45,6 +63,9 @@ def split_speech(text: str) -> list[str]:
     if not text:
         return [""]
     sentences = [x for x in re.split(r"(?<=[.!?…])\s+", text) if x]
+    head, rest = _first_cut(sentences[0])
+    if head:
+        sentences = [head, rest, *sentences[1:]]
     pieces: list[str] = []
     buf = ""
     for sentence in sentences:
@@ -84,6 +105,71 @@ class _Session:
         self.convo_until = 0.0
         self.replied_at = 0.0
         self.recent: list[tuple[str, str]] = []
+        self.prespeak: _Prespeak | None = None
+
+
+class _Prespeak:
+    """The voice for a reply's first pieces, made while Claude is still
+    writing the rest (2026-11-26). The API brain reports the words so far;
+    every piece that can't change any more is synthesized at once, so when
+    the reply is finished its first piece is often already spoken-ready.
+    A piece that doesn't end up in the reply is simply not used."""
+
+    AHEAD = 2   # pieces made ahead; more would compete with the rest of the turn for the CPU
+
+    def __init__(self, voice: Any) -> None:
+        self._voice = voice
+        self._cond = threading.Condition()
+        self._wanted: list[str] = []
+        self._audio: dict[str, bytes] = {}
+        self._doing: str | None = None
+        self._running = False
+        self._closed = False
+
+    def feed(self, so_far: str) -> None:
+        stable = split_speech(so_far)[:-1][: self.AHEAD]   # the last piece may still grow
+        with self._cond:
+            if self._closed:
+                return
+            for piece in stable:
+                if piece and piece not in self._wanted:
+                    self._wanted.append(piece)
+            if not self._running and any(p not in self._audio for p in self._wanted):
+                self._running = True
+                threading.Thread(target=self._run, name="prespeak", daemon=True).start()
+
+    def _run(self) -> None:
+        while True:
+            with self._cond:
+                todo = next((p for p in self._wanted if p not in self._audio), None)
+                if todo is None or self._closed:
+                    self._running = False
+                    self._cond.notify_all()
+                    return
+                self._doing = todo
+            try:
+                audio = self._voice.speak(todo)
+            except Exception as exc:  # noqa: BLE001 -- the normal path will try again
+                _log.warning("speech failed (%s)", type(exc).__name__)
+                audio = b""
+            with self._cond:
+                self._audio[todo] = audio
+                self._doing = None
+                self._cond.notify_all()
+
+    def take(self, piece: str, wait_s: float = 30.0) -> bytes | None:
+        """This piece's audio if it was made (or is being made) ahead; else None."""
+        with self._cond:
+            if piece not in self._wanted:
+                return None
+            self._cond.wait_for(lambda: piece in self._audio or (self._doing != piece and not self._running),
+                                timeout=wait_s)
+            return self._audio.get(piece) or None
+
+    def close(self) -> None:
+        with self._cond:
+            self._closed = True
+            self._cond.notify_all()
 
 
 class _PageChannel:
@@ -185,10 +271,12 @@ class Talk:
             # "Nova, what time is it" typed or said on the page: the instant lane wants the command itself
             command = strip_address(heard, self._names()) or heard
             self._face("thinking", "the phone", command)
-            fut = asyncio.run_coroutine_threadsafe(self._start(session, command), self._loop)
+            fut = asyncio.run_coroutine_threadsafe(
+                self._start(session, command, speak=body.get("speak") is not False), self._loop)
             fut.result(5)
         kind, words = asyncio.run_coroutine_threadsafe(self._next(session), self._loop).result(REPLY_WAIT_S + 5)
-        return self._with_stt(stt_ms, self._out(heard, words, awaiting=kind == "ask", want_audio=body.get("speak")))
+        return self._with_stt(stt_ms, self._out(heard, words, awaiting=kind == "ask", want_audio=body.get("speak"),
+                                                pre=session.prespeak))
 
     @staticmethod
     def _with_stt(stt_ms: int, out: dict[str, Any]) -> dict[str, Any]:
@@ -253,11 +341,12 @@ class Talk:
                 return self._close(session, heard, want_audio)
             channel = _PageChannel(session, name=f"your {device}", armed_by=ArmedBy.VOICE)
             self._face("thinking", f"your {device}", command)
-            asyncio.run_coroutine_threadsafe(self._start(session, command, channel), self._loop).result(5)
+            asyncio.run_coroutine_threadsafe(self._start(session, command, channel, speak=want_audio is not False),
+                                             self._loop).result(5)
             heard = command
         kind, words = asyncio.run_coroutine_threadsafe(self._next(session), self._loop).result(REPLY_WAIT_S + 5)
         self._converse(session, heard, words)
-        return self._out(heard, words, awaiting=kind == "ask", want_audio=want_audio)
+        return self._out(heard, words, awaiting=kind == "ask", want_audio=want_audio, pre=session.prespeak)
 
     # --- conversation mode (ADR 0029) -----------------------------------------
 
@@ -385,13 +474,20 @@ class Talk:
         self._face("speaking", words)
         return words, kind == "ask"
 
-    async def _start(self, session: _Session, text: str, channel: Any = None) -> None:
+    async def _start(self, session: _Session, text: str, channel: Any = None, speak: bool = False) -> None:
         while not session.events.empty():  # a reply nobody waited for (an earlier timeout)
             session.events.get_nowait()
+        if session.prespeak is not None:
+            session.prespeak.close()
+        session.prespeak = None
+        channel = channel or _PageChannel(session)
+        if speak and self.voice_ready():
+            session.prespeak = _Prespeak(self.voice)
+            channel.on_text = session.prespeak.feed
 
         async def run() -> None:
             try:
-                reply = await self.assistant.turn(text, channel or _PageChannel(session))
+                reply = await self.assistant.turn(text, channel)
             except Exception as exc:  # noqa: BLE001 -- one bad turn never takes the hub down
                 _log.error("turn failed (%s)", type(exc).__name__)
                 reply = "Sorry, something went wrong."
@@ -405,7 +501,8 @@ class Talk:
         except asyncio.TimeoutError:
             return "done", "That's taking too long; I'll keep going and tell you when it's done."
 
-    def _out(self, heard: str, words: str, *, awaiting: bool, want_audio: Any) -> dict[str, Any]:
+    def _out(self, heard: str, words: str, *, awaiting: bool, want_audio: Any,
+             pre: _Prespeak | None = None) -> dict[str, Any]:
         """The reply. Long ones are spoken in pieces (2026-11-25): the first
         sentence is synthesized now and returned with the words; the rest are
         synthesized in the background while it plays, and fetched in order
@@ -416,19 +513,22 @@ class Talk:
             parts = split_speech(words)
             try:
                 tv = time.monotonic()
-                out["audio"] = base64.b64encode(self.voice.speak(parts[0])).decode("ascii")
+                first = (pre.take(parts[0]) if pre is not None else None) or self.voice.speak(parts[0])
+                out["audio"] = base64.b64encode(first).decode("ascii")
                 out.setdefault("ms", {})["voice"] = int((time.monotonic() - tv) * 1000)
             except Exception as exc:  # noqa: BLE001 -- the words still arrive
                 _log.warning("speech failed (%s)", type(exc).__name__)
                 return out
             if len(parts) > 1:
-                out["more"] = self._speech_job(parts[1:])
+                out["more"] = self._speech_job(parts[1:], pre)
                 out["parts"] = len(parts) - 1
+            elif pre is not None:
+                pre.close()
         return out
 
     # --- the rest of a long reply's speech ------------------------------------
 
-    def _speech_job(self, parts: list[str]) -> str:
+    def _speech_job(self, parts: list[str], pre: _Prespeak | None = None) -> str:
         jid = secrets.token_hex(8)
         job = {"parts": [None] * len(parts), "cond": threading.Condition(), "at": time.monotonic()}
         with self._guard:
@@ -442,13 +542,15 @@ class Talk:
         def run() -> None:
             for i, text in enumerate(parts):
                 try:
-                    audio = self.voice.speak(text)
+                    audio = (pre.take(text) if pre is not None else None) or self.voice.speak(text)
                 except Exception as exc:  # noqa: BLE001
                     _log.warning("speech failed (%s)", type(exc).__name__)
                     audio = b""
                 with job["cond"]:
                     job["parts"][i] = audio
                     job["cond"].notify_all()
+            if pre is not None:
+                pre.close()
 
         threading.Thread(target=run, name="speech", daemon=True).start()
         return jid

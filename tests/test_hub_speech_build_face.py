@@ -382,3 +382,14 @@ def test_the_page_strips_novas_name_so_simple_commands_stay_instant():
     talk.handle({"session": "strip-test-1", "text": "Nova, what time is it", "speak": False})
     talk.handle({"session": "strip-test-2", "text": "what's the weather", "speak": False})
     assert a.texts == ["what time is it", "what's the weather"]
+
+
+def test_a_long_first_sentence_is_broken_at_a_natural_pause():
+    text = ("The sky looks blue because sunlight scatters off the tiny gas molecules in the air, and blue light "
+            "scatters far more than red. At sunset the light crosses more air.")
+    pieces = split_speech(text)
+    assert pieces[0] == "The sky looks blue because sunlight scatters off the tiny gas molecules in the air,"
+    assert " ".join(pieces) == " ".join(text.split())
+    # no comma in a good place: left whole rather than cut mid-phrase
+    plain = "a" * 30 + " " + "b" * 80 + " ends here. Next."
+    assert split_speech(plain)[0].startswith("a" * 30 + " " + "b" * 80)

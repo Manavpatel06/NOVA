@@ -254,7 +254,58 @@ class Agent:
 
     # -- one sentence ---------------------------------------------------------
 
-    async def respond(self, text: str, invoke_tool: InvokeTool) -> AgentResult | None:
+    def _streamed(self, body: dict, headers: dict, timeout: float, on_text: Callable[[str], None]) -> dict:
+        """One Messages API call read as it's written (2026-11-26): `on_text`
+        gets the reply's words so far each time more arrive (put together
+        exactly like the final reply), so NOVA can start making the voice for
+        the first sentence before Claude has finished. Returns the same shape
+        as the non-streamed reply (content, stop_reason, usage)."""
+        import json as _json
+
+        from nova.security.egress import EgressError
+
+        blocks: dict[int, dict] = {}
+        partial: dict[int, list[str]] = {}
+        usage: dict = {}
+        stop = None
+        for ev in self._egress.post_stream(API_URL, {**body, "stream": True}, headers=headers, timeout=timeout):
+            kind = ev.get("type")
+            if kind == "message_start":
+                usage.update((ev.get("message") or {}).get("usage") or {})
+            elif kind == "content_block_start":
+                blocks[int(ev.get("index", 0))] = dict(ev.get("content_block") or {})
+            elif kind == "content_block_delta":
+                i, d = int(ev.get("index", 0)), ev.get("delta") or {}
+                b = blocks.setdefault(i, {"type": "text", "text": ""})
+                if d.get("type") == "text_delta":
+                    b["text"] = b.get("text", "") + str(d.get("text", ""))
+                    # the step's words so far, exactly as the final reply would be put together
+                    so_far = " ".join(blocks[k].get("text", "").strip() for k in sorted(blocks)
+                                      if blocks[k].get("type") == "text" and blocks[k].get("text", "").strip())
+                    try:
+                        on_text(self._aliases.restore(so_far))
+                    except Exception:  # noqa: BLE001 -- the voice is a nicety; the answer still comes
+                        pass
+                elif d.get("type") == "input_json_delta":
+                    partial.setdefault(i, []).append(str(d.get("partial_json", "")))
+            elif kind == "content_block_stop":
+                i = int(ev.get("index", 0))
+                if i in partial and i in blocks:
+                    raw = "".join(partial.pop(i))
+                    try:
+                        blocks[i]["input"] = _json.loads(raw) if raw else {}
+                    except ValueError:
+                        blocks[i]["input"] = {}
+            elif kind == "message_delta":
+                stop = (ev.get("delta") or {}).get("stop_reason") or stop
+                usage.update(ev.get("usage") or {})
+            elif kind == "error":
+                err = EgressError(f"stream error: {(ev.get('error') or {}).get('message', '')}")
+                raise err
+        return {"content": [blocks[i] for i in sorted(blocks)], "stop_reason": stop, "usage": usage}
+
+    async def respond(self, text: str, invoke_tool: InvokeTool,
+                      on_text: Callable[[str], None] | None = None) -> AgentResult | None:
         """Handle one addressed sentence. None means "couldn't reach the
         brain" -- the caller falls back to the router."""
         cfg = self._config.brain
@@ -299,11 +350,12 @@ class Agent:
             body = {"model": model, "max_tokens": cfg.max_tokens, "system": system,
                     "tools": tools, "messages": messages}
             try:
-                reply = await asyncio.to_thread(
-                    self._egress.post_json, API_URL, body,
-                    headers={"x-api-key": key, "anthropic-version": API_VERSION},
-                    timeout=cfg.request_timeout_s,
-                )
+                hdrs = {"x-api-key": key, "anthropic-version": API_VERSION}
+                if on_text is not None and hasattr(self._egress, "post_stream"):
+                    reply = await asyncio.to_thread(self._streamed, body, hdrs, cfg.request_timeout_s, on_text)
+                else:
+                    reply = await asyncio.to_thread(
+                        self._egress.post_json, API_URL, body, headers=hdrs, timeout=cfg.request_timeout_s)
             except Exception as exc:  # noqa: BLE001
                 status = getattr(exc, "status", None)
                 _log.error("Brain request failed (%s)", exc)

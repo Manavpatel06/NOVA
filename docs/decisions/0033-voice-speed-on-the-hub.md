@@ -43,3 +43,17 @@ Run `nova-hub update`, `nova-hub tune`, sign out and back in (the face restarts 
   sentence measured) but makes more mistakes ("Nova, open the folder" -> "Nova opened the folder"). small.en
   stays the default.
 - Tried and dropped: the int8 Kokoro model (no faster on this CPU: 3.44 s vs 3.57 s).
+
+## Speaking while Claude is still writing (2026-11-26)
+- The API brain now reads Claude's reply as it streams (`Egress.post_stream`: same allowlist, audit, redirect and
+  error rules; kept-open connection). Each time more words arrive it reports the reply so far.
+- The hub voices every piece that can no longer change (at most two ahead) while the rest is still being written,
+  so when the reply is finished its first piece is usually ready. Nothing is ever voiced twice; a piece that isn't
+  in the final reply (text before a tool call) is just not used. Only when the reply will be spoken here (not on
+  phone calls, which the carrier voices).
+- The gain is for replies of two or more sentences (longer answers from the stronger model most of all). A
+  one-sentence reply can't be voiced before it's complete, so it gains nothing.
+- The reply format and the laptop, page and phone are unchanged; the Max plan brain doesn't stream.
+- Measured before this on the hub: a three-sentence answer took 3.3-4.5 s just to voice its first piece, because
+  a long first sentence was one piece. A first sentence over 90 characters is now broken at its last comma,
+  semicolon, colon or dash between 25 and 90 characters (left whole when there's none).

@@ -312,6 +312,114 @@ class Egress:
             return resp.status, raw
         raise OSError("connection lost")
 
+    def post_stream(self, url: str, body: dict, *, headers: dict[str, str], timeout: float = 20.0):
+        """POST JSON and read the reply as server-sent events, yielding each
+        event's JSON as it arrives (2026-11-26: NOVA starts preparing its
+        voice while Claude is still writing). Same rules as post_json: exact
+        allowlisted https host, audited (sizes and status, never bodies),
+        redirects refused, HTTP errors raised as EgressError with the status.
+        `timeout` bounds the connect and each wait for more of the reply."""
+        import http.client
+        import json
+        import ssl
+
+        parts = urlsplit(url)
+        host = normalize_host(parts.hostname or "")
+        allowed = host is not None and host in self._allowed_hosts and parts.scheme == "https"
+        data = json.dumps(body).encode("utf-8")
+        self._audit.record({"kind": "egress.post", "host": host, "allowed": allowed, "bytes_out": len(data),
+                            "stream": True})
+        if not allowed:
+            raise EgressError(f"host {host!r} (from {url!r}) is not on the egress allowlist (or not https)")
+        path = (parts.path or "/") + (f"?{parts.query}" if parts.query else "")
+        hdrs = {"content-type": "application/json", "accept": "text/event-stream", **headers}
+        pooled = host in self._keep_alive
+        conn = None
+        if pooled:
+            with self._pool_lock:
+                idle = self._pool.setdefault(host, [])
+                conn = idle.pop() if idle else None
+        reused = conn is not None
+        resp = None
+        for _attempt in (0, 1):
+            if conn is None:
+                conn = http.client.HTTPSConnection(host, parts.port or 443, timeout=timeout,
+                                                   context=ssl.create_default_context())
+            elif conn.sock is not None:
+                conn.sock.settimeout(timeout)
+            try:
+                conn.request("POST", path, body=data, headers=hdrs)
+                resp = conn.getresponse()
+                break
+            except (http.client.RemoteDisconnected, http.client.CannotSendRequest, http.client.BadStatusLine,
+                    ConnectionError) as exc:
+                conn.close()
+                conn = None
+                if reused:
+                    reused = False
+                    continue
+                self._audit.record({"kind": "egress.post_result", "host": host, "status": "unreachable"})
+                raise EgressError(f"{host} unreachable: {type(exc).__name__}") from exc
+            except OSError as exc:
+                conn.close()
+                self._audit.record({"kind": "egress.post_result", "host": host, "status": "unreachable"})
+                raise EgressError(f"{host} unreachable: {exc}") from exc
+        if resp is None:
+            raise EgressError(f"{host} unreachable")
+        if 300 <= resp.status < 400:
+            conn.close()
+            self._audit.record({"kind": "egress.post_redirect_blocked", "host": host,
+                                "redirect_target_host": normalize_host(urlsplit(resp.getheader("location") or "").hostname or ""),
+                                "status": resp.status})
+            raise EgressRedirectBlocked(original_url=url, redirect_url=resp.getheader("location") or "",
+                                        status=resp.status)
+        if resp.status >= 400:
+            raw = resp.read()
+            conn.close()
+            detail = ""
+            try:
+                detail = json.loads(raw.decode("utf-8", "replace")).get("error", {}).get("message", "")
+            except Exception:  # noqa: BLE001
+                pass
+            self._audit.record({"kind": "egress.post_result", "host": host, "status": resp.status})
+            err = EgressError(f"HTTP {resp.status} from {host}: {detail}".strip())
+            err.status = resp.status  # type: ignore[attr-defined]
+            raise err
+        got = 0
+        finished = False
+        try:
+            while True:
+                try:
+                    line = resp.readline(1_000_000)
+                except OSError as exc:
+                    raise EgressError(f"{host} stopped answering: {exc}") from exc
+                if not line:
+                    finished = True
+                    break
+                got += len(line)
+                line = line.strip()
+                if not line.startswith(b"data:"):
+                    continue
+                payload = line[5:].strip()
+                if not payload or payload == b"[DONE]":
+                    continue
+                try:
+                    event = json.loads(payload.decode("utf-8"))
+                except ValueError:
+                    continue
+                if isinstance(event, dict):
+                    yield event
+        finally:
+            self._audit.record({"kind": "egress.post_result", "host": host, "status": resp.status, "bytes_in": got})
+            if pooled and finished and not resp.will_close:
+                with self._pool_lock:
+                    idle = self._pool.setdefault(host, [])
+                    if len(idle) < 4:
+                        idle.append(conn)
+                        conn = None
+            if conn is not None:
+                conn.close()
+
     def post_form(self, url: str, fields: dict[str, str], *, headers: dict[str, str], timeout: float = 20.0) -> dict:
         """POST a form (application/x-www-form-urlencoded) to an allowlisted
         https host and return its JSON reply (2026-11-25, for Twilio's API,

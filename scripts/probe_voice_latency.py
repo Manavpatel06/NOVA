@@ -59,6 +59,8 @@ def main() -> int:
 
     secs, out = talk({"text": "Nova, tell me one fun fact about Arizona in one short sentence", "speak": False})
     print(f"Claude question, no voice:   {secs:.2f} s  -> {str(out.get('say'))[:80]!r}")
+    secs, out = talk({"text": "Nova, in three sentences, why is the sky blue?", "speak": True})
+    print(f"Claude, 3 sentences + voice: {secs:.2f} s  until the first piece can play (hub: {out.get('ms')})")
 
     if audio:
         import numpy as np

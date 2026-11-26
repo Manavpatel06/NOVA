@@ -300,7 +300,11 @@ class HubAssistant:
             return reply.text, reply.success
 
         try:
-            result = await self.brain.respond(text, invoke_tool)
+            on_text = getattr(self._channel, "on_text", None)   # the voice gets ready while Claude writes
+            if on_text is not None and "on_text" in inspect.signature(self.brain.respond).parameters:
+                result = await self.brain.respond(text, invoke_tool, on_text=on_text)
+            else:
+                result = await self.brain.respond(text, invoke_tool)
         except Exception as exc:  # noqa: BLE001 -- never let the brain take the turn down
             _log.error("brain crashed (%s)", type(exc).__name__)
             result = None
@@ -349,11 +353,16 @@ class FirstAvailable:
                 await b.warm_up()
                 return  # warm only the one that will answer
 
-    async def respond(self, text: str, invoke_tool: Any) -> Any:
+    async def respond(self, text: str, invoke_tool: Any, on_text: Any = None) -> Any:
+        import inspect as _inspect
+
         for name, b in self.brains:
             if not b.available():
                 continue
-            result = await b.respond(text, invoke_tool)
+            if on_text is not None and "on_text" in _inspect.signature(b.respond).parameters:
+                result = await b.respond(text, invoke_tool, on_text=on_text)
+            else:
+                result = await b.respond(text, invoke_tool)
             if result is not None:
                 if name != self.last:
                     _log.info("Brain: answering with %s", name)

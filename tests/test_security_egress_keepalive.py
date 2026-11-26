@@ -34,6 +34,14 @@ def server():
         def do_POST(self):
             self.rfile.read(int(self.headers.get("content-length") or 0))
             ports.append(self.client_address[1])
+            if self.path == "/sse":
+                payload = b"event: x\ndata: {\"type\": \"a\"}\n\n: comment\ndata: not json\n\ndata: {\"type\": \"b\"}\n\n"
+                self.send_response(200)
+                self.send_header("content-type", "text/event-stream")
+                self.send_header("content-length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+                return
             if self.path == "/redir":
                 self.send_response(302)
                 self.send_header("location", "https://evil.example.net/")
@@ -139,3 +147,23 @@ def test_a_connection_that_went_stale_while_idle_is_retried_once(plain):
     time.sleep(0.2)
     assert eg.post_json(f"https://{HOST}/ok", {}, headers={}) == {"ok": True}
     assert len(set(plain)) == 2
+
+
+def test_streams_yield_each_event_and_keep_the_connection(plain):
+    audit = _Audit()
+    eg = _egress(audit)
+    assert [e["type"] for e in eg.post_stream(f"https://{HOST}/sse", {}, headers={})] == ["a", "b"]
+    assert [e["type"] for e in eg.post_stream(f"https://{HOST}/sse", {}, headers={})] == ["a", "b"]
+    assert len(set(plain)) == 1
+    assert any(r.get("stream") for r in audit.rows) and any(r.get("bytes_in") for r in audit.rows)
+
+
+def test_streams_refuse_redirects_errors_and_other_hosts(plain):
+    eg = _egress()
+    with pytest.raises(EgressRedirectBlocked):
+        list(eg.post_stream(f"https://{HOST}/redir", {}, headers={}))
+    with pytest.raises(EgressError) as e:
+        list(eg.post_stream(f"https://{HOST}/err", {}, headers={}))
+    assert e.value.status == 500
+    with pytest.raises(EgressError):
+        list(eg.post_stream("https://evil.example.net/x", {}, headers={}))
