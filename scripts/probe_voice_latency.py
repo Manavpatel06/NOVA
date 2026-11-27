@@ -61,6 +61,11 @@ def main() -> int:
     print(f"Claude question, no voice:   {secs:.2f} s  -> {str(out.get('say'))[:80]!r}")
     secs, out = talk({"text": "Nova, in three sentences, why is the sky blue?", "speak": True})
     print(f"Claude, 3 sentences + voice: {secs:.2f} s  until the first piece can play (hub: {out.get('ms')})")
+    t = time.monotonic()
+    for part in range(int(out.get("parts") or 0)):   # what a speaker does while the first piece plays
+        egress.post_json(f"https://{host}/v1/talk/more", {"id": out["more"], "part": part}, headers={}, timeout=60)
+    if out.get("parts"):
+        print(f"  the other {out['parts']} piece(s) ready {time.monotonic() - t:.2f} s later")
 
     if audio:
         import numpy as np

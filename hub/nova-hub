@@ -22,6 +22,7 @@
 #   nova-hub voice-reboot on|off   let "Nova, reboot the hub" (+ "Nova, confirm") restart this computer
 #   nova-hub tune [off]  quicker replies: Wi-Fi power saving off, CPU performance profile (asks first)
 #   nova-hub hearing fast|accurate   speech-to-text: base.en (~2.5x quicker) or small.en (fewer mistakes)
+#   nova-hub wifi      how good the hub's Wi-Fi is (signal, band, speed, power saving)
 set -uo pipefail
 
 NOVA_DIR="${NOVA_DIR:-$HOME/NOVA}"
@@ -323,6 +324,23 @@ cmd_voice() {
   health | jq -e '.voice_ready' >/dev/null 2>&1 && good "NOVA on the hub can hear and speak" \
     || note "restarting; check in a minute with: nova-hub status"
   cmd_talk
+}
+
+cmd_wifi() {
+  # How good the hub's Wi-Fi link is (ADR 0033): signal, band, speed, power saving
+  local dev
+  for dev in $(iw dev 2>/dev/null | awk '/Interface/ {print $2}'); do
+    say "Wi-Fi ($dev)"
+    iw dev "$dev" link | awk '/SSID|freq|signal|tx bitrate|rx bitrate/ {$1=$1; print "   " $0}'
+    echo "   $(iw dev "$dev" get power_save 2>/dev/null)"
+    local sig; sig=$(iw dev "$dev" link | awk '/signal/ {print $2}')
+    if [[ -n "$sig" && "$sig" -lt -67 ]]; then
+      bad "weak signal ($sig dBm): move the hub closer to the router, or use a USB Ethernet adapter"
+    elif [[ -n "$sig" ]]; then
+      good "signal $sig dBm is fine"
+    fi
+    iw dev "$dev" link | grep -q 'freq: 24' && note "on 2.4 GHz: if your router has 5 GHz, that band is usually quicker"
+  done
 }
 
 cmd_hearing() {
@@ -668,5 +686,6 @@ case "${1:-status}" in
   voice-reboot) shift; cmd_voice_reboot "$@" ;;
   tune)   shift; cmd_tune "$@" ;;
   hearing) shift; cmd_hearing "$@" ;;
-  *) sed -n '2,25p' "$0"; exit 1 ;;
+  wifi)   cmd_wifi ;;
+  *) sed -n '2,26p' "$0"; exit 1 ;;
 esac
