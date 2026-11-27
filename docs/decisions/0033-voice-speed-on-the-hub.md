@@ -57,3 +57,7 @@ Run `nova-hub update`, `nova-hub tune`, sign out and back in (the face restarts 
 - Measured before this on the hub: a three-sentence answer took 3.3-4.5 s just to voice its first piece, because
   a long first sentence was one piece. A first sentence over 90 characters is now broken at its last comma,
   semicolon, colon or dash between 25 and 90 characters (left whole when there's none).
+- Measured after it (hub): a three-sentence answer is ready to play in 2.9-3.6 s (was 5.6-7.2 s).
+- Found then: a sentence said right after a long answer waited 2.5-3 s for speech-to-text, behind the voicing of
+  that answer's later pieces (one lock for both). Hearing and speaking now have their own locks, and the later
+  pieces of a reply wait while someone is being heard (`HubVoice.speak_later`). Tested.

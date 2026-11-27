@@ -43,7 +43,14 @@ class HubVoice:
         self._threads = threads
         self._stt = None
         self._tts = None
-        self._lock = threading.Lock()
+        # hearing and speaking each have their own lock (2026-11-26): a sentence said while the rest of
+        # a reply is being voiced is heard at once instead of waiting seconds behind that piece
+        self._stt_lock = threading.Lock()
+        self._tts_lock = threading.Lock()
+        # speech-to-text goes before voicing the later pieces of an earlier reply (2026-11-26:
+        # a sentence said right after a long answer waited ~3 s behind them)
+        self._turn = threading.Condition()
+        self._hearing = 0
 
     # --- readiness --------------------------------------------------------
 
@@ -68,8 +75,9 @@ class HubVoice:
 
     def warm_up(self) -> None:
         """Load both models now so the first sentence isn't slow."""
-        with self._lock:
+        with self._stt_lock:
             self._load_stt()
+        with self._tts_lock:
             self._load_tts()
 
     # --- speech to text ---------------------------------------------------
@@ -93,8 +101,6 @@ class HubVoice:
         """16 kHz mono int16 PCM -> text ("" for silence)."""
         import numpy as np
 
-        from nova.stt.transcriber import _is_silence_hallucination
-
         if len(pcm16) % 2:
             pcm16 = pcm16[:-1]
         if len(pcm16) > SAMPLE_RATE * 2 * MAX_SECONDS:
@@ -102,10 +108,22 @@ class HubVoice:
         audio = np.frombuffer(pcm16, dtype="<i2").astype(np.float32) / 32768.0
         if audio.size < SAMPLE_RATE // 4:  # under a quarter second: nothing was said
             return ""
-        with self._lock:
+        with self._turn:
+            self._hearing += 1
+        try:
+            return self._transcribe(audio)
+        finally:
+            with self._turn:
+                self._hearing -= 1
+                self._turn.notify_all()
+
+    def _transcribe(self, audio) -> str:
+        from nova.stt.transcriber import _is_silence_hallucination
+
+        with self._stt_lock:
             model = self._load_stt()
-            # greedy decoding (beam 1) and no timestamps: about twice as fast on the hub's CPU, and the
-            # sentences are short commands (2026-11-26: 7.9 s for 1.8 s of speech before this)
+            # greedy decoding (beam 1) and no timestamps: ~10 % faster measured, and the sentences are
+            # short commands (ADR 0033)
             segments, _info = model.transcribe(audio, language="en", condition_on_previous_text=False,
                                                hotwords="Nova Manav", vad_filter=True, beam_size=1,
                                                without_timestamps=True)
@@ -126,6 +144,13 @@ class HubVoice:
             _log.info("Kokoro voice loaded")
         return self._tts
 
+    def speak_later(self, text: str) -> bytes:
+        """speak(), but only once nobody is waiting to be heard: for the later
+        pieces of a reply, which have until the earlier ones finish playing."""
+        with self._turn:
+            self._turn.wait_for(lambda: self._hearing == 0, timeout=30)
+        return self.speak(text)
+
     def speak(self, text: str) -> bytes:
         """Text -> a WAV file's bytes."""
         import numpy as np
@@ -133,7 +158,7 @@ class HubVoice:
         text = " ".join((text or "").split())[:2000]
         if not text:
             return b""
-        with self._lock:
+        with self._tts_lock:
             pcm, rate = self._load_tts().create(text, voice=self.voice, lang="en-us")
         samples = np.clip(np.asarray(pcm, dtype=np.float32), -1.0, 1.0)
         return to_wav((samples * 32767.0).astype("<i2").tobytes(), int(rate))

@@ -168,3 +168,36 @@ def test_without_a_listener_the_brain_does_not_stream():
     invoke, _ = recorder()
     assert asyncio.run(agent.respond("hi", invoke)).text == "ok"
     assert "stream" not in eg.bodies[0]
+
+
+def test_hearing_goes_before_voicing_the_rest_of_an_earlier_reply(monkeypatch):
+    import numpy as np
+
+    from nova.hub.voice import HubVoice
+
+    order = []
+
+    class _Stt:
+        def transcribe(self, audio, **kw):
+            order.append("hear")
+            time.sleep(0.1)
+            return [], None
+
+    class _Tts:
+        def create(self, text, **kw):
+            order.append(text)
+            time.sleep(0.5)                            # a long piece
+            return np.zeros(10, dtype="float32"), 24000
+
+    v = HubVoice()
+    monkeypatch.setattr(v, "_load_stt", lambda: _Stt())
+    monkeypatch.setattr(v, "_load_tts", lambda: _Tts())
+    rest = threading.Thread(target=lambda: [v.speak_later(p) for p in ("p1", "p2")])
+    rest.start()
+    time.sleep(0.05)                                   # p1 is being voiced
+    t0 = time.monotonic()
+    v.transcribe((np.ones(16000, dtype="<i2") * 1000).tobytes())
+    heard_in = time.monotonic() - t0
+    rest.join()
+    assert heard_in < 0.35                             # not stuck behind p1's half second
+    assert order == ["p1", "hear", "p2"]               # and p2 waited for the hearing

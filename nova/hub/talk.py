@@ -542,7 +542,8 @@ class Talk:
         def run() -> None:
             for i, text in enumerate(parts):
                 try:
-                    audio = (pre.take(text) if pre is not None else None) or self.voice.speak(text)
+                    later = getattr(self.voice, "speak_later", self.voice.speak)
+                    audio = (pre.take(text) if pre is not None else None) or later(text)
                 except Exception as exc:  # noqa: BLE001
                     _log.warning("speech failed (%s)", type(exc).__name__)
                     audio = b""
