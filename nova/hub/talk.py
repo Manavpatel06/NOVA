@@ -106,6 +106,7 @@ class _Session:
         self.replied_at = 0.0
         self.recent: list[tuple[str, str]] = []
         self.prespeak: _Prespeak | None = None
+        self.dry_calls: list | None = None
 
 
 class _Prespeak:
@@ -271,10 +272,15 @@ class Talk:
             # "Nova, what time is it" typed or said on the page: the instant lane wants the command itself
             command = strip_address(heard, self._names()) or heard
             self._face("thinking", "the phone", command)
+            dry = body.get("dry_run") is True
             fut = asyncio.run_coroutine_threadsafe(
-                self._start(session, command, speak=body.get("speak") is not False), self._loop)
+                self._start(session, command, speak=body.get("speak") is not False and not dry, dry_run=dry),
+                self._loop)
             fut.result(5)
         kind, words = asyncio.run_coroutine_threadsafe(self._next(session), self._loop).result(REPLY_WAIT_S + 5)
+        if isinstance(getattr(session, "dry_calls", None), list) and body.get("dry_run") is True:
+            # an accuracy check (owner only, like everything here): what NOVA would have done
+            return {"heard": heard, "say": words, "awaiting": kind == "ask", "dry_run": session.dry_calls}
         return self._with_stt(stt_ms, self._out(heard, words, awaiting=kind == "ask", want_audio=body.get("speak"),
                                                 pre=session.prespeak))
 
@@ -474,13 +480,17 @@ class Talk:
         self._face("speaking", words)
         return words, kind == "ask"
 
-    async def _start(self, session: _Session, text: str, channel: Any = None, speak: bool = False) -> None:
+    async def _start(self, session: _Session, text: str, channel: Any = None, speak: bool = False,
+                     dry_run: bool = False) -> None:
         while not session.events.empty():  # a reply nobody waited for (an earlier timeout)
             session.events.get_nowait()
         if session.prespeak is not None:
             session.prespeak.close()
         session.prespeak = None
         channel = channel or _PageChannel(session)
+        session.dry_calls = [] if dry_run else None
+        if dry_run:
+            channel.dry_run = session.dry_calls
         if speak and self.voice_ready():
             session.prespeak = _Prespeak(self.voice)
             channel.on_text = session.prespeak.feed

@@ -242,6 +242,8 @@ class HubAssistant:
             finally:
                 self._channel = None
                 self._strict = False
+        if isinstance(getattr(channel, "dry_run", None), list):
+            return reply   # a check, not a conversation: nothing goes in the journal
         if self._journal and self.config.brain.journal:
             try:
                 from nova.memory.store import default_store
@@ -258,12 +260,38 @@ class HubAssistant:
         return SkillCtx(config=self.config, ladder=self.ladder, egress=self.egress, armed_by=armed,
                         origin=Origin.CLAUDE if tainted else Origin.ROUTER)
 
+    def _dry(self) -> "list | None":
+        """A dry run (2026-11-27, accuracy checks): the channel collects what
+        NOVA would do. READ skills still run (no side effects; their answers
+        shape what NOVA does next); anything else is only written down."""
+        calls = getattr(self._channel, "dry_run", None)
+        return calls if isinstance(calls, list) else None
+
     async def _turn(self, text: str) -> str:
+        dry = self._dry()
+        if dry is not None:
+            saved = [(b, list(b._history), list(b._exchange_taint), b._last_turn_at)
+                     for _n, b in getattr(self.brain, "brains", [("", self.brain)]) if hasattr(b, "_history")]
+            try:
+                return await self._turn_inner(text)
+            finally:   # a check leaves Manav's real conversation as it was
+                for b, hist, taint, last in saved:
+                    b._history[:], b._exchange_taint[:], b._last_turn_at = hist, taint, last
+        return await self._turn_inner(text)
+
+    async def _turn_inner(self, text: str) -> str:
+        from nova.security.tiers import Tier
+
+        dry = self._dry()
         instant = self._instant(text)
         if instant is not None:
             spec = self.skills().get(instant.spec.name)
             if spec is None or self._offline(spec.name):
                 return NOT_HERE
+            if dry is not None:
+                dry.append({"skill": spec.name, "params": dict(instant.params), "lane": "instant"})
+                if spec.tier is not Tier.READ:
+                    return f"(dry run) {spec.name}"
             try:
                 reply = await spec.invoke(self._ctx(), **instant.params)
             except Exception as exc:  # noqa: BLE001 -- never retried: it may have half-run
@@ -282,6 +310,12 @@ class HubAssistant:
 
         async def invoke_tool(name: str, params: dict[str, Any], tainted: bool) -> tuple[str, bool]:
             spec = allowed.get(name)
+            if dry is not None:
+                dry.append({"skill": name, "params": dict(params), "lane": "brain"})
+                if spec is None:
+                    return f"no tool called {name}", False
+                if spec.tier is not Tier.READ:
+                    return f"(dry run: {name} would run here; assume it worked)", True
             if spec is None or self._offline(name):
                 return NOT_HERE, False
             ran.append(name)

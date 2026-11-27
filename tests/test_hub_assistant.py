@@ -395,3 +395,67 @@ def test_memory_starts_from_the_mirror_once(monkeypatch, tmp_path):
     (mirror / "facts.md").write_text("changed")
     hub_main._adopt_memory()  # only the first time
     assert (mem / "facts.md").read_text() == "likes tea"
+
+
+# --- dry runs: accuracy checks (2026-11-27) ----------------------------------------------
+
+async def test_a_dry_run_writes_down_actions_instead_of_doing_them(tmp_path, local_service):
+    brain = _Brain(calls=[("time", {}), ("remind_me", {"text": "call mom", "when": "7pm"})], answer="All set.")
+    a = _assistant(tmp_path, brain)
+    ch = _Channel()
+    ch.dry_run = []
+    reply = await a.turn("what time is it and remind me to call mom at 7", ch)
+    assert reply == "All set."
+    assert [c["skill"] for c in ch.dry_run] == ["time", "remind_me"]
+    assert brain.results[0][1] is True and "It's" in brain.results[0][0]           # READ really ran
+    assert "dry run" in brain.results[1][0] and local_service.calls == []           # the reminder didn't
+    assert ch.asked == []                                                            # and nothing was asked
+
+
+async def test_a_dry_run_of_an_instant_command_is_written_down(tmp_path):
+    a = _assistant(tmp_path, _Brain())
+    ch = _Channel()
+    ch.dry_run = []
+    reply = await a.turn("what time is it", ch)
+    assert ch.dry_run == [{"skill": "time", "params": {}, "lane": "instant"}] and reply.startswith("It's")
+
+
+async def test_a_dry_run_of_an_instant_action_runs_nothing(tmp_path):
+    class _Devices:
+        def __init__(self):
+            self.sent = []
+
+        def online(self, d):
+            return True
+
+        def skills(self, d):
+            return {"mute"}
+
+        def submit(self, *a):
+            self.sent.append(a)
+            raise AssertionError("nothing may reach the laptop in a dry run")
+
+    a = HubAssistant(Config(), audit=AuditLog(tmp_path / "audit.log"), egress=None, brain=_Brain(),
+                     journal=False, devices=_Devices())
+    ch = _Channel()
+    ch.dry_run = []
+    reply = await a.turn("mute", ch)
+    assert ch.dry_run[0]["skill"] == "mute" and reply == "(dry run) mute" and a.devices.sent == []
+
+
+async def test_a_dry_run_leaves_the_real_conversation_alone(tmp_path):
+    from nova.brain.agent import Agent
+    from tests.test_brain_agent import FakeEgress, say
+
+    a = _assistant(tmp_path, None)
+    agent = Agent(Config(), FakeEgress([say("first"), say("checked")]), key_provider=lambda: "sk-ant-test",
+                  skills_provider=a.skills)
+    agent._config = type(agent._config)(**{**agent._config.__dict__,
+                                            "brain": type(agent._config.brain)(**{**agent._config.brain.__dict__, "mode": "api"})})
+    a.brain = agent
+    await a.turn("tell me a joke", _Channel())
+    before = list(agent._history)
+    ch = _Channel()
+    ch.dry_run = []
+    await a.turn("what's the capital of France", ch)
+    assert agent._history == before
