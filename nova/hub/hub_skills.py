@@ -121,7 +121,7 @@ def status_text(f: dict[str, Any], *, connectors: Any = None, devices: Any = Non
 
 
 def make(*, connectors: Any = None, devices: Any = None, spend: Callable[[], Any] | None = None,
-         restart: Callable[[float], None] | None = None) -> dict[str, Any]:
+         restart: Callable[[float], None] | None = None, vocabulary: Any = None) -> dict[str, Any]:
     from nova.skills.registry import Reply, SkillSpec
 
     async def hub_status(ctx):
@@ -151,7 +151,41 @@ def make(*, connectors: Any = None, devices: Any = None, spend: Callable[[], Any
             return Reply(text=f"I couldn't restart the hub ({why}).{hint}", success=False)
         return Reply(text="Restarting the hub. I'll be back in about two minutes.")
 
-    return {
+    async def learn_word(ctx, word: str):
+        if vocabulary is None:
+            return Reply(text="I can't learn words here.", success=False)
+        w = vocabulary.learn(word)
+        if w is None:
+            return Reply(text="That doesn't look like a word I can learn (letters, digits, up to 40).", success=False)
+        return Reply(text=f"Got it, I'll listen for {w}.")
+
+    async def forget_word(ctx, word: str):
+        if vocabulary is None or not vocabulary.forget(word):
+            return Reply(text=f"{word} wasn't on my list.", success=False)
+        return Reply(text=f"Okay, {word} is off my list.")
+
+    async def my_words(ctx):
+        if vocabulary is None:
+            return Reply(text="I don't keep a word list here.", success=False)
+        mine = vocabulary.words()
+        return Reply(text=("Words I listen for: " + ", ".join(mine) + ".") if mine
+                     else "You haven't taught me any words yet.")
+
+    out = {
+        "learn_word": SkillSpec(
+            name="learn_word", tier=Tier.ACT,
+            examples=("learn the word HydraWav3", "remember how to spell Ghosh", "add Priya to your words"),
+            description="Teach NOVA's hearing a name or word it keeps getting wrong (a person, course, product). "
+                        "Pass the word spelled correctly.",
+            trusts_input=False, handler=learn_word),
+        "forget_word": SkillSpec(
+            name="forget_word", tier=Tier.ACT, examples=("forget the word Ghosh",),
+            description="Remove a word from NOVA's hearing list.", trusts_input=False, handler=forget_word),
+        "my_words": SkillSpec(
+            name="my_words", tier=Tier.READ, examples=("what words have I taught you",),
+            description="List the words Manav taught NOVA's hearing.", trusts_input=False, handler=my_words),
+    }
+    return out | {
         "update_nova": SkillSpec(
             name="update_nova", tier=Tier.CONFIRM,
             examples=("update yourself from github", "pull the latest nova", "update nova on the hub"),

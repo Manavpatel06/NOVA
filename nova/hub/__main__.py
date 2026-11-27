@@ -137,7 +137,11 @@ def _talk(config, egress: Egress, audit: AuditLog, devices=None, face=None, conn
     from nova.hub.voice import HubVoice
 
     _adopt_memory()
-    voice = HubVoice(stt_model=_stt_model(config), voice=config.tts.voice)
+    from nova.hub.vocabulary import Vocabulary
+
+    vocab = Vocabulary(DATA_DIR / "vocabulary.txt", names=config.wake.names,
+                       apps=list(config.security.allowed_apps), connectors=connectors)
+    voice = HubVoice(stt_model=_stt_model(config), voice=config.tts.voice, prompt=vocab.prompt)
     missing = voice.missing()
     if missing:
         _log.warning("Talk page is text-only until `nova-hub voice` installs: %s", ", ".join(missing))
@@ -146,7 +150,7 @@ def _talk(config, egress: Egress, audit: AuditLog, devices=None, face=None, conn
     local = {"apply_upgrade": hub_apply_upgrade(devices, _restart_soon)}
     holder: dict = {}
     local.update(hub_skills.make(connectors=connectors, devices=devices, restart=_restart_soon,
-                                 spend=lambda: getattr(holder.get("a"), "spend", None)))
+                                 spend=lambda: getattr(holder.get("a"), "spend", None), vocabulary=vocab))
     assistant = HubAssistant(config, audit=audit, egress=egress, devices=devices, connectors=connectors,
                              local_skills=local)
     holder["a"] = assistant

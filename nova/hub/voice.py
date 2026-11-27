@@ -18,6 +18,7 @@ import re
 import threading
 import time
 import wave
+from typing import Any
 
 from nova import MODELS_DIR
 from nova.log import get_logger
@@ -35,12 +36,15 @@ class VoiceUnavailable(RuntimeError):
 
 
 class HubVoice:
-    def __init__(self, *, stt_model: str = "small.en", voice: str = "af_heart", threads: int = 4) -> None:
+    def __init__(self, *, stt_model: str = "small.en", voice: str = "af_heart", threads: int = 4,
+                 prompt: Any = None) -> None:
         if not re.fullmatch(r"[a-z0-9][a-z0-9.-]{1,39}", stt_model or ""):
             raise ValueError(f"not a Whisper model name: {stt_model!r}")
         self.stt_model = stt_model
         self.voice = voice
         self._threads = threads
+        #: the words NOVA should hear right (nova.hub.vocabulary.Vocabulary.prompt)
+        self._prompt = prompt
         self._stt = None
         self._tts = None
         # hearing and speaking each have their own lock (2026-11-26): a sentence said while the rest of
@@ -122,11 +126,18 @@ class HubVoice:
 
         with self._stt_lock:
             model = self._load_stt()
-            # greedy decoding (beam 1) and no timestamps: ~10 % faster measured, and the sentences are
-            # short commands (ADR 0033)
+            # accuracy first (2026-11-27, ADR 0034): beam 5 and Manav's own words as the prompt took word
+            # errors from 7.1 % to 2.8 % on NOVA's test commands; no false "Nova" in chatter or noise
+            words = ""
+            if self._prompt is not None:
+                try:
+                    words = self._prompt() or ""
+                except Exception:  # noqa: BLE001 -- hearing never fails over the word list
+                    words = ""
             segments, _info = model.transcribe(audio, language="en", condition_on_previous_text=False,
-                                               hotwords="Nova Manav", vad_filter=True, beam_size=1,
-                                               without_timestamps=True)
+                                               initial_prompt=words or None,
+                                               hotwords=None if words else "Nova Manav", vad_filter=True,
+                                               beam_size=5, without_timestamps=True)
             return "".join(s.text for s in segments if not _is_silence_hallucination(s)).strip()
 
     # --- text to speech ---------------------------------------------------
